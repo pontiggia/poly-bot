@@ -1,0 +1,57 @@
+
+╔════════════════════════════════════════════════════════════════════╗
+║            PAPER TRADING REPORT -          3s                     ║
+╠════════════════════════════════════════════════════════════════════╣
+║ MARKET ACTIVITY                                                    ║
+║ ───────────────                                                    ║
+║ Session Duration:     3s                                            ║
+║ Book Updates:         0                    (0.0/sec)               ║
+╠════════════════════════════════════════════════════════════════════╣
+║ STRATEGY PERFORMANCE                                               ║
+║ ────────────────────                                               ║
+║ Opportunities Found:  0                    (0.00/hour)              ║
+║ Order Intents:        0                                                    ║
+║                                                                    ║
+║ Fill Simulation:                                                   ║
+║   Would Full Fill:    0        (  0.0%)                             ║
+║   Would Partial Fill: 0        (  0.0%)                             ║
+║   Would Not Fill:     0        (  0.0%)                             ║
+║   Fill Rate:          0.0%                                       ║
+╠════════════════════════════════════════════════════════════════════╣
+║ ARB EXECUTION                                                      ║
+║ ─────────────                                                      ║
+║ Arb Attempts:         0                                                    ║
+║   Both Legs Fill:     0        (  0.0%) ← Target               ║
+║   One Leg Only:       0        (  0.0%) ⚠️ Risk                ║
+║   Neither Leg:        0        (  0.0%)                             ║
+║ Arb Success Rate:     0.0%                                       ║
+╠════════════════════════════════════════════════════════════════════╣
+║ P&L SIMULATION                                                     ║
+║ ──────────────                                                     ║
+║ Gross Edge Captured:  $0.00                                               ║
+║                                                                    ║
+║ TAKER MODE (3% fee):                                               ║
+║   Fees Paid:          $0.00                                               ║
+║   Net P&L:            $+0.00               NOT PROFITABLE ❌             ║
+║   Projected Daily:    $+0.00                                              ║
+║                                                                    ║
+║ MAKER MODE (0% fee):                                               ║
+║   Fees Paid:          $0.00                                               ║
+║   Net P&L:            $+0.00               NOT PROFITABLE ❌             ║
+║   Projected Daily:    $+0.00                                              ║
+╠════════════════════════════════════════════════════════════════════╣
+║ EDGE ANALYSIS                                                      ║
+║ ─────────────                                                      ║
+║ Average Edge:         0.00%                                       ║
+║ Min Edge:             0.00%                                       ║
+║ Max Edge:             0.00%                                       ║
+║ Average Slippage:     0.00 cents                                  ║
+║ Max Slippage:         0.00 cents                                  ║
+╠════════════════════════════════════════════════════════════════════╣
+║ VERDICT                                                            ║
+║ ───────                                                            ║
+║ Taker Mode: NOT PROFITABLE ❌                                      ║
+║ Maker Mode: NOT PROFITABLE ❌                                      ║
+║                                                                    ║
+║ Recommendation: Neither mode profitable - review strategy         ║
+╚════════════════════════════════════════════════════════════════════╝

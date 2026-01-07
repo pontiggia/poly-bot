@@ -1,0 +1,56 @@
+{
+  "arbs": {
+    "attempts": 1,
+    "both_legs_fill": 1,
+    "neither_leg": 0,
+    "one_leg_only": 0,
+    "partial_arb_rate": 0.0,
+    "success_rate": 1.0
+  },
+  "edge_analysis": {
+    "avg_percent": 4.166666666666667,
+    "max_percent": 4.166666666666667,
+    "min_percent": 4.166666666666667
+  },
+  "fills": {
+    "fill_rate": 1.0,
+    "total_intents": 2,
+    "would_full_fill": 2,
+    "would_not_fill": 0,
+    "would_partial_fill": 0
+  },
+  "opportunities": {
+    "detected": 1,
+    "per_hour": 26.48139137732133
+  },
+  "pnl": {
+    "gross_edge_captured": "2.40",
+    "maker": {
+      "fees": "0",
+      "net_pnl": "2.40",
+      "profitable": true,
+      "projected_daily": "1525.3281433337086127721704538"
+    },
+    "taker": {
+      "fees": "1.7280",
+      "net_pnl": "0.6720",
+      "profitable": true,
+      "projected_daily": "427.09188013343841157620772706"
+    }
+  },
+  "session": {
+    "book_updates": 0,
+    "duration_human": "2m 15s",
+    "duration_secs": 135,
+    "updates_per_second": 0.0
+  },
+  "slippage": {
+    "avg_cents": 0.0,
+    "max_cents": 0.0
+  },
+  "verdict": {
+    "maker_profitable": true,
+    "recommendation": "either_prefer_maker",
+    "taker_profitable": true
+  }
+}

@@ -27,6 +27,18 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+/// Diagnostic statistics for arbitrage strategy
+#[derive(Debug, Clone)]
+pub struct ArbStats {
+    pub checks_total: u64,
+    pub checks_not_two_sided: u64,
+    pub checks_quick_fail: u64,
+    pub checks_full_calc_fail: u64,
+    pub checks_size_too_small: u64,
+    pub checks_exposure_limit: u64,
+    pub intents_generated: u64,
+}
+
 /// Configuration for the math arb strategy
 #[derive(Debug, Clone)]
 pub struct MathArbConfig {
@@ -106,6 +118,14 @@ pub struct MathArbStrategy {
 
     /// Current exposure (approximate, for quick checks)
     current_exposure: std::sync::RwLock<Decimal>,
+
+    /// Diagnostic counters
+    checks_total: AtomicU64,
+    checks_not_two_sided: AtomicU64,
+    checks_quick_fail: AtomicU64,
+    checks_full_calc_fail: AtomicU64,
+    checks_size_too_small: AtomicU64,
+    checks_exposure_limit: AtomicU64,
 }
 
 impl MathArbStrategy {
@@ -131,6 +151,12 @@ impl MathArbStrategy {
             last_trade: dashmap::DashMap::new(),
             trade_count: AtomicU64::new(0),
             current_exposure: std::sync::RwLock::new(Decimal::ZERO),
+            checks_total: AtomicU64::new(0),
+            checks_not_two_sided: AtomicU64::new(0),
+            checks_quick_fail: AtomicU64::new(0),
+            checks_full_calc_fail: AtomicU64::new(0),
+            checks_size_too_small: AtomicU64::new(0),
+            checks_exposure_limit: AtomicU64::new(0),
         }
     }
 
@@ -142,6 +168,19 @@ impl MathArbStrategy {
     /// Get trade count
     pub fn trade_count(&self) -> u64 {
         self.trade_count.load(Ordering::Relaxed)
+    }
+
+    /// Get diagnostic stats
+    pub fn get_stats(&self) -> ArbStats {
+        ArbStats {
+            checks_total: self.checks_total.load(Ordering::Relaxed),
+            checks_not_two_sided: self.checks_not_two_sided.load(Ordering::Relaxed),
+            checks_quick_fail: self.checks_quick_fail.load(Ordering::Relaxed),
+            checks_full_calc_fail: self.checks_full_calc_fail.load(Ordering::Relaxed),
+            checks_size_too_small: self.checks_size_too_small.load(Ordering::Relaxed),
+            checks_exposure_limit: self.checks_exposure_limit.load(Ordering::Relaxed),
+            intents_generated: self.trade_count.load(Ordering::Relaxed),
+        }
     }
 
     /// Check if market is on cooldown
@@ -177,19 +216,27 @@ impl MathArbStrategy {
         pair: &MarketPair,
         ctx: &StrategyContext,
     ) -> Option<Vec<OrderIntent>> {
+        self.checks_total.fetch_add(1, Ordering::Relaxed);
+
         // Get books for both tokens
         let yes_book = ctx.books.get_book(&pair.yes_token_id)?;
         let no_book = ctx.books.get_book(&pair.no_token_id)?;
 
         // Both books need to be two-sided
         if !yes_book.is_two_sided() || !no_book.is_two_sided() {
+            self.checks_not_two_sided.fetch_add(1, Ordering::Relaxed);
             return None;
         }
 
         // Quick check first
-        let (yes_ask, no_ask, edge) =
-            self.edge_calculator
-                .quick_check(ctx.books, &pair.yes_token_id, &pair.no_token_id)?;
+        let quick_result = self.edge_calculator.quick_check(ctx.books, &pair.yes_token_id, &pair.no_token_id);
+        
+        if quick_result.is_none() {
+            self.checks_quick_fail.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        
+        let (yes_ask, no_ask, edge) = quick_result.unwrap();
 
         debug!(
             market = %pair.condition_id,
@@ -208,6 +255,7 @@ impl MathArbStrategy {
         );
 
         if !calc.is_profitable {
+            self.checks_full_calc_fail.fetch_add(1, Ordering::Relaxed);
             debug!(
                 market = %pair.condition_id,
                 actual_edge = %calc.actual_edge,
@@ -231,6 +279,7 @@ impl MathArbStrategy {
             .max(Decimal::ZERO);
 
         if trade_size < self.config.min_position_size {
+            self.checks_size_too_small.fetch_add(1, Ordering::Relaxed);
             debug!(
                 market = %pair.condition_id,
                 trade_size = %trade_size,
@@ -243,6 +292,7 @@ impl MathArbStrategy {
         // Check exposure limit
         let total_notional = (yes_ask + no_ask) * trade_size;
         if !self.check_exposure_limit(total_notional) {
+            self.checks_exposure_limit.fetch_add(1, Ordering::Relaxed);
             debug!(
                 market = %pair.condition_id,
                 "Exposure limit would be exceeded"

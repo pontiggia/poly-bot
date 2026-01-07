@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Market WebSocket connection
 pub struct MarketWebSocket {
@@ -20,6 +21,8 @@ pub struct MarketWebSocket {
     token_ids: Vec<TokenId>,
     /// Channel to send parsed messages
     message_tx: mpsc::UnboundedSender<MarketMessage>,
+    /// Raw WebSocket message counter (increments for every incoming raw message)
+    raw_message_counter: Arc<AtomicU64>,
 }
 
 /// Message types from market WebSocket
@@ -91,10 +94,12 @@ impl MarketWebSocket {
     pub fn new(
         token_ids: Vec<TokenId>,
         message_tx: mpsc::UnboundedSender<MarketMessage>,
+        raw_message_counter: Arc<AtomicU64>,
     ) -> Self {
         Self {
             token_ids,
             message_tx,
+            raw_message_counter,
         }
     }
 
@@ -192,6 +197,8 @@ impl MarketWebSocket {
 
     /// Handle incoming WebSocket message
     async fn handle_message(&self, msg: Message) -> Result<()> {
+        // Count every raw message received from the WebSocket
+        self.raw_message_counter.fetch_add(1, Ordering::Relaxed);
         match msg {
             Message::Text(text) => {
                 // Log raw messages for debugging (truncated)

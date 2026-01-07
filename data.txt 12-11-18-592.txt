@@ -1,0 +1,56 @@
+
+curl -s "https://clob.polymarket.com/book?token_id=24987631508471554741620794727487253902047372973830655708822916260927541162666" | jq
+This one is live. Now let me check the market info and fee rate:
+
+
+curl -s "https://clob.polymarket.com/fee-rate?token_id=24987631508471554741620794727487253902047372973830655708822916260927541162666" | jq
+Now let me get the market info to see both tokens:
+
+
+curl -s "https://clob.polymarket.com/market/0x7a8c9be27d64524fc00001cf41026ba734d5749c1ca7deaa89864199ae5fd892" | jq
+
+curl -s "https://clob.polymarket.com/market/0x7a8c9be27d64524fc00001cf41026ba734d5749c1ca7deaa89864199ae5fd892"
+Interesting! The /market/{condition_id} endpoint returns 404 for this live market. Let me try searching for it in the markets list:
+
+
+curl -s "https://clob.polymarket.com/markets?condition_id=0x7a8c9be27d64524fc00001cf41026ba734d5749c1ca7deaa89864199ae5fd892" | jq '.data[0]' 2>/dev/null
+The query param didn't work - it just returned the first market. Let me try the Gamma API with the event slug from the URL:
+
+
+curl -s "https://gamma-api.polymarket.com/events/btc-updown-15m-1767758400" | jq
+
+curl -s "https://gamma-api.polymarket.com/events?slug=btc-updown-15m-1767758400" | jq '.[0]' 2>/dev/null | head -c 3000
+Now let me get the full market info with the clobTokenIds:
+
+
+curl -s "https://gamma-api.polymarket.com/events?slug=btc-updown-15m-1767758400" | jq '.[0].markets[0] | {conditionId, outcomes, clobTokenIds}'
+Excellent! Now I have the full picture. Let me verify both books:
+
+
+echo "=== UP TOKEN ===" && curl -s "https://clob.polymarket.com/book?token_id=24987631508471554741620794727487253902047372973830655708822916260927541162666" | jq '{asset_id, best_bid: .bids[-1].price, best_ask: .asks[-1].price}' && echo "=== DOWN TOKEN ===" && curl -s "https://clob.polymarket.com/book?token_id=31419718950412866993454632142323756427503490705613267285150156809183569033252" | jq '{asset_id, best_bid: .bids[-1].price, best_ask: .asks[-1].price}'
+Perfect! Now I have full clarity on the API structure. Let me summarize:
+
+Key Findings
+1. Gamma API is the right source for market discovery
+Returns:
+
+outcomes: "[\"Up\", \"Down\"]" (JSON string, NOT array!)
+clobTokenIds: "[\"token1\", \"token2\"]" (JSON string, NOT array!)
+2. CLOB /market/{condition_id} doesn't work for 15-min markets
+These ephemeral markets return 404 on the single-market endpoint but work via the book endpoint.
+
+3. 15-min crypto markets use "Up"/"Down" NOT "Yes"/"No"
+The first token is "Up", second is "Down" - which map to YES/NO in terms of our arb strategy.
+
+4. Current books show
+Token	Best Bid	Best Ask
+UP	$0.77	$0.78
+DOWN	$0.22	$0.23
+Combined ask: $0.78 + $0.23 = $1.01 (no arb opportunity right now)
+
+5. Fee structure confirmed
+Fixes Needed for endpoints.rs:
+Parse wrapped response for /markets endpoint
+Handle stringified JSON for clobTokenIds and outcomes from Gamma
+Support "Up"/"Down" as well as "Yes"/"No" for token pair detection
+Add Gamma API client as separate module for market discovery

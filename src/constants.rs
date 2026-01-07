@@ -132,8 +132,8 @@ pub const DEFAULT_MIN_EDGE: Decimal = dec!(0.03);
 /// Extra margin for thin order books
 pub const THIN_BOOK_EXTRA_MARGIN: Decimal = dec!(0.01);
 
-/// Minimum edge for maker arb (no fees)
-pub const MAKER_MIN_EDGE: Decimal = dec!(0.01);
+/// Minimum edge for maker arb (no fees) - 0.2% = 0.002
+pub const MAKER_MIN_EDGE: Decimal = dec!(0.002);
 
 // ============================================================================
 // FEE IDENTIFICATION

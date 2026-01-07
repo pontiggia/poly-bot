@@ -20,6 +20,7 @@ use crate::config::{Config, OperatingMode};
 use crate::execution::{DualPolicy, ExecutionResult, ExecutionStatus, OrderExecutor, OrderTracker};
 use crate::kill_switch::KillSwitch;
 use crate::ledger::Ledger;
+use crate::paper::{PaperConfig, PaperTrader, ResolutionTracker};
 use crate::risk::CircuitBreaker;
 use crate::signing::OrderSigner;
 use crate::state::OrderBookState;
@@ -29,6 +30,7 @@ use crate::strategy::{
 use crate::websocket::{MarketMessage, MarketWebSocket, UserMessage, UserWebSocket};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -49,16 +51,24 @@ pub struct Bot {
     market_registry: Arc<MarketPairRegistry>,
     /// Strategy router
     strategy_router: Arc<StrategyRouter>,
+    /// Math arb strategy (for stats access)
+    math_arb_strategy: Arc<MathArbStrategy>,
     /// Circuit breaker for risk management
     circuit_breaker: Arc<CircuitBreaker>,
     /// Order executor for submitting trades
     executor: Arc<OrderExecutor>,
     /// Order tracker for outstanding GTC orders
     order_tracker: Arc<OrderTracker>,
+    /// Paper trader (for paper mode simulation)
+    paper_trader: Option<PaperTrader>,
+    /// Resolution tracker (for settling paper positions)
+    resolution_tracker: Option<Arc<ResolutionTracker>>,
     /// Market WebSocket message receiver
     market_ws_rx: mpsc::UnboundedReceiver<MarketMessage>,
     /// Market WebSocket task handle
     market_ws_task: JoinHandle<()>,
+    /// Raw market websocket message counter (incremented by MarketWebSocket)
+    market_message_counter: Arc<AtomicU64>,
     /// User WebSocket message receiver
     user_ws_rx: mpsc::UnboundedReceiver<UserMessage>,
     /// User WebSocket task handle
@@ -106,14 +116,14 @@ impl Bot {
 
         // Register MathArbStrategy with appropriate config
         let arb_config = if config.use_maker_mode {
-            info!("Using MAKER mode for arb strategy (1% min edge, GTC orders, 0% fees)");
+            info!("Using MAKER mode for arb strategy (0.2% min edge, GTC orders, 0% fees)");
             crate::strategy::MathArbConfig::maker()
         } else {
             info!("Using TAKER mode for arb strategy (3% min edge, FOK orders)");
             crate::strategy::MathArbConfig::taker()
         };
         let math_arb = Arc::new(MathArbStrategy::with_config(market_registry.clone(), arb_config));
-        if let Err(e) = strategy_router.register(math_arb) {
+        if let Err(e) = strategy_router.register(math_arb.clone()) {
             warn!("Failed to register MathArbStrategy: {}", e);
         }
 
@@ -152,7 +162,7 @@ impl Bot {
         
         // Note: 15-min crypto markets use neg-risk exchange
         let executor = Arc::new(OrderExecutor::new(
-            api_client,
+            api_client.clone(),
             order_signer,
             policy,
             circuit_breaker.clone(),
@@ -163,9 +173,44 @@ impl Bot {
         // Set up order tracker for outstanding orders
         let order_tracker = Arc::new(OrderTracker::new());
 
+        // Set up paper trading components if in paper mode
+        let (paper_trader, resolution_tracker) = if config.mode == OperatingMode::Paper {
+            info!("📋 Initializing PAPER TRADING mode");
+            
+            // Create paper config based on bot config
+            let paper_config = if config.use_maker_mode {
+                PaperConfig::maker_mode()
+            } else {
+                PaperConfig::default()
+            }
+            .with_capital(config.max_bet_usd)
+            .with_verbose(true);
+
+            let paper_trader = PaperTrader::new(paper_config, market_registry.clone());
+            
+            // Create resolution tracker for settling positions
+            let resolution_tracker = Arc::new(ResolutionTracker::new(
+                api_client.clone(),
+                Duration::from_secs(300), // Check every 5 minutes
+            ));
+
+            info!("📋 Paper trading initialized with ${} capital", config.max_bet_usd);
+            
+            (Some(paper_trader), Some(resolution_tracker))
+        } else {
+            info!("🚀 LIVE TRADING mode - executing real orders");
+            (None, None)
+        };
+
         // Set up Market WebSocket for order book data
         let (market_ws_tx, market_ws_rx) = mpsc::unbounded_channel();
-        let market_ws = Arc::new(MarketWebSocket::new(token_ids.clone(), market_ws_tx));
+        // Shared raw-message counter for WebSocket telemetry
+        let market_message_counter = Arc::new(AtomicU64::new(0));
+        let market_ws = Arc::new(MarketWebSocket::new(
+            token_ids.clone(),
+            market_ws_tx,
+            market_message_counter.clone(),
+        ));
 
         // Spawn Market WebSocket task
         let market_ws_clone = market_ws.clone();
@@ -202,11 +247,15 @@ impl Bot {
             ledger,
             market_registry,
             strategy_router,
+            math_arb_strategy: math_arb.clone(),
             circuit_breaker,
             executor,
             order_tracker,
+            paper_trader,
+            resolution_tracker,
             market_ws_rx,
             market_ws_task,
+            market_message_counter,
             user_ws_rx,
             user_ws_task,
             last_log_time: HashMap::new(),
@@ -225,6 +274,7 @@ impl Bot {
     /// - User WS: Fill notifications processed instantly
     /// - Tick: Every 100ms for strategy periodic logic
     /// - Heartbeat: Every 10s for logging/monitoring
+    /// - Resolution check: Every 5 minutes (paper mode only)
     /// - Kill signal: Async shutdown trigger
     pub async fn run(&mut self) {
         info!("Starting bot main loop (event-driven)...");
@@ -234,6 +284,9 @@ impl Bot {
         
         // Heartbeat for logging (10s)
         let mut heartbeat_interval = interval(Duration::from_secs(10));
+        
+        // Resolution check for paper mode (5 minutes)
+        let mut resolution_interval = interval(Duration::from_secs(300));
 
         loop {
             tokio::select! {
@@ -258,6 +311,11 @@ impl Bot {
                 // Heartbeat - 10s periodic logging
                 _ = heartbeat_interval.tick() => {
                     self.log_heartbeat();
+                }
+                
+                // Resolution check - 5 min periodic (paper mode only)
+                _ = resolution_interval.tick() => {
+                    self.check_resolutions().await;
                 }
 
                 // Kill signal - graceful shutdown
@@ -396,11 +454,14 @@ impl Bot {
         
         let active_orders = self.order_tracker.active_count();
         
+        // Base heartbeat
+        let raw_ws_msgs = self.market_message_counter.load(Ordering::Relaxed);
         info!(
-            "Heartbeat [{}]: {} markets | {} msgs | {:.1} msg/s | {} intents | {} execs | {} fills | {} active | CB: {}",
+            "Heartbeat [{}]: {} markets | {} msgs (raw_ws: {}) | {:.1} msg/s | {} intents | {} execs | {} fills | {} active | CB: {}",
             mode_str,
             self.order_book_state.num_markets(),
             self.total_messages,
+            raw_ws_msgs,
             self.total_messages as f64 / 10.0,  // msgs per second (over 10s window)
             self.total_intents,
             self.total_executions,
@@ -408,6 +469,37 @@ impl Bot {
             active_orders,
             circuit_status
         );
+        
+        // Paper trading stats
+        if let Some(ref paper_trader) = self.paper_trader {
+            let stats = paper_trader.stats();
+            info!(
+                "📋 Paper Stats: {} opps | {} arbs ({} success, {} partial) | Taker P&L: ${:.2} | Maker P&L: ${:.2} | {} open pos",
+                stats.opportunities,
+                stats.arb_attempts,
+                stats.successful_arbs,
+                stats.partial_arbs,
+                stats.simulated_pnl_taker,
+                stats.simulated_pnl_maker,
+                stats.open_positions
+            );
+        }
+
+        // Arb strategy diagnostics
+        let arb_stats = self.math_arb_strategy.get_stats();
+        if arb_stats.checks_total > 0 {
+            info!(
+                "🔍 Arb Checks: {} total | {} not 2-sided | {} quick fail | {} calc fail | {} too small | {} exposure | ✅ {} intents",
+                arb_stats.checks_total,
+                arb_stats.checks_not_two_sided,
+                arb_stats.checks_quick_fail,
+                arb_stats.checks_full_calc_fail,
+                arb_stats.checks_size_too_small,
+                arb_stats.checks_exposure_limit,
+                arb_stats.intents_generated
+            );
+        }
+        
         // Reset counter for next interval
         self.total_messages = 0;
     }
@@ -498,19 +590,19 @@ impl Bot {
         // Check operating mode
         match self.config.mode {
             OperatingMode::Paper => {
-                info!(
-                    "📋 PAPER MODE: Would execute {} order(s) - not submitting",
-                    intents.len()
-                );
-                // In paper mode, we just log what would happen
-                for intent in &intents {
+                // Route to paper trader for realistic simulation
+                if let Some(ref mut paper_trader) = self.paper_trader {
+                    let fills = paper_trader.process_intents(intents, &self.order_book_state);
+                    
+                    // Log summary
+                    let filled_count = fills.iter().filter(|f| f.would_fill()).count();
                     info!(
-                        "  [PAPER] {} {} @ ${:.4} x {}",
-                        format!("{:?}", intent.side),
-                        &intent.token_id[..intent.token_id.len().min(16)],
-                        intent.price,
-                        intent.size
+                        "📋 PAPER: Simulated {} order(s) → {} would fill",
+                        fills.len(),
+                        filled_count
                     );
+                } else {
+                    warn!("Paper trader not initialized - cannot simulate orders");
                 }
             }
             OperatingMode::Live => {
@@ -684,6 +776,20 @@ impl Bot {
             info!("Processing {} shutdown intent(s)", shutdown_intents.len());
             self.process_intents(shutdown_intents);
         }
+        
+        // Generate final paper trading report
+        if let Some(ref paper_trader) = self.paper_trader {
+            info!("📋 Generating final paper trading report...");
+            paper_trader.generate_report();
+            
+            // TODO: Export arb history to CSV (need to add csv crate)
+            // let csv_path = std::path::PathBuf::from("./paper_reports/arb_history.csv");
+            // if let Err(e) = paper_trader.export_arbs(&csv_path) {
+            //     warn!("Failed to export arb history: {}", e);
+            // } else {
+            //     info!("📊 Arb history exported to {:?}", csv_path);
+            // }
+        }
 
         // Abort WebSocket tasks
         self.market_ws_task.abort();
@@ -701,6 +807,17 @@ impl Bot {
         );
 
         info!("Bot shutdown complete");
+    }
+    
+    /// Check for market resolutions (paper mode only)
+    async fn check_resolutions(&mut self) {
+        if self.config.mode != OperatingMode::Paper {
+            return;
+        }
+        
+        // TODO: Implement resolution checking
+        // This would poll the resolution tracker and update position tracker
+        debug!("Resolution check not yet implemented");
     }
 
     /// Get reference to order book state (for external access)

@@ -71,19 +71,21 @@ async fn main() -> anyhow::Result<()> {
     // ===========================================================================
     // MARKET DISCOVERY
     // ===========================================================================
-    // Discover 15-minute crypto markets from Gamma API
-    // Uses slug-based discovery: btc-updown-15m-{timestamp}, etc.
+    // Discover ALL active tradeable markets from Gamma API
+    // Includes: crypto, politics, sports, entertainment, etc.
     // ===========================================================================
 
-    info!("Discovering 15-min crypto markets from Gamma API...");
+    info!("Discovering ALL active markets from Gamma API...");
     
     let discovery = MarketDiscovery::new();
     
-    // Discover 15-min crypto markets (Up/Down) using slug pattern discovery
-    let discovered = match discovery.discover_crypto_15min().await {
+    // Discover all active tradeable binary markets
+    // No filters - scan everything for arbitrage opportunities
+    let filter = polymarket_bot::api::discovery::MarketFilter::new();
+    let discovered = match discovery.discover_all(&filter).await {
         Ok(markets) => {
-            // Limit to first 5 markets
-            markets.into_iter().take(5).collect::<Vec<_>>()
+            // Use all discovered markets
+            markets
         }
         Err(e) => {
             warn!("Failed to discover markets from API: {}", e);
@@ -93,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
     };
     
     let (market_pairs, token_ids): (Vec<MarketPair>, Vec<String>) = if !discovered.is_empty() {
-        info!("Discovered {} tradeable 15-min crypto markets", discovered.len());
+        info!("Discovered {} tradeable markets", discovered.len());
         
         let mut pairs = Vec::new();
         let mut tokens = Vec::new();

@@ -1,0 +1,57 @@
+
+╔════════════════════════════════════════════════════════════════════╗
+║            PAPER TRADING REPORT -        2m 15s                   ║
+╠════════════════════════════════════════════════════════════════════╣
+║ MARKET ACTIVITY                                                    ║
+║ ───────────────                                                    ║
+║ Session Duration:     2m 15s                                        ║
+║ Book Updates:         0                    (0.0/sec)               ║
+╠════════════════════════════════════════════════════════════════════╣
+║ STRATEGY PERFORMANCE                                               ║
+║ ────────────────────                                               ║
+║ Opportunities Found:  1                    (26.48/hour)              ║
+║ Order Intents:        2                                                    ║
+║                                                                    ║
+║ Fill Simulation:                                                   ║
+║   Would Full Fill:    2        (100.0%)                             ║
+║   Would Partial Fill: 0        (  0.0%)                             ║
+║   Would Not Fill:     0        (  0.0%)                             ║
+║   Fill Rate:          100.0%                                       ║
+╠════════════════════════════════════════════════════════════════════╣
+║ ARB EXECUTION                                                      ║
+║ ─────────────                                                      ║
+║ Arb Attempts:         1                                                    ║
+║   Both Legs Fill:     1        (100.0%) ← Target               ║
+║   One Leg Only:       0        (  0.0%) ⚠️ Risk                ║
+║   Neither Leg:        0        (  0.0%)                             ║
+║ Arb Success Rate:     100.0%                                       ║
+╠════════════════════════════════════════════════════════════════════╣
+║ P&L SIMULATION                                                     ║
+║ ──────────────                                                     ║
+║ Gross Edge Captured:  $2.40                                               ║
+║                                                                    ║
+║ TAKER MODE (3% fee):                                               ║
+║   Fees Paid:          $1.72                                               ║
+║   Net P&L:            $+0.67               PROFITABLE ✅               ║
+║   Projected Daily:    $+427.09                                            ║
+║                                                                    ║
+║ MAKER MODE (0% fee):                                               ║
+║   Fees Paid:          $0.00                                               ║
+║   Net P&L:            $+2.40               PROFITABLE ✅               ║
+║   Projected Daily:    $+1525.32                                           ║
+╠════════════════════════════════════════════════════════════════════╣
+║ EDGE ANALYSIS                                                      ║
+║ ─────────────                                                      ║
+║ Average Edge:         4.17%                                       ║
+║ Min Edge:             4.17%                                       ║
+║ Max Edge:             4.17%                                       ║
+║ Average Slippage:     0.00 cents                                  ║
+║ Max Slippage:         0.00 cents                                  ║
+╠════════════════════════════════════════════════════════════════════╣
+║ VERDICT                                                            ║
+║ ───────                                                            ║
+║ Taker Mode: PROFITABLE ✅                                          ║
+║ Maker Mode: PROFITABLE ✅                                          ║
+║                                                                    ║
+║ Recommendation: Both modes profitable - MAKER preferred (higher profit)║
+╚════════════════════════════════════════════════════════════════════╝

@@ -327,7 +327,7 @@ impl GammaClient {
     }
     
     /// Supported crypto assets for 15-min Up/Down markets
-    pub const CRYPTO_ASSETS: &'static [&'static str] = &["btc", "eth", "sol"];
+    pub const CRYPTO_ASSETS: &'static [&'static str] = &["btc", "eth", "sol", "xrp"];
     
     /// Discover 15-minute crypto markets by slug pattern
     /// 

@@ -26,6 +26,7 @@ pub mod signing;
 pub mod state;
 pub mod strategy;
 pub mod websocket;
+pub mod paper;
 
 pub use api::{ApiClient, ApiCredentials};
 pub use bot::Bot;
@@ -33,4 +34,5 @@ pub use config::Config;
 pub use error::{BotError, Result};
 pub use kill_switch::KillSwitch;
 pub use signing::{Order, OrderBuilder, OrderSigner};
+pub use paper::{PaperConfig, PaperTrader};
 
