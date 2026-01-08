@@ -1,0 +1,97 @@
+Bot that will earn even more from the commissions
+
+Polymarket introduced fees on 15-minute BTC markets to fund the rebates program
+
+here's what happens:
+
+- simple taker bots with market orders will die
+every trade now costs fees, unprofitable strategies become even worse
+
+- maker bots with limit orders will thrive
+don't pay commissions + get bonuses when their orders get filled
+
+'Gabagool' - arbitrage bot that catches misprices on YES/NO
+buys both outcomes < $1.00 and locks profit regardless of result
+
+now gets ~$58.5 per trade (per 15 minutes)
+
+it works as a maker, so doesn't pay commissions at all
+catches the same spreads + now gets rebates from the commission pool
+
+adds roughly ~$300 per day to profit
+
+bots that are built right will become even more dominant
+fees filter out the weak, strong get stronger
+
+his profile: https://polymarket.com/@gabagool22?via=archive
+
+
+.
+@Polymarket
+ just introduced market making rewards on 15-minute polymarkets
+
+For some reason, all I saw on X today was people saying that Polymarket added trading fees, but most of them completely misunderstood what actually happened
+
+Polymarket introduced taker fees so that all the fees collected go directly to paying out people who are doing market making
+
+Most likely this is still only described in the docs and not fully live on the site yet, but I’m pretty sure it’ll be rolled out very soon
+
+And honestly, I think this is a very great move. Over time, this will probably be added to all crypto markets first and then eventually to all markets that are lacking liquidity
+
+Really curious to see how big the reward pools will be. This is a great direction for people who don’t want to gamble, but want to earn systematically instead
+
+
+POLYMARKET INTRODUCES TRADING FEES
+
+Polymarket is introducing taker fees (and a maker rebate program) only on 15‑minute crypto markets
+​
+If you trade or market‑make via API, code changes are required so orders correctly handle fee‑enabled markets
+
+What’s changing
+- Taker fees apply when you remove liquidity (e.g., market orders / crossing the spread) in 15‑minute crypto markets
+​
+- Those taker fees fund Maker Rebates, paid daily in USDC to traders whose limit orders add liquidity and get filled
+​
+- Polymarket says currently 100% of collected fees in these markets are redistributed back to makers as rebates
+
+Will fees crush the $100k/mo bots? 
+
+Example https://polymarket.com/@Account88888?via=sales
+
+Aggressive takers now bleed PnL, while makers get paid to quote (100% rebates)
+The meta just shifted from speed to liquidity. Adapt or pay up
+
+What’s Next?
+Fees were probably inevitable: it's hard to run a venue at scale without a sustainable revenue model, and incentives (rebates) need funding
+
+A JavaScript bot turned broken prices into $330K using the same trick over and over.
+
+The glitch appears every few seconds. Most miss it. This bot never does.
+
+distinct-baguette sat buried deep in a leaderboard. Another crypto bot grinding 15 minute windows. Almost closed the tab.
+
+Then I saw the win rate. 75%. That is low for a profitable bot. Way too low. Something was off.
+
+Turns out I was looking at it wrong.
+
+→ Account: https://polymarket.com/@distinct-baguette?via=marlowxbt
+
+This bot does not predict anything. Does not care if BTC goes up or down. Does not read charts. Does not time entries. It watches one thing: prices that do not add up.
+
+Sounds weird until you see the trick.
+
+Polymarket 15 minute windows have two sides. YES and NO. One always pays $1. So YES + NO should equal $1. Basic math.
+
+But when markets move fast, prices slip. YES at 48 cents. NO at 49 cents. Total: 97 cents.
+
+Bot sees this. Buys both sides. Waits. Market closes. One side pays $1. Spent 97 cents. Keeps 3 cents. Does not matter who wins.
+
+The script scans Polymarket every few seconds. BTC. SOL. XRP. Anything with volume. Prices slip under 99 cents combined. It fires.
+
+Three cents per trade. Thousands of times. That is how you stack $316K.
+
+The 75% win rate finally made sense. He is not picking winners. He is locking profit before the bet even resolves.
+
+Everyone else bets on outcomes.
+
+This bot bets on broken math.

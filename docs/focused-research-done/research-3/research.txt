@@ -1,0 +1,30 @@
+Market Selection Criteria Findings
+1. Identifying 15-Minute Crypto Markets Programmatically
+The docs mention "15-minute crypto markets" specifically in the context of fees and maker rebates, but don't provide a direct filter parameter for them. You can identify them by:
+Method 1: Check fee rate
+
+GET https://clob.polymarket.com/fee-rate?token_id={token_id}
+# Returns fee_rate_bps: 1000 for 15-min crypto markets
+# Returns fee_rate_bps: 0 for other markets
+
+Method 2: Filter by tags
+
+# Get crypto tag ID first
+curl "https://gamma-api.polymarket.com/tags"
+
+# Then filter markets
+curl "https://gamma-api.polymarket.com/events?tag_id=<crypto_tag_id>&active=true&closed=false"
+
+2. API Calls for Filtering
+Key Gamma API parameters:
+tag_id - Filter by category (crypto, sports, etc.)
+active=true / closed=false - Only tradeable markets
+series_id - For sports leagues
+order=startTime - Sort by resolution time
+3. Other High-Frequency Market Types
+The docs highlight:
+Sports game bets (use tag_id=100639 for game bets vs futures)
+Automated sports leagues via /sports endpoint
+Markets with short resolution windows (check endDate field)
+Gap Identified
+The docs don't expose a direct "resolution_interval" or "market_type" filter for 15-minute markets. You'd need to empirically identify them via fee rates or tag patterns.

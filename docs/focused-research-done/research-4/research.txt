@@ -1,0 +1,78 @@
+ALLOY vs ETHERS-RS — DECISION SUMMARY (FOR POLYMARKET BOT)
+
+Goal
+Verify whether Alloy is production-ready and fully capable of handling Polymarket EIP-712 signing, or whether we should stay on ethers-rs.
+
+⸻
+
+	1.	Production Readiness
+
+	•	Alloy is the official successor to ethers-rs.
+	•	Alloy has reached v1.0 with semantic versioning guarantees.
+	•	Actively maintained and recommended by the Rust/Ethereum ecosystem.
+	•	ethers-rs is effectively legacy and no longer the forward path.
+
+Conclusion: Alloy is production-ready and future-proof.
+
+⸻
+
+	2.	EIP-712 Signing Capability
+
+Alloy supports everything required for Polymarket CLOB signing:
+	•	EIP-712 domain construction (chainId, verifyingContract, name, version).
+	•	ABI encoding for EIP-712 typed data.
+	•	Hashing and signing using local private keys via Signer trait.
+	•	Supports both:
+	•	Static encoding (safer, faster, preferred where possible)
+	•	Dynamic encoding (needed for runtime-defined order structs)
+
+Signing workflow (Domain → Struct Hash → EIP-712 Digest → Signature) is fully supported.
+
+Conclusion: Alloy fully supports EIP-712 signing.
+
+⸻
+
+	3.	Real-World Usage / Examples
+
+	•	Alloy official examples include:
+	•	EIP-712 style signing
+	•	Permit and typed-data signatures
+	•	ABI encoding (static and dynamic)
+	•	Polymarket-style order signing is feasible using alloy_dyn_abi + alloy_signer.
+	•	While Polymarket does not publish an “official Alloy example”, the required primitives exist and are used in production elsewhere.
+
+Conclusion: No blocker for Polymarket order signing with Alloy.
+
+⸻
+
+	5.	Alloy vs ethers-rs Comparison
+
+Alloy:
+	•	Actively maintained
+	•	Faster ABI encoding
+	•	Modern architecture
+	•	Future ecosystem standard
+	•	Full EIP-712 support
+
+ethers-rs:
+	•	Mature but legacy
+	•	Slower
+	•	Deprecated directionally
+	•	No long-term advantage over Alloy
+
+⸻
+
+FINAL DECISION
+
+Use ALLOY.
+	•	It checks all required boxes for Polymarket:
+	•	EIP-712 signing
+	•	Production stability
+	•	Performance
+	•	Long-term ecosystem support
+	•	ethers-rs is not safer at this point — it is simply older.
+
+Action Item:
+Proceed with Alloy for signing and ABI handling.
+Add input validation around EIP-712 typed data.
+Prefer static encoding where feasible.

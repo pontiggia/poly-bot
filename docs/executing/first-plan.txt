@@ -1,0 +1,1067 @@
+# Polymarket Bot - Complete Execution Plan
+
+> **⚠️ HISTORICAL DOCUMENT** - This file documents the original build plan.
+> For current behavior, see [STATE-OF-THE-BOT.md](../STATE-OF-THE-BOT.md)
+
+## Current Status: Phase 9 Complete - PROFITABLE ✅
+
+**Latest Update:** 2026-01-08
+
+### Progress Summary
+- ✅ **Phase 0:** Wallet Setup - Funded trading wallet with API credentials
+- ✅ **Phase 1:** Project Foundation - Cargo.toml, types, kill switch (8 tests passing)
+- ✅ **Phase 2:** WebSocket Connectivity - Real-time market data streaming working
+- ✅ **Phase 3:** HTTP Client & Authentication - REST API + EIP-712 signing (25 tests passing)
+- ✅ **Phase 4:** Ledger & State Machine - Authoritative portfolio state (56 tests passing)
+- ✅ **Phase 5:** Risk Management - Circuit breaker, limits, reconciliation (75 tests passing)
+- ✅ **Phase 6:** Strategy Framework - Traits, router, executor, policies (94 tests passing)
+- ✅ **Event-Driven Refactor:** tokio::select! architecture, <1ms latency
+- ✅ **Phase 7:** Math arb strategy (MVP) - Market pair registry, edge calculator, MathArbStrategy (115 tests)
+- ✅ **Phase 7.5:** API Fix & Market Discovery - Fixed CLOB/Gamma API, slug-based 15-min crypto discovery (136 tests)
+- ✅ **Phase 8:** Wire Execution Policies - Full execution pipeline connected (136 tests)
+- ✅ **Phase 8.5:** Maker Strategy Enhancement - Zero-fee maker execution (150 tests)
+- ✅ **Phase 9:** Integration & Live Testing - **PROFITABLE** +$1.10 (3.24%) (154 tests)
+- ⏸️ **Phase 10:** Monitoring and deployment
+
+### Live Session Results (2026-01-08)
+- **Profit:** +$1.10 (3.24% return on $33.85 invested)
+- **Orders Placed:** 8
+- **Orders Filled:** 7
+- **Fees Paid:** $0.00 (all maker)
+
+### Post-Phase 9 Fixes Applied
+- ✅ Dynamic share sizing to meet $1.00 minimum order value
+- ✅ Parallel execution for maker arb legs (tokio::join!)
+- ✅ Critical error handling (circuit breaker trips on orphaned positions)
+- ✅ Fill detection fix (correct size matching with to_fill_for_order)
+
+### Key Achievements
+- WebSocket successfully receiving live Polymarket order book data
+- User WebSocket for trade/fill notifications implemented
+- Order book state tracking with lock-free DashMap
+- Ledger system: orders, positions, cash tracking
+- Order state machine with lifecycle management
+- Bot module with event-driven tokio::select! architecture
+- Clean separation: main.rs (86 lines), bot.rs (~730 lines)
+- Kill switch with async Notify + file watcher
+- HTTP client with connection pooling and optimized settings
+- HMAC authentication for REST API
+- EIP-712 order signing with alloy (verified hash constants)
+- Risk management: circuit breaker, position limits, loss limits
+- Strategy framework: traits, router, executor with policies
+- Event-driven architecture: <1ms latency, efficient async
+- Market pair registry for YES/NO (Up/Down) token tracking
+- Dynamic edge calculator with fee/liquidity awareness
+- MathArbStrategy with arb detection and intent generation
+- Gamma API client for market discovery
+- Slug-based discovery for 15-min crypto markets (BTC, ETH, SOL)
+- MarketPair supports Up/Down outcomes (not just Yes/No)
+- Bot auto-discovers live markets on startup
+- **Phase 8:** Full execution pipeline wired: Strategy → Policy → Executor → API
+- **Phase 8:** Paper mode (safe testing) vs Live mode (real trading)
+- **Phase 8:** Circuit breaker integration in execution path
+- **Phase 8:** Execution result tracking and logging
+- **Phase 8.5:** DualPolicy for Taker/Maker routing based on urgency
+- **Phase 8.5:** OrderTracker for outstanding GTC order management
+- **Phase 8.5:** CancellationManager for order cleanup
+- **Phase 8.5:** User WebSocket wired for fill notifications
+- **Phase 8.5:** Maker mode config (USE_MAKER_MODE=true for 1% edge, 0% fees)
+- **Phase 9:** Live trading verified profitable (+$1.10)
+- **Phase 9:** Dynamic share sizing for $1.00 minimum order value
+- **Phase 9:** Parallel execution for maker arb legs
+- **Phase 9:** Critical error handling with circuit breaker
+- All tests passing (154 unit tests)
+
+---
+
+## Overview
+
+This plan covers the complete implementation of a high-frequency Polymarket trading bot in Rust, following the architecture in `/Users/pontidev/Developer/poly-bot/planning/`.
+
+**Philosophy:** Correctness FIRST, then speed. A fast bot that loses money is worse than a slow bot that doesn't.
+
+**Approach:** Phase by phase - implement entire phase, test, then move to next.
+
+---
+
+## Phase 0: Wallet Setup (PREREQUISITE)
+
+**Goal:** Set up a funded trading wallet separate from your main wallet.
+
+### Why a Separate Wallet?
+- **Security:** Bot has access to private key - limit exposure
+- **Operational separation:** Only fund with what you're willing to risk
+- **Polymarket requirement:** Need a "signer" wallet for EIP-712 order signing
+
+### Step 0.1: Create New Wallet
+
+**Option A: Using MetaMask (Easiest)**
+1. Open MetaMask → Click account icon → "Add account or hardware wallet" → "Add a new account"
+2. Name it "Polybot Trading"
+3. Click the 3 dots → "Account details" → "Show private key"
+4. Enter your password → Copy the private key
+5. **SAVE THIS SECURELY** (password manager, NOT in code)
+
+**Option B: Using CLI (More Secure)**
+```bash
+# Install cast (part of Foundry)
+curl -L https://foundry.paradigm.xyz | bash
+foundryup
+
+# Generate new wallet
+cast wallet new
+
+# Output will show:
+# Address: 0x...
+# Private key: 0x...
+```
+
+### Step 0.2: Fund the Wallet on Polygon
+
+1. **Get MATIC for gas** (small amount, ~$5 worth)
+   - Send from your main wallet, OR
+   - Use a bridge from Ethereum, OR
+   - Buy on exchange and withdraw to Polygon
+
+2. **Get USDC on Polygon** (your trading capital)
+   - Option A: Bridge USDC from Ethereum using https://wallet.polygon.technology/
+   - Option B: Send USDC from exchange (Coinbase, Binance) directly to Polygon
+   - **Start small:** $50-100 for testing
+
+### Step 0.3: Connect to Polymarket
+
+1. Go to https://polymarket.com
+2. Connect with your NEW trading wallet
+3. **Deposit USDC** into Polymarket (they use a proxy wallet system)
+4. Your API credentials are already set up - they work with any connected wallet
+
+### Step 0.4: Verify Setup
+
+You should have:
+- [ ] New wallet address (0x...)
+- [ ] Private key saved securely (0x... - 64 hex chars)
+- [ ] MATIC for gas (~$5)
+- [ ] USDC deposited in Polymarket (~$50-100 to start)
+- [ ] API credentials (api_key, secret, passphrase) - you already have these
+
+### Environment Variables (for later)
+```bash
+# .env file (NEVER commit this)
+POLYMARKET_API_KEY=your-api-key
+POLYMARKET_SECRET=your-secret
+POLYMARKET_PASSPHRASE=your-passphrase
+PRIVATE_KEY=0x...your-private-key...
+WALLET_ADDRESS=0x...your-wallet-address...
+```
+
+---
+
+## Execution Phases
+
+### Phase 1: Project Foundation (Start Here)
+
+**Goal:** Compilable Rust project with core types and kill switch working.
+
+#### Step 1.1: Initialize Project
+```bash
+cd /Users/pontidev/Developer/poly-bot
+cargo new polymarket-bot
+cd polymarket-bot
+```
+
+#### Step 1.2: Create Module Structure ✅ COMPLETED
+```
+src/
+├── main.rs           # Entry point - config, logging, creates Bot
+├── lib.rs            # Module exports
+├── bot.rs            # Bot orchestration - event loop, coordinates components
+├── config.rs         # Configuration loading from .env
+├── error.rs          # Error types with ErrorType classification
+├── constants.rs      # All constants (URLs, timeouts, limits)
+├── kill_switch.rs    # Kill switch with atomic bool + env var + file
+├── api/
+│   ├── mod.rs        # API module exports
+│   ├── types.rs      # Type definitions (PriceLevel, OrderBook, etc.)
+│   ├── client.rs     # Optimized HTTP client with pooling
+│   ├── auth.rs       # HMAC authentication
+│   └── endpoints.rs  # REST endpoint wrappers
+├── signing/
+│   ├── mod.rs        # Signing module exports
+│   └── order.rs      # EIP-712 order signing with alloy
+├── websocket/
+│   ├── mod.rs        # WebSocket exports
+│   ├── market.rs     # Market WebSocket client (order book updates)
+│   └── user.rs       # User WebSocket client (trade notifications)
+├── state/
+│   ├── mod.rs        # State exports
+│   └── order_book.rs # Order book state with DashMap
+├── ledger/
+│   ├── mod.rs        # Ledger struct combining components
+│   ├── orders.rs     # OpenOrders tracking with state machine
+│   ├── positions.rs  # Position tracking (shares, avg_cost, pnl)
+│   └── cash.rs       # Cash balance (available, reserved, total)
+├── execution/
+│   ├── mod.rs        # Execution exports
+│   └── state_machine.rs  # Invariant checking
+├── strategy/         # Stub (Phase 6)
+│   └── mod.rs
+└── risk/             # Stub (Phase 5)
+    └── mod.rs
+```
+
+#### Step 1.3: Configure Cargo.toml ✅ COMPLETED
+- Used alloy v1.x for Ethereum signing
+- All dependencies configured and tested
+
+#### Step 1.4: Implement Core Files ✅ COMPLETED
+
+1. ✅ **`src/error.rs`** - Error types with thiserror, ErrorType classification
+2. ✅ **`src/constants.rs`** - All constants (URLs, timeouts, limits, WS ping intervals)
+3. ✅ **`src/api/types.rs`** - Core type definitions (TokenId, OrderId, Side, PriceLevel, etc.)
+4. ✅ **`src/config.rs`** - Configuration loading from .env with dotenvy
+5. ✅ **`src/kill_switch.rs`** - Kill switch with atomic bool + env var + file check
+6. ✅ **`src/main.rs`** - Entry point (86 lines) - creates Bot and runs it
+7. ✅ **`src/bot.rs`** - Bot orchestration (140 lines) - event loop, component coordination
+
+#### Step 1.5: Validation Checkpoint ✅ ALL PASSED
+- ✅ `cargo build` succeeds
+- ✅ `cargo test` passes (8 tests)
+- ✅ Kill switch works: `touch /tmp/polybot_kill` stops the bot
+- ✅ Kill switch works: `POLYBOT_KILL=1` stops the bot
+- ✅ Graceful shutdown working
+
+---
+
+### Phase 2: WebSocket Connectivity ✅ COMPLETED
+
+**Goal:** Real-time market data streaming with order book state.
+
+#### Step 2.1: Implement WebSocket Module ✅ COMPLETED
+
+1. ✅ **`src/websocket/mod.rs`** - Module exports
+2. ✅ **`src/websocket/market.rs`** - Market WebSocket connection
+   - Connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market`
+   - Subscribes with `{"assets_ids": [...], "type": "market"}`
+   - Flexible JSON parsing (handles nested structures)
+   - Automatic reconnection with exponential backoff
+   - PING/PONG keepalive (5 sec interval)
+   - Spawned as async task in bot.rs
+
+3. ✅ **`src/websocket/user.rs`** - User WebSocket (fills)
+   - Connects to `wss://ws-subscriptions-clob.polymarket.com/ws/user`
+   - Authentication message with API credentials
+   - Parse trade notifications
+   - Automatic reconnection with exponential backoff
+
+#### Step 2.2: Implement State Module ✅ COMPLETED
+
+1. ✅ **`src/state/mod.rs`** - Module exports
+2. ✅ **`src/state/order_book.rs`** - OrderBookState with DashMap
+   - `best_bid()`, `best_ask()`, `spread()`, `mid_price()`, `spread_bps()`
+   - Lock-free updates with DashMap
+   - `bid_depth()`, `ask_depth()` for liquidity analysis
+   - `is_two_sided()`, `is_crossed()` for validation
+   - 3 unit tests (all passing)
+
+3. ⏸️ **`src/state/markets.rs`** - MarketRegistry - DEFERRED to Phase 3
+   - Will implement market discovery via REST API
+   - MarketKind (Binary/MultiOutcome)
+   - FeeModel (Zero/Flat/Dynamic)
+   - MarketFilter for querying
+
+#### Step 2.3: Integration ✅ COMPLETED
+
+- Created `src/bot.rs` for clean separation of concerns
+- Bot orchestrates WebSocket, order book state, and event loop
+- main.rs simplified to just initialization
+
+#### Step 2.4: Validation Checkpoint ✅ ALL PASSED
+- ✅ WebSocket connects to Polymarket
+- ✅ Receives real-time market data
+- ✅ Order book state updates correctly
+- ✅ Can calculate bid/ask/spread/spread_bps
+- ✅ Successfully tracking markets (tested with live token)
+- ✅ Heartbeat shows: "1 markets tracked, N iterations"
+
+---
+
+### Phase 3: HTTP Client & Authentication ✅ COMPLETED
+
+**Goal:** Authenticated API calls with optimized HTTP client.
+
+#### Step 3.1: Implement API Module ✅ COMPLETED
+
+1. ✅ **`src/api/client.rs`** - Optimized HTTP client
+   - Connection pooling (20 idle connections)
+   - TCP_NODELAY enabled
+   - Aggressive timeouts (500ms request, 200ms connect)
+   - Connection warming with /time endpoint
+   - get(), get_authenticated(), post_authenticated(), delete_authenticated()
+
+2. ✅ **`src/api/auth.rs`** - HMAC signature generation
+   - ApiCredentials struct
+   - `generate_signature(secret, timestamp, method, path, body)` → Base64
+   - AuthHeaders struct for request headers
+   - 3 unit tests
+
+3. ✅ **`src/api/endpoints.rs`** - REST endpoint wrappers
+   - Public: get_time(), get_markets(), get_market(), get_book(), get_price(), get_midpoint(), get_fee_rate()
+   - Authenticated: get_orders(), place_order(), cancel_order(), cancel_all_orders(), get_notifications()
+   - Response types: MarketInfo, TokenInfo, BookResponse, etc.
+   - 3 unit tests
+
+#### Step 3.2: Implement Signing Module ✅ COMPLETED
+
+1. ✅ **`src/signing/mod.rs`** - Module exports
+2. ✅ **`src/signing/order.rs`** - OrderSigner with alloy
+   - Order struct with all EIP-712 fields
+   - OrderBuilder for fluent construction
+   - EIP-712 domain separator for Polymarket CTF Exchange (Polygon chain ID 137)
+   - Support for standard and neg-risk exchange contracts
+   - sign_order() async method
+   - 9 unit tests
+
+#### Step 3.3: Validation Checkpoint ✅ ALL PASSED
+- ✅ HTTP client created with optimized settings
+- ✅ HMAC signature generation works (3 tests)
+- ✅ EIP-712 order signing compiles (9 tests)
+- ✅ cargo build succeeds with no warnings
+- ✅ cargo test passes (25 tests total)
+
+---
+
+### Phase 4: Ledger & State Machine ✅ COMPLETED
+
+**Goal:** Authoritative state tracking with order lifecycle management.
+
+#### Step 4.1: Implement Ledger Module ✅ COMPLETED
+
+1. ✅ **`src/ledger/orders.rs`** - OpenOrders tracking
+   - OrderState enum (CreatedLocal → Signed → Submitted → Acked → Filled)
+   - TrackedOrder struct with state transitions
+   - State transition validation with can_transition_to()
+   - DashMap for lock-free concurrent access
+
+2. ✅ **`src/ledger/positions.rs`** - Position tracking
+   - Update ONLY from confirmed fills (never from expected)
+   - Track shares, avg_cost, realized_pnl, unrealized_pnl
+   - apply_fill() with proper flip position logic
+   - 31 unit tests for all scenarios
+
+3. ✅ **`src/ledger/cash.rs`** - Cash balance
+   - available, reserved, total using Decimal
+   - Reserve on ACKED, release on cancel/reject
+   - Thread-safe with DashMap pattern
+
+4. ⏸️ **`src/ledger/reconciliation.rs`** - REST sync loop - DEFERRED TO PHASE 5
+   - Every 2-5 minutes: GET /orders?status=open
+   - Handle discrepancies
+   - Note: Ties into circuit breaker logic
+
+#### Step 4.2: Implement Execution State Machine ✅ COMPLETED
+
+1. ✅ **`src/execution/state_machine.rs`** - Invariant checking
+   - InvariantViolation enum for validation failures
+   - check_invariants() for ledger consistency
+   - Validates: fills map to orders, cash reserves match open orders
+
+#### Step 4.3: User WebSocket ✅ COMPLETED
+
+1. ✅ **`src/websocket/user.rs`** - Trade notifications
+   - Connect to `wss://ws-subscriptions-clob.polymarket.com/ws/user`
+   - Authentication with API credentials
+   - Parse trade notifications (fills)
+   - Automatic reconnection with exponential backoff
+
+#### Step 4.4: Validation Checkpoint ✅ ALL PASSED
+- ✅ Order state transitions work correctly (can_transition_to validation)
+- ✅ Positions update only from fills (apply_fill method)
+- ✅ Cash reserved/released properly
+- ✅ All 56 tests passing
+- ✅ cargo build with no warnings
+
+---
+
+### Phase 5: Risk & Circuit Breaker ✅
+
+**Goal:** Safety systems that prevent catastrophic losses.
+
+#### Step 5.1: Implement Risk Module ✅
+
+1. ✅ **`src/risk/circuit_breaker.rs`** - Circuit breaker
+   - CircuitState enum: Closed → Open → HalfOpen
+   - OpenReason: FatalErrorThreshold, RejectRateExceeded, WebSocketDisconnect, etc.
+   - Open on: WS disconnect, reconciliation failure, >20% reject rate, 5+ fatal errors
+   - Only Fatal errors count toward threshold
+   - Auto-recovery after 60s timeout → HalfOpen
+   - Closes after 3 successful orders in HalfOpen
+   - 9 unit tests
+
+2. ✅ **`src/risk/limits.rs`** - Hard risk limits
+   - RiskLimitsConfig: max_daily_loss, max_open_orders, max_position_exposure, etc.
+   - check_order() pre-trade validation
+   - record_realized_pnl() tracks daily P&L
+   - Halts trading when limits exceeded
+   - 6 unit tests
+
+3. ✅ **`src/risk/reconciliation.rs`** - REST sync loop
+   - ReconciliationLoop runs every 2 minutes
+   - Compares server orders with local OpenOrders
+   - Detects discrepancies: RemoteNotLocal, LocalNotRemote, StateMismatch
+   - Triggers circuit breaker on critical issues
+   - 2 unit tests
+
+#### Step 5.2: Validation Checkpoint ✅ ALL PASSED
+- ✅ Circuit breaker opens on simulated errors
+- ✅ Circuit breaker auto-recovers (half-open)
+- ✅ Risk limits enforce correctly
+- ✅ All 73 tests passing
+- ✅ cargo build with no warnings
+
+---
+
+### Phase 6: Strategy Framework
+
+**Goal:** Pluggable strategy system with execution policies.
+
+#### Step 6.1: Implement Strategy Traits
+
+1. **`src/strategy/traits.rs`** - Core abstractions
+   - Strategy trait with on_book_update, on_fill, on_tick, on_shutdown
+   - OrderIntent struct (what strategy wants)
+   - Urgency enum (Immediate/Normal/Passive)
+   - StrategyContext (read-only view)
+
+2. **`src/strategy/router.rs`** - StrategyRouter
+   - Register/enable/disable strategies
+   - Route book updates to subscribed strategies
+   - Conflict resolution
+
+#### Step 6.2: Implement Execution Policies
+
+1. **`src/execution/policy.rs`** - ExecutionPolicy trait
+   - TakerPolicy: FOK/FAK, unwind partials
+   - MakerPolicy: GTC, keep remainder
+
+2. **`src/execution/executor.rs`** - Order executor
+   - Convert OrderIntent → OrderParams via policy
+   - Submit orders concurrently (tokio::join!)
+   - Handle partial fills
+
+#### Step 6.3: Validation Checkpoint
+- [ ] Strategy trait compiles and works
+- [ ] Router dispatches to correct strategies
+- [ ] Policies convert intents to correct order types
+
+---
+
+### Phase 7: Math Arb Strategy (MVP) ✅ COMPLETED
+
+**Goal:** First working strategy - mathematical arbitrage.
+
+#### Step 7.1: Implement Market Pair Registry ✅ COMPLETED
+
+1. ✅ **`src/strategy/market_pair.rs`** - MarketPair + MarketPairRegistry
+   - MarketPair struct: market_id, yes_token_id, no_token_id, fee_rate_bps, description
+   - MarketPairRegistry using DashMap for lock-free concurrent access
+   - get_by_token(), get_by_market(), get_complement() methods
+   - Support for 15-min crypto detection via is_crypto_15min()
+   - 7 unit tests
+
+#### Step 7.2: Implement Edge Calculator ✅ COMPLETED
+
+1. ✅ **`src/strategy/edge_calculator.rs`** - Dynamic edge calculation
+   - EdgeCalculator with configurable base_fee, slippage, min/max edge
+   - `required_edge = fees + slippage + thin_book_penalty`
+   - quick_check() for fast arb rejection
+   - is_profitable() for full validation
+   - 7 unit tests
+
+#### Step 7.3: Implement MathArbStrategy ✅ COMPLETED
+
+1. ✅ **`src/strategy/arbitrage.rs`** - MathArbStrategy
+   - Implements Strategy trait
+   - Detect when YES + NO < $1.00 - required_edge
+   - Return TWO OrderIntents (YES leg + NO leg) with same group_id
+   - Urgency::Immediate for taker execution
+   - Cooldown mechanism, exposure limits
+   - 7 unit tests
+
+#### Step 7.4: Bot Integration ✅ COMPLETED
+
+1. ✅ **`src/bot.rs`** - Strategy integration
+   - Added Ledger, StrategyRouter, MarketPairRegistry to Bot
+   - route_to_strategies() called on book updates
+   - Strategies receive StrategyContext with order book and ledger snapshot
+
+#### Step 7.5: Validation Checkpoint ✅ ALL PASSED
+- ✅ Market pair registry tracks YES/NO tokens
+- ✅ Edge calculator computes dynamic thresholds
+- ✅ Strategy detects arb opportunities
+- ✅ Strategy generates grouped OrderIntents
+- ✅ All 115 tests passing
+- ✅ cargo build with no warnings
+
+---
+
+### Phase 7.5: API Fix & Market Discovery ✅ COMPLETED
+
+**Goal:** Fix API endpoint issues and implement automatic market discovery.
+
+**Background:** Live API testing revealed several issues:
+- See `planning/05-API-DISCOVERY-FINDINGS.md` for full details
+
+#### Critical Issues Found:
+
+1. **CLOB `/markets` returns wrapped response** - `{ "data": [...] }` not direct array
+2. **CLOB `/market/{id}` returns 404** for 15-min crypto markets
+3. **Fee rate field name mismatch** - API returns `base_fee` not `fee_rate_bps`
+4. **Gamma API uses stringified JSON** - `outcomes` and `clobTokenIds` are JSON strings
+5. **15-min markets use "Up"/"Down"** not "Yes"/"No" for outcomes
+
+#### Step 7.5.1: Fix CLOB Endpoints ✅ COMPLETED
+
+1. ✅ **`src/api/endpoints.rs`** - Fixed response parsing
+   - Added `MarketsResponse` wrapper struct for `/markets`
+   - Fixed `FeeRateResponse` to use `base_fee` field with alias for compatibility
+   - Updated `get_markets()` to unwrap response
+   - Added `get_markets_page()` for pagination
+   - Added `get_all_markets()` for full pagination
+
+#### Step 7.5.2: Add Gamma API Client ✅ COMPLETED
+
+1. ✅ **`src/api/gamma.rs`** (NEW) - Gamma API client
+   - GammaEvent, GammaMarket, GammaTag structs
+   - `parse_outcomes()` and `parse_token_ids()` for stringified JSON
+   - `get_active_events()`, `get_event_by_slug()`, `get_events_by_tag()`
+   - `get_crypto_15min_events()` helper
+   - Helper methods: `is_binary()`, `is_crypto_15min()`, `is_tradeable()`
+   - 7 unit tests
+
+#### Step 7.5.3: Add Market Discovery ✅ COMPLETED
+
+1. ✅ **`src/api/discovery.rs`** (NEW) - Market discovery module
+   - `MarketFilter` with outcome types, volume, liquidity filters
+   - `OutcomeType` enum (YesNo, UpDown, Other)
+   - `DiscoveredMarket` with parsed tokens and metadata
+   - `MarketDiscovery` service with filter support
+   - `discover_all()`, `discover_crypto_15min()`, `discover_by_slug()`
+   - `to_market_pair()` conversion
+   - 8 unit tests
+
+#### Step 7.5.4: Update Market Pair Support ✅ COMPLETED
+
+1. ✅ **`src/strategy/market_pair.rs`** - Support Up/Down outcomes
+   - Added `BinaryOutcomeType` enum
+   - Added `outcome_type`, `first_outcome_label`, `second_outcome_label` fields
+   - Added `new_up_down()` constructor for crypto 15-min markets
+   - Added `with_outcomes()` for custom outcome labels
+   - Added `is_up_down()`, `is_yes_no()` methods
+   - Added `first_token_id()`, `second_token_id()`, `up_token_id()`, `down_token_id()` accessors
+   - 10 unit tests (3 new)
+
+#### Step 7.5.5: Update Main Entry Point ✅ COMPLETED
+
+1. ✅ **`src/main.rs`** - Use API discovery instead of hardcoded tokens
+   - Added `MarketDiscovery` and `MarketFilter` imports
+   - Discover 15-min crypto markets on startup
+   - Log discovered markets with details
+   - Fallback to hardcoded test market if discovery fails
+   - Register discovered markets in Bot
+
+#### Step 7.5.6: Validation Checkpoint ✅ ALL PASSED
+- ✅ `get_markets()` correctly parses wrapped response
+- ✅ `get_fee_rate()` works with actual API field name (`base_fee`)
+- ✅ Gamma API client can fetch and parse events
+- ✅ Market discovery finds 15-min crypto markets (Up/Down)
+- ✅ MarketPair correctly handles Up/Down outcomes
+- ✅ Bot starts up with dynamically discovered markets
+- ✅ All 136 tests passing
+
+---
+
+### Phase 8: Maker Rebate Strategy
+
+**Goal:** Second strategy - passive maker for rebates.
+
+#### Step 8.1: Implement MakerRebateArbStrategy
+
+1. **`src/strategy/maker_arb.rs`** - MakerRebateArbStrategy
+   - Same arb logic as MathArb
+   - Urgency::Passive → GTC orders
+   - Lower min_edge (1% vs 3% - no fees)
+   - price_offset to post inside spread
+   - Only on 15-min crypto markets (FeeModel::Dynamic)
+
+#### Step 8.2: Validation Checkpoint
+- [ ] Strategy posts GTC orders
+- [ ] Filters to only 15-min crypto markets
+- [ ] Can run alongside MathArbStrategy
+
+---
+
+### Phase 9: Integration & Testing
+
+**Goal:** Full system integration with live testing.
+
+#### Step 9.1: Main Loop Integration
+
+1. **`src/main.rs`** - Complete main loop
+   ```rust
+   loop {
+       if kill_switch.is_killed() { break; }
+       if !circuit_breaker.is_trading_allowed() { continue; }
+
+       // Process WebSocket messages
+       // Route to strategies
+       // Execute order intents
+       // Update ledger
+   }
+   ```
+
+#### Step 9.2: Testing Progression
+1. **Paper trading** - Log what would happen, no real orders
+2. **Tiny amounts** - $1-10 trades
+3. **Small amounts** - $50-100 trades
+4. **Normal operation** - After 1 week stable
+
+#### Step 9.3: Pre-Live Checklist
+- [ ] Kill switch tested (env var AND file)
+- [ ] Graceful shutdown cancels all orders
+- [ ] Circuit breaker triggers correctly
+- [ ] Reconciliation running, no discrepancies
+- [ ] Private key secure, never logged
+- [ ] Small test trades successful
+- [ ] Partial fill handling verified
+- [ ] Risk limits enforced
+
+---
+
+### Phase 10: Monitoring & Deployment
+
+**Goal:** Production-ready with observability.
+
+#### Step 10.1: Metrics & Logging
+
+1. **`src/risk/metrics.rs`** - Health metrics
+   - Latency p50/p95/p99
+   - WS reconnect count
+   - Reject rate
+   - Fill ratio
+
+#### Step 10.2: VPS Deployment
+
+1. Provision AWS us-east-1 instance
+2. Apply kernel tuning (sysctl.conf from planning)
+3. Set up systemd service
+4. Configure monitoring alerts
+
+---
+
+## File Implementation Order
+
+For each phase, implement files in this order:
+
+```
+Phase 1: error.rs → constants.rs → api/types.rs → config.rs → kill_switch.rs → main.rs
+Phase 2: websocket/mod.rs → websocket/market.rs → state/order_book.rs → state/markets.rs
+Phase 3: api/client.rs → api/auth.rs → signing/order.rs → api/endpoints.rs
+Phase 4: ledger/orders.rs → ledger/positions.rs → ledger/cash.rs → execution/state_machine.rs
+Phase 5: risk/circuit_breaker.rs → risk/limits.rs
+Phase 6: strategy/traits.rs → strategy/router.rs → execution/policy.rs → execution/executor.rs
+Phase 7: strategy/market_pair.rs → strategy/edge_calculator.rs → strategy/arbitrage.rs
+Phase 7.5: api/endpoints.rs (fix) → api/gamma.rs (new) → api/discovery.rs (new) → main.rs (update)
+Phase 8: strategy/maker_arb.rs
+Phase 9: main.rs (complete integration)
+Phase 10: risk/metrics.rs + deployment
+```
+
+---
+
+## Key Files to Reference
+
+During implementation, reference these planning docs:
+
+| Doc | Contains |
+|-----|----------|
+| `planning/01-STRATEGY-ANALYSIS.md` | Strategy logic, edge calculations, risk factors |
+| `planning/02-RUST-ARCHITECTURE.md` | All Rust code snippets, module structure, types |
+| `planning/03-API-REFERENCE.md` | WebSocket/REST formats, auth, error codes |
+| `planning/04-IMPLEMENTATION-PLAN.md` | Phase checklists, config guide, constants |
+| `planning/05-API-DISCOVERY-FINDINGS.md` | **NEW:** Live API testing findings, Gamma API, fixes needed |
+
+---
+
+## Validation Gates
+
+**DO NOT proceed to next phase until current phase passes all checkpoints.**
+
+| Phase | Must Pass Before Proceeding |
+|-------|---------------------------|
+| 1 | `cargo build` + kill switch works |
+| 2 | WebSocket receives data |
+| 3 | Can sign and verify orders |
+| 4 | State machine transitions correctly |
+| 5 | Circuit breaker opens/closes properly |
+| 6 | Strategy router dispatches correctly |
+| 7 | Arb strategy generates correct intents (115 tests) |
+| 7.5 | Market discovery works with live API |
+| 8 | Both strategies can run together |
+| 9 | Small live trades successful |
+| 10 | Monitoring working, 1 week stable |
+
+---
+
+## Commands Reference
+
+```bash
+# Build
+cargo build --release
+
+# Run tests
+cargo test
+
+# Run with logging
+RUST_LOG=debug cargo run
+
+# Paper trading mode
+cargo run -- --mode paper
+
+# Kill switch
+touch /tmp/polybot_kill
+# or
+export POLYBOT_KILL=1
+```
+
+---
+
+## How We'll Work Together
+
+Since you're new to Rust, here's how I'll guide you:
+
+### For Each Phase:
+
+1. **I implement** - I'll write all the Rust code for the phase
+2. **You review** - Look over what I wrote, ask questions
+3. **We test** - Run the validation checkpoints together
+4. **You approve** - Confirm it works before moving to next phase
+
+### What You'll Need to Do:
+
+- **Phase 0:** Set up wallet and fund it (I'll guide you)
+- **Run commands:** `cargo build`, `cargo test`, `cargo run`
+- **Create `.env` file:** Add your credentials (I'll show format)
+- **Test kill switch:** `touch /tmp/polybot_kill`
+- **Monitor logs:** Watch for errors/opportunities
+
+### What I'll Handle:
+
+- All Rust code writing
+- Explaining what each part does
+- Debugging any issues
+- Optimizing for performance
+
+### Estimated Timeline:
+
+| Phase | Effort | You'll See |
+|-------|--------|-----------|
+| 0 | 30 min | Funded wallet ready |
+| 1 | 1-2 hrs | Project compiles, kill switch works |
+| 2 | 2-3 hrs | Live market data streaming |
+| 3 | 2-3 hrs | Can sign and submit orders |
+| 4 | 2-3 hrs | Full order tracking |
+| 5 | 1-2 hrs | Safety systems active |
+| 6 | 2-3 hrs | Strategy framework ready |
+| 7 | 2-3 hrs | **First strategy running (paper)** |
+| 8 | 1-2 hrs | Execution pipeline wired |
+| 8.5 | 2-3 hrs | **Maker strategy (zero fees!)** |
+| 9 | 1 week | Live testing with small amounts |
+| 10 | 1-2 hrs | Production deployment |
+
+---
+
+## Phase 8.5: Maker Strategy Enhancement 🚧 NEW
+
+**Goal:** Take advantage of Polymarket's 0% maker fee on 15-min crypto markets.
+
+### Why Maker Strategy Matters
+
+**Fee Structure on 15-min Crypto Markets:**
+| Role | Fee | Edge Needed |
+|------|-----|-------------|
+| Taker | Up to 3% | 3%+ to profit |
+| Maker | 0% (FREE!) | 1%+ to profit |
+
+**Example: YES @ $0.52 ask, NO @ $0.47 ask**
+- Combined = $0.99, Edge = $0.01 (1%)
+- **Taker:** 1% - 3% fee = **-2% LOSS** ❌
+- **Maker:** 1% - 0% fee = **+1% PROFIT** ✅
+
+### What Already Exists (Ready to Wire)
+
+```rust
+// src/execution/policy.rs
+MakerPolicy::new()           // ✅ GTC orders, post on book
+  .with_price_offset(cents)  // ✅ Post inside spread
+
+// src/strategy/edge_calculator.rs  
+EdgeConfig::maker()          // ✅ min_edge = 1% (vs 3% taker)
+
+// src/strategy/arbitrage.rs
+MathArbConfig::maker()       // ✅ use_maker_execution = true
+
+// src/constants.rs
+MAKER_MIN_EDGE = 0.01        // ✅ 1 cent minimum edge
+```
+
+### Implementation Tasks
+
+#### Task 8.5.1: Dual Policy Support in Bot ⬜
+**File:** `src/bot.rs`
+
+```rust
+// Change from:
+let policy = Arc::new(TakerPolicy::new());
+
+// To:
+let taker_policy = Arc::new(TakerPolicy::new());
+let maker_policy = Arc::new(MakerPolicy::new().with_price_offset(dec!(0.5))); // 0.5 cents inside spread
+
+// Keep both, choose based on OrderIntent.urgency
+```
+
+**Logic:**
+- `Urgency::Immediate` → Use TakerPolicy (FOK)
+- `Urgency::Passive` → Use MakerPolicy (GTC)
+
+#### Task 8.5.2: Outstanding Order Tracker ⬜
+**File:** `src/execution/order_tracker.rs` (NEW)
+
+```rust
+pub struct OrderTracker {
+    /// Active orders by order_id
+    active_orders: DashMap<OrderId, TrackedOrder>,
+    
+    /// Orders by token (for quick lookup)
+    by_token: DashMap<TokenId, HashSet<OrderId>>,
+    
+    /// Orders by market (for cancellation on close)
+    by_market: DashMap<ConditionId, HashSet<OrderId>>,
+}
+
+pub struct TrackedOrder {
+    pub order_id: OrderId,
+    pub token_id: TokenId,
+    pub market_id: ConditionId,
+    pub side: Side,
+    pub price: Decimal,
+    pub size: Decimal,
+    pub filled: Decimal,
+    pub created_at: Instant,
+    pub strategy_name: String,
+}
+
+impl OrderTracker {
+    /// Check if we already have an order at this price
+    pub fn has_order_at(&self, token: &TokenId, price: Decimal) -> bool;
+    
+    /// Track a new order
+    pub fn track(&self, order: TrackedOrder);
+    
+    /// Update on fill
+    pub fn on_fill(&self, order_id: &OrderId, filled_size: Decimal);
+    
+    /// Remove completed/cancelled order
+    pub fn remove(&self, order_id: &OrderId);
+    
+    /// Get all orders for a market (for cancellation)
+    pub fn orders_for_market(&self, market: &ConditionId) -> Vec<OrderId>;
+    
+    /// Get stale orders (older than threshold)
+    pub fn stale_orders(&self, max_age: Duration) -> Vec<OrderId>;
+}
+```
+
+#### Task 8.5.3: Wire User WebSocket to Ledger ⬜
+**File:** `src/bot.rs`
+
+Currently User WebSocket exists but isn't wired. Need to:
+1. Parse fill notifications from User WS
+2. Update `Ledger` positions on fills
+3. Update `OrderTracker` with fill progress
+
+```rust
+// In Bot::run() event loop:
+user_msg = self.user_ws_rx.recv() => {
+    if let Some(msg) = user_msg {
+        self.handle_user_message(msg).await;
+    }
+}
+
+// Handle fill notification
+fn handle_fill(&mut self, fill: FillNotification) {
+    // Update ledger
+    self.ledger.record_fill(fill.order_id, fill.size, fill.price);
+    
+    // Update tracker
+    self.order_tracker.on_fill(&fill.order_id, fill.size);
+    
+    // Log
+    info!("💰 Fill: {} {} @ ${}", fill.size, fill.side, fill.price);
+}
+```
+
+#### Task 8.5.4: Order Cancellation Logic ⬜
+**File:** `src/execution/cancellation.rs` (NEW)
+
+```rust
+pub struct CancellationManager {
+    api_client: Arc<ApiClient>,
+    order_tracker: Arc<OrderTracker>,
+}
+
+impl CancellationManager {
+    /// Cancel order by ID
+    pub async fn cancel(&self, order_id: &OrderId) -> Result<()>;
+    
+    /// Cancel all orders for a market (before close)
+    pub async fn cancel_market(&self, market: &ConditionId) -> Result<usize>;
+    
+    /// Cancel stale orders (cleanup)
+    pub async fn cancel_stale(&self, max_age: Duration) -> Result<usize>;
+    
+    /// Cancel all outstanding orders (emergency)
+    pub async fn cancel_all(&self) -> Result<usize>;
+}
+```
+
+#### Task 8.5.5: MakerArbStrategy ⬜
+**File:** `src/strategy/maker_arb.rs` (NEW)
+
+```rust
+/// Maker arbitrage strategy - same logic as MathArb but with GTC orders
+pub struct MakerArbStrategy {
+    name: String,
+    config: MakerArbConfig,
+    registry: Arc<MarketPairRegistry>,
+    edge_calculator: EdgeCalculator,  // Uses EdgeConfig::maker()
+    order_tracker: Arc<OrderTracker>, // Check existing orders
+    enabled: AtomicBool,
+}
+
+pub struct MakerArbConfig {
+    pub min_edge: Decimal,           // Default: 1% (vs 3% taker)
+    pub price_offset_cents: Decimal, // Post inside spread
+    pub max_orders_per_market: u32,  // Avoid over-posting
+    pub order_ttl_secs: u64,         // Cancel after N seconds
+    pub max_position_size: Decimal,
+}
+
+impl Strategy for MakerArbStrategy {
+    fn on_book_update(&self, market: &str, token: &str, ctx: &StrategyContext) -> Vec<OrderIntent> {
+        // 1. Check arb opportunity (same as MathArb)
+        // 2. Check if we already have orders at this level
+        // 3. Return Urgency::Passive intents (→ GTC orders)
+    }
+}
+```
+
+#### Task 8.5.6: Add Config Options ⬜
+**File:** `src/config.rs`
+
+```rust
+pub struct Config {
+    // ... existing fields ...
+    
+    /// Use maker execution (GTC orders, 0% fee)
+    pub use_maker_mode: bool,
+    
+    /// Price offset for maker orders (cents inside spread)
+    pub maker_price_offset: Decimal,
+    
+    /// Max age for GTC orders before cancellation (seconds)
+    pub maker_order_ttl: u64,
+}
+```
+
+**Environment variables:**
+```bash
+USE_MAKER_MODE=true
+MAKER_PRICE_OFFSET=0.5
+MAKER_ORDER_TTL=120
+```
+
+### Execution Flow (Maker Mode)
+
+```
+Book Update → MakerArbStrategy.on_book_update()
+           → Check edge >= 1% (maker threshold)
+           → Check no existing order at this price
+           → Return Vec<OrderIntent> with Urgency::Passive
+           
+process_intents() → Urgency::Passive detected
+                 → Use MakerPolicy (not TakerPolicy)
+                 → MakerPolicy.to_order_params()
+                     → OrderType::GTC
+                     → Apply price_offset (post inside spread)
+                 → executor.execute()
+                 → order_tracker.track(order)
+                 
+User WS Fill → handle_fill()
+            → ledger.record_fill()
+            → order_tracker.on_fill()
+            → Check if arb pair is balanced
+            
+Cleanup Timer → cancellation.cancel_stale()
+             → Remove old unfilled orders
+```
+
+### Validation Checkpoints
+
+```bash
+# Build and test
+cargo build
+cargo test
+
+# Run in paper mode with maker config
+USE_MAKER_MODE=true BOT_MODE=paper cargo run
+
+# Should see:
+# "Using MakerPolicy for Urgency::Passive intents"
+# "📝 Intent: MakerArbStrategy BUY ... [Passive/GTC]"
+# "🎯 Order posted: ... GTC @ $0.525"
+```
+
+### Test Cases
+
+1. **Maker order creation:**
+   - Urgency::Passive → OrderType::GTC
+   - Price adjusted by offset
+
+2. **Order tracking:**
+   - New orders tracked in OrderTracker
+   - Duplicate orders prevented
+
+3. **Fill handling:**
+   - User WS fill updates ledger
+   - Tracker updated with fill progress
+
+4. **Cancellation:**
+   - Stale orders cancelled after TTL
+   - Market orders cancelled on close
+
+### Risk Considerations
+
+1. **Unfilled orders at resolution:**
+   - Cancel all orders 1-2 minutes before market close
+   - Need market end time from Gamma API
+
+2. **Imbalanced legs:**
+   - If one leg fills but other doesn't
+   - Need to either: cancel other leg OR take opposing position
+
+3. **Quote stale risk:**
+   - GTC orders can be stale if price moves
+   - Cancel and re-quote periodically
+
+---

@@ -1,0 +1,142 @@
+websockets:
+USER:
+url: wss://ws-subscriptions-clob.polymarket.com/ws/user method GET
+first message: {"auth":{"apiKey":"da85d242-0a7d-6a65-bb82-fb7d9a1c7c14","secret":"pkM5Pzu8fqLKE-sQUosetIQMQcz8sX2dcdz_2iZE6kU=","passphrase":"184fbb107bc28939589d7432df646bf2e5ed942c91a0b0b1be785380c90cd6cc"},"markets":[],"type":"user"}
+
+when making a bet:
+{"type":"TRADE","id":"3565d9bd-5620-4c70-ab54-28b521dc4ef4","taker_order_id":"0x00e477575fcdb390dfb3b0e4e5c0ec7321e289219b7d6075dfdca203124eb455","market":"0x81d8e0447f946c753a1efad76eef9aa46ca33e14e86c1f50ae4377984b2d12d5","asset_id":"1626193495054297080765627917808881174024341691464027194829514041992558860552","side":"BUY","size":"1.12359","fee_rate_bps":"0","price":"0.89","status":"MATCHED","match_time":"1767658657","last_update":"1767658658","outcome":"No","owner":"da85d242-0a7d-6a65-bb82-fb7d9a1c7c14","trade_owner":"da85d242-0a7d-6a65-bb82-fb7d9a1c7c14","maker_address":"0x838E1cd51542c848E568aaD7dfe682291284E648","transaction_hash":"0x40347bc4aaed2eb48bb548fab94fee3a9fc9071eb2c24527c3c69c6f03dfd2e5","bucket_index":0,"maker_orders":[{"order_id":"0x4815c07c2a7445ef6c044ee56840a0b43ca0cb57d2184be067fc96d4500c0dca","owner":"147110e7-4f84-2ad1-9737-d462ef4f6e87","maker_address":"0x724db3C436dCc7b26FbE1ae0c0d6aF538B588DeA","matched_amount":"1.12359","price":"0.1100000890004361","fee_rate_bps":"0","asset_id":"60535924391853275297967753306794300787165161956262993483858770165742288324173","outcome":"Yes","outcome_index":0,"side":"BUY"}],"trader_side":"TAKER","timestamp":"1767658658035","event_type":"trade"}
+
+
+MARKET:
+url: wss://ws-subscriptions-clob.polymarket.com/ws/market method GET
+first message: {"assets_ids":["9116770648672617954873502150906669109632013173266181691206825621739241400461"],"type":"market"}
+incoming messages: [{"market":"0x2e94bb8dd09931d12e6e656fe4fe6ceb3922bc3d6eab864bb6cd24773cf67269","asset_id":"9116770648672617954873502150906669109632013173266181691206825621739241400461","timestamp":"1767642862089","hash":"86cc81dbf4d5aef952e924a78cf51556b4ca6af5","bids":[{"price":"0.01","size":"1027313.8"},{"price":"0.02","size":"129350.81"},{"price":"0.03","size":"10526.19"},{"price":"0.04","size":"1857.15"},{"price":"0.05","size":"285.71"},{"price":"0.06","size":"3900"},{"price":"0.07","size":"1204.07"},{"price":"0.08","size":"100"},{"price":"0.09","size":"25158.73"},{"price":"0.1","size":"28048"},{"price":"0.11","size":"25134.87"},{"price":"0.12","size":"239.04"},{"price":"0.14","size":"471.57"},{"price":"0.15","size":"16841.95"},{"price":"0.16","size":"2207.23"},{"price":"0.17","size":"26031.84"},{"price":"0.18","size":"12075.32"},{"price":"0.19","size":"926.56"},{"price":"0.2","size":"38027.22"},{"price":"0.21","size":"6766.55"},{"price":"0.22","size":"1153"},{"price":"0.23","size":"1860.78"},{"price":"0.24","size":"696.22"},{"price":"0.25","size":"9860.97"},{"price":"0.26","size":"5895.15"},{"price":"0.27","size":"1207.38"},{"price":"0.28","size":"2978.97"},{"price":"0.29","size":"15683"},{"price":"0.3","size":"5242.47"},{"price":"0.31","size":"2738.7"},{"price":"0.32","size":"3459.53"},{"price":"0.33","size":"1065.66"}],"asks":[{"price":"0.99","size":"1979.07"},{"price":"0.98","size":"3500"},{"price":"0.97","size":"6862.08"},{"price":"0.96","size":"1300"},{"price":"0.95","size":"20"},{"price":"0.94","size":"4648.94"},{"price":"0.93","size":"204.08"},{"price":"0.92","size":"8.57"},{"price":"0.9","size":"5"},{"price":"0.89","size":"164.65"},{"price":"0.86","size":"102.04"},{"price":"0.85","size":"700"},{"price":"0.84","size":"1126"},{"price":"0.83","size":"1140"},{"price":"0.82","size":"79.36"},{"price":"0.8","size":"515.7"},{"price":"0.79","size":"4336.41"},{"price":"0.78","size":"64.93"},{"price":"0.75","size":"57.14"},{"price":"0.71","size":"49.26"},{"price":"0.7","size":"2854"},{"price":"0.69","size":"954.23"},{"price":"0.67","size":"200"},{"price":"0.66","size":"569.11"},{"price":"0.6","size":"10"},{"price":"0.59","size":"2718.57"},{"price":"0.58","size":"567"},{"price":"0.55","size":"15.15"},{"price":"0.53","size":"5"},{"price":"0.51","size":"20"},{"price":"0.5","size":"60"},{"price":"0.49","size":"165"},{"price":"0.47","size":"4444"},{"price":"0.46","size":"234"},{"price":"0.44","size":"15.74"},{"price":"0.43","size":"99.76"},{"price":"0.39","size":"2222"},{"price":"0.38","size":"1000"},{"price":"0.37","size":"6488.13"},{"price":"0.36","size":"5364.66"},{"price":"0.35","size":"1098.57"}],"event_type":"book","last_trade_price":"0.330"}]
+
+LIVE DATA:
+url: wss://ws-live-data.polymarket.com/ method GET
+first message: {"action":"subscribe","subscriptions":[{"topic":"activity","type":"orders_matched","filters":"{\"event_slug\":\"khamenei-out-as-supreme-leader-of-iran-by-june-30-747\"}"},{"topic":"comments","type":"*","filters":"{\"parentEntityID\":10126,\"parentEntityType\":\"Series\"}"}]}
+incoming messages: {"connection_id":"WuiFwd4ULPECH7A=","payload":{"asset":"9116770648672617954873502150906669109632013173266181691206825621739241400461","bio":"","conditionId":"0x2e94bb8dd09931d12e6e656fe4fe6ceb3922bc3d6eab864bb6cd24773cf67269","eventSlug":"khamenei-out-as-supreme-leader-of-iran-by-june-30-747","icon":"https://polymarket-upload.s3.us-east-2.amazonaws.com/khamenei-out-as-supreme-leader-of-iran-in-2025-VNDMf5RqFLwB.jpg","name":"FuriusCamillus","outcome":"Yes","outcomeIndex":0,"price":0.3499998774999204,"profileImage":"","proxyWallet":"0x7d85544513634fdb91f7AA08864a0d988d61183E","pseudonym":"Harmful-Index","side":"BUY","size":2.857141,"slug":"khamenei-out-as-supreme-leader-of-iran-by-june-30-747","timestamp":1767642931,"title":"Khamenei out as Supreme Leader of Iran by June 30?","transactionHash":"0x842bf52f945984cbc2e9ce01fba589c4bbf50846cfa901282506c85cd48ee791"},"timestamp":1767642931668,"topic":"activity","type":"orders_matched"}
+
+BET:
+fetch("https://clob.polymarket.com/notifications?signature_type=1&geo_block_token=", {
+  "headers": {
+    "accept": "application/json, text/plain, */*",
+    "accept-language": "en-US,en;q=0.9",
+    "poly_address": "0xBeeD38951e4Bb9205b461560a6479763157c606e",
+    "poly_api_key": "da85d242-0a7d-6a65-bb82-fb7d9a1c7c14",
+    "poly_passphrase": "184fbb107bc28939589d7432df646bf2e5ed942c91a0b0b1be785380c90cd6cc",
+    "poly_signature": "Z3cVSVMZ1jajWHLMNN10O-_WAoufjFXr-HuzXXvfpyo=",
+    "poly_timestamp": "1767658098",
+    "priority": "u=1, i",
+    "sec-ch-ua": "\"Google Chrome\";v=\"143\", \"Chromium\";v=\"143\", \"Not A(Brand\";v=\"24\"",
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": "\"macOS\"",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-site"
+  },
+  "referrer": "https://polymarket.com/",
+  "body": null,
+  "method": "GET",
+  "mode": "cors",
+  "credentials": "omit"
+});
+
+res:
+[]
+
+fetch("https://clob.polymarket.com/notifications?signature_type=1&geo_block_token=", {
+  "headers": {
+    "accept": "application/json, text/plain, */*",
+    "accept-language": "en-US,en;q=0.9",
+    "poly_address": "0xBeeD38951e4Bb9205b461560a6479763157c606e",
+    "poly_api_key": "da85d242-0a7d-6a65-bb82-fb7d9a1c7c14",
+    "poly_passphrase": "184fbb107bc28939589d7432df646bf2e5ed942c91a0b0b1be785380c90cd6cc",
+    "poly_signature": "vbnFMR-0IlU82N9ZvuSVXMJZO5TSx4B8Vo0PwLl_9pU=",
+    "poly_timestamp": "1767658170",
+    "priority": "u=1, i",
+    "sec-ch-ua": "\"Google Chrome\";v=\"143\", \"Chromium\";v=\"143\", \"Not A(Brand\";v=\"24\"",
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": "\"macOS\"",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-site"
+  },
+  "referrer": "https://polymarket.com/",
+  "body": null,
+  "method": "GET",
+  "mode": "cors",
+  "credentials": "omit"
+});
+
+res:
+[
+    {
+        "id": 363086296,
+        "type": 2,
+        "owner": "da85d242-0a7d-6a65-bb82-fb7d9a1c7c14",
+        "payload": {
+            "asset_id": "9116770648672617954873502150906669109632013173266181691206825621739241400461",
+            "condition_id": "0x2e94bb8dd09931d12e6e656fe4fe6ceb3922bc3d6eab864bb6cd24773cf67269",
+            "eventSlug": "khamenei-out-as-supreme-leader-of-iran-by-june-30-747",
+            "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/khamenei-out-as-supreme-leader-of-iran-in-2025-VNDMf5RqFLwB.jpg",
+            "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/khamenei-out-as-supreme-leader-of-iran-in-2025-VNDMf5RqFLwB.jpg",
+            "market": "0x2e94bb8dd09931d12e6e656fe4fe6ceb3922bc3d6eab864bb6cd24773cf67269",
+            "market_slug": "khamenei-out-as-supreme-leader-of-iran-by-june-30-747",
+            "matched_size": "3.225805",
+            "order_id": "0x980ff3499765b76c43acae02cb92f9407c11eed9e49e140212574d43e166fe72",
+            "original_size": "3.2258",
+            "outcome": "Yes",
+            "outcome_index": 0,
+            "owner": "da85d242-0a7d-6a65-bb82-fb7d9a1c7c14",
+            "price": "0.31",
+            "question": "Khamenei out as Supreme Leader of Iran by June 30?",
+            "remaining_size": "0",
+            "seriesSlug": "khamenei-out",
+            "side": "BUY",
+            "trade_id": "0b6d4698-0f73-4100-8737-b643afdb61b3",
+            "transaction_hash": "0x8a66f2cb7525fa21eb92e3f13e4d346b1b0d75c517fc7df551a9e2b9ac08c152",
+            "type": "FAK"
+        },
+        "timestamp": "2026-01-06T00:09:30.615735Z"
+    }
+]
+
+fetch("https://clob.polymarket.com/order?geo_block_token=", {
+  "headers": {
+    "accept": "application/json, text/plain, */*",
+    "accept-language": "en-US,en;q=0.9",
+    "content-type": "application/json",
+    "poly_address": "0xBeeD38951e4Bb9205b461560a6479763157c606e",
+    "poly_api_key": "da85d242-0a7d-6a65-bb82-fb7d9a1c7c14",
+    "poly_passphrase": "184fbb107bc28939589d7432df646bf2e5ed942c91a0b0b1be785380c90cd6cc",
+    "poly_signature": "_wQeobJEHYuu6GwMKVLPUN3l1OsdvyR5BPiXtxr4psc=",
+    "poly_timestamp": "1767658169",
+    "priority": "u=1, i",
+    "sec-ch-ua": "\"Google Chrome\";v=\"143\", \"Chromium\";v=\"143\", \"Not A(Brand\";v=\"24\"",
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": "\"macOS\"",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-site"
+  },
+  "referrer": "https://polymarket.com/",
+  "body": "{\"deferExec\":false,\"order\":{\"salt\":903656186495,\"maker\":\"0x838E1cd51542c848E568aaD7dfe682291284E648\",\"signer\":\"0xBeeD38951e4Bb9205b461560a6479763157c606e\",\"taker\":\"0x0000000000000000000000000000000000000000\",\"tokenId\":\"9116770648672617954873502150906669109632013173266181691206825621739241400461\",\"makerAmount\":\"1000000\",\"takerAmount\":\"3225800\",\"side\":\"BUY\",\"expiration\":\"0\",\"nonce\":\"0\",\"feeRateBps\":\"0\",\"signatureType\":1,\"signature\":\"0xef492cc07edff126387feb91964f675232913443c08c9728e916fe52ac82229b19c1787111687deb576636635558756a0804a00d57fb5495b1fd18efa9d321501b\"},\"owner\":\"da85d242-0a7d-6a65-bb82-fb7d9a1c7c14\",\"orderType\":\"FAK\"}",
+  "method": "POST",
+  "mode": "cors",
+  "credentials": "omit"
+});
+
+res:
+{
+    "errorMsg": "",
+    "orderID": "0x980ff3499765b76c43acae02cb92f9407c11eed9e49e140212574d43e166fe72",
+    "takingAmount": "3.225805",
+    "makingAmount": "0.999999",
+    "status": "matched",
+    "transactionsHashes": [
+        "0x8a66f2cb7525fa21eb92e3f13e4d346b1b0d75c517fc7df551a9e2b9ac08c152"
+    ],
+    "success": true
+}
+

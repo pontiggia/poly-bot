@@ -1,0 +1,259 @@
+Changes to apply to the bot plan (Claude Code instructions)
+
+0) Clarify trading model: CLOB-first, not “risk-free”
+
+Update Strategy doc language: “YES+NO < 1” is not risk-free on a CLOB unless you can reliably execute both legs at intended prices/sizes.
+
+Add a section: “CLOB execution risks”
+	•	Partial fills
+	•	Price moves between legs
+	•	Queue priority / maker-taker dynamics
+	•	Tick size / min size
+	•	Rate limits / websocket gaps
+	•	Fee model & rounding
+
+Define “risk-free” only at resolution if both legs acquired.
+
+⸻
+
+1) Promote “Order/Fills Ledger” to a first-class subsystem (before strategies)
+
+Right now the plan focuses early on strategy/latency. Reorder phases so you build a truthful accounting layer first.
+
+Add a strict internal ledger (authoritative state)
+
+Implement these as distinct modules/data structures:
+	•	OpenOrders (order_id → order metadata + status)
+	•	Fills (trade_id → fill record)
+	•	Positions (token_id → net shares, avg cost, realized pnl)
+	•	Cash (USDC: available, reserved, total)
+	•	PnL (realized + unrealized)
+
+Rule: your bot must be able to reconstruct portfolio state from:
+	1.	User WS trade events (primary)
+	2.	REST reconciliation (secondary)
+
+Add a “Reconciliation Loop”
+
+Every N minutes (ex: 2–5 min):
+	•	GET /orders?status=open (or equivalent)
+	•	Cross-check with local OpenOrders
+	•	Cancel stale / stuck / inconsistent orders
+	•	Repair local state if needed
+	•	Emit a “reconciliation report” metric/log
+
+This should be in the plan before enabling live strategies.
+
+⸻
+
+2) Make execution a state machine (explicit, deterministic)
+
+Add a dedicated section in Implementation Plan: “Execution Engine State Machine”
+
+Order lifecycle states
+	•	CREATED_LOCAL
+	•	SIGNED
+	•	SUBMITTED
+	•	ACKED (got order_id)
+	•	PARTIALLY_FILLED
+	•	FILLED
+	•	CANCEL_PENDING
+	•	CANCELLED
+	•	EXPIRED
+	•	REJECTED
+	•	UNKNOWN (requires reconciliation)
+
+Invariants
+	•	A fill must always map to an order (or be handled as “orphan fill” and reconciled)
+	•	Reserved cash decreases only on ack OR on known fill policy (choose one, but be consistent)
+	•	A position update happens only from fills, never from “expected fills”
+
+⸻
+
+3) Redesign “Math Arb” execution: treat it as 2-leg execution with hedging/unwind
+
+Your current approach (concurrent join!) is good, but the plan needs the real execution logic.
+
+Add “Pre-trade feasibility check”
+
+Before sending orders:
+	•	read top-of-book for YES and NO (ask levels if buying)
+	•	compute max_size = min(size_yes_ask, size_no_ask)
+	•	compute expected avg price with slippage estimate (even a crude one)
+	•	require edge_after_fees > dynamic_min_edge
+
+Add “Order type policy”
+
+Define a default policy per strategy:
+	•	Arb legs: prefer FOK if available, otherwise FAK
+	•	Avoid leaving dangling exposure: do not use GTC unless it’s a deliberate maker strategy
+
+Add “Partial fill handling” (mandatory)
+
+If one leg partially fills and the other doesn’t:
+	•	Option A (safer): immediate unwind filled leg (sell back at best bid) if combined edge is gone
+	•	Option B: allow brief “hedge window” (e.g., 200–500ms) then unwind if not completed
+
+This logic must be defined in the plan; otherwise arb will slowly turn into directional exposure.
+
+⸻
+
+4) Replace static thresholds with dynamic edge requirements
+
+You have constants like:
+	•	ARB_THRESHOLD = 0.97
+	•	MIN_EDGE_CENTS = 0.03
+
+Keep defaults, but update the plan to compute a dynamic minimum edge:
+
+Add a function:
+
+required_edge = fees + expected_slippage + partial_fill_risk + spread_penalty
+
+Where:
+	•	fees: maker/taker bps (from API)
+	•	expected_slippage: based on depth & intended size
+	•	partial_fill_risk: increases in thin books / volatile markets
+	•	spread_penalty: avoid trading wide spreads unless edge huge
+
+Decision rule becomes:
+Execute only if
+(1 - (yes_price + no_price)) >= required_edge
+
+⸻
+
+5) Add “Market metadata correctness” & invariants (prevent silent bot death)
+
+Create a module: MarketRegistry
+
+Enforce:
+	•	market is binary vs multi-outcome (reject unsupported at first)
+	•	active/tradable status
+	•	tick size / min size / max size
+	•	close time & resolution rules
+	•	token_id mapping correctness
+
+Add startup validation:
+	•	fetch markets list
+	•	build mapping: market_id → {yes_token_id, no_token_id}
+	•	run consistency checks before trading
+
+⸻
+
+6) Instrumentation: measure p50/p95/p99, not averages
+
+The architecture doc has aggressive latency targets; add a section that says:
+
+Add “Latency spans”
+
+Log timestamps for:
+	•	WS recv
+	•	parse done
+	•	book updated
+	•	opportunity detected
+	•	order signed
+	•	POST sent
+	•	ack received
+	•	fill received (user WS)
+	•	reconciliation corrections
+
+Store histograms:
+	•	p50 / p95 / p99
+	•	and also “max last 1 min”
+
+Add “health metrics”
+	•	WS reconnect count
+	•	missed seq / resync events
+	•	order rejects
+	•	cancel success rate
+	•	fill ratio (filled / submitted)
+	•	partial fill rate
+
+⸻
+
+7) Rate limiting & backpressure plan (explicit)
+
+Add a section: “API/WS backpressure and rate limits”
+	•	cap order submissions per second
+	•	coalesce cancels/replaces
+	•	implement a circuit breaker:
+	•	if reject rate spikes, pause trading
+	•	if WS desync, pause trading until resynced
+	•	if reconciliation finds unknown state, pause
+
+⸻
+
+8) Security / key handling: make it concrete + add kill switch
+
+Add to plan:
+
+Key handling
+	•	Do not log private key / signature payloads
+	•	Prefer encrypted key storage or OS keychain where possible
+	•	Use “trading key” with limited funds (operational separation)
+
+Kill switch (must exist on day 1)
+
+Define a kill switch that’s checked every loop iteration:
+	•	env var toggle
+	•	local file flag
+	•	or tiny HTTP endpoint
+
+Kill switch should:
+	•	stop placing new orders
+	•	attempt cancel open orders
+	•	print final state snapshot
+
+⸻
+
+9) Change the implementation order (new phase ordering)
+
+Rewrite your phases like this:
+
+Phase 1 — Connectivity + Truth (must pass before trading)
+	•	WS market feed ingestion + book build
+	•	User WS fills/events ingestion
+	•	Internal ledger + persistence snapshots
+	•	Reconciliation loop
+	•	Cancel-all + shutdown safety
+
+Phase 2 — Execution engine
+	•	order build/sign (EIP-712)
+	•	submit / ack / cancel / replace
+	•	state machine correctness
+	•	dry-run mode against sandbox/small size
+
+Phase 3 — Strategy MVP
+	•	math arb with 2-leg execution + partial fill unwind
+	•	small sizing caps
+	•	strict risk limits
+
+Phase 4 — Edge expansion
+	•	temporal arb
+	•	external spot feeds
+	•	market selection scoring
+
+Phase 5 — Optimization
+	•	parsing, lock-free improvements, io_uring (optional)
+	•	micro-latency tuning only after correctness + metrics
+
+⸻
+
+10) Add “Risk limits” (hard guardrails)
+
+Add hard limits that block trades:
+	•	max notional per market
+	•	max total open exposure
+	•	max outstanding orders
+	•	max daily loss
+	•	max partial-fill exposure allowed
+
+⸻
+
+Optional optimizations worth adding (only after correctness)
+
+These are good, but should be explicitly deprioritized until phases 1–3 are solid:
+	•	further lock-free book operations beyond what’s needed
+	•	deep HTTP2 tuning beyond connection reuse + keepalive
+	•	io_uring
+	•	ultra-ns math claims (your bottlenecks will be IO + WS + rate limits first)

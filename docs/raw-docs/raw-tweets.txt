@@ -1,0 +1,454 @@
+tweet 1:
+Jane Street Bots already entered Polymarket xD
+
+While most traders chase narratives, one Polymarket account turned 15-minute crypto prediction windows into a mechanical profit engine.
+
+Trader didn't build a sophisticated arbitrage bot.
+
+He found something simpler, momentum lag on ultra-short timeframes.
+
+Win rate: 99.5% algo accuracy on a long run
+
+The system lives in 15-minute Bitcoin, Ethereum, Solana, and XRP markets.
+
+It scans every active micro-window on the platform.
+
+And looks for one specific signal: volatility compression into directional breaks.
+
+When crypto moves hard in one direction, these short-window markets lag by 30-90 seconds.
+
+The order books thin out. Prices stick. The market freezes while the asset keeps moving
+
+He watches for 3-5% gaps between where the market should be and where it's priced.
+
+Then it waits. 8-12 minutes on average. The market catches up. Position closes automatically.
+
+Average return per trade: 50-150%
+
+While everyone's watching the 5-second chart, JaneStreetIndia waits for the 15-minute market to break from reality.
+
+tweet 2:
+Jane Street deleted identity. But not wallet.
+
+I tracked 14,822 trades.
+
+Yet up $324K. Here's why the name "Jane Street" was never a joke.
+
+On 97.7% of markets, he holds Up AND Down positions simultaneously. Delta neutral.
+
+explaining:
+
+Polymarket 15-min crypto bcs MM haven't arrived. Retail is guessing direction. Spreads blow out to 8-15 cents between Up and Down on different time windows.
+
+He enters both legs, not at once, but when combined cost is under $1. Say 48c for Up, 46c for Down = 94c total. Market resolves. One leg pays $1.
+
+Not just arbing static spreads but timing entries around volatility compression.
+
+When BTC consolidates, both outcomes drift toward 50c. He loads up.
+
+When directional move hits, one leg resolves
+
+Average hold time: 8-12 minutes.
+23 out of 25 days green. $5K-33K daily.
+
+The rebrand makes sense. "JaneStreetIndia" was too loud. Same wallet. Just quieter now.
+
+tweet 3:
+Jane Street visualization
+
+This is what $324K in 25 days actually looks like on Polymarket
+
+I started tracking a fresh 15-minute market from the second it opened.
+
+The visualization reveals:
+Bot enters one leg after market opens.
+
+Waits for spread dislocation. Enters the opposite side when price shifts.
+
+Total position cost: 84-96 cents. Resolution payout: $1. Both sides held simultaneously.
+
+Daily PnL: $5K-$33K.
+
+tweet 4:
+1. arbitrage bots
+
+buy YES + NO when combined price < $1
+
+example: YES at 48Â¢ + NO at 49Â¢ = 97Â¢ total
+
+you lock $0.03 profit per $1 no matter who wins
+
+trader "distinct-baguette" made $242k in 1.5 months doing this
+
+targets 15-min crypto markets where prices move fast
+
+python script polls API every 1-3 seconds, executes when sum < 99Â¢
+
+///
+
+2. statistical arbitrage
+
+find correlated markets that drift apart
+
+"trump wins" vs "GOP senate control" should move together
+
+when spread hits 4-7%, short expensive one, long cheap one
+
+close when they converge
+
+trader "sharky6999" made $480k scanning 100+ markets per minute
+
+///
+
+3. AI probability models
+
+train ML models to estimate real odds from news/social data
+
+if your model says 60% YES but market at 50Â¢, buy
+
+trader "ilovecircle" made $2.2M in 2 months with 74% accuracy
+
+uses ensemble of 10 AI models, retrains weekly
+
+///
+
+4. spread farming
+
+buy at bid (5Â¢), sell at ask (6Â¢), repeat
+
+or hedge across platforms (short polymarket, long binance)
+
+trader "cry.eth2" made $194k with 1M trades
+
+high-frequency loop via CLOB API
+
+///
+
+5. copy-trading automation
+
+mirror successful whale traders automatically
+
+scan profiles, execute proportional trades
+
+one bot made $80k in 2 weeks copying near-resolved markets
+
+///
+
+tech stack:
+
+python + requests library for API calls 
+
+web3-py for blockchain interactions deploy on VPS for 24/7 operation
+
+polymarket has REST APIs for everything:
+
+gamma markets API (prices/volumes)
+CLOB API (place orders)
+data API (track positions)
+
+///
+
+starting point:
+
+> build simple arbitrage bot first
+> fund with $100-1k for testing target high-volume markets (politics/crypto)
+ > expect 50-70% win rate but focus on positive EV
+
+how to actually build a Polymarket arbitrage bot (the simple version) 
+
+ +$300/day PnL if you run it right
+
+everyone overcomplicates this. Polymarket arb is literally: buy YES + NO when they cost < $1.00, wait, get $1.00 back.polytrackhq​
+
+the part that matters isn’t “strategy” - it’s execution + not getting rugged by bad code.pypi​
+
+where the +$300/day comes from
+it’s not one big bet. it’s small edges repeated across liquid markets, all day, every day.polytrackhq​
+if you’re consistently locking ~1–3% per cycle and actually getting fills, +$300/day is just throughput + discipline, not “genius alpha”.polytrackhq​
+first, the edge (why this isn’t a meme)
+polytrack’s writeup cites research showing ~$40M extracted via arbitrage and 86M bets analyzed - meaning this is a real, repeatable edge, not a one-off lucky trade.polytrackhq​
+
+so the goal is simple: find mispricings fast, size small at first, automate the boring part.polytrackhq​
+
+what you actually need (minimal)
+
+Python + official trading client py-clob-client (this is the standard base layer).pypi​
+
+A VPS so the script runs 24/7 (don’t run this from a laptop).
+
+A small bankroll to test (start small, then scale after you confirm fills + slippage).
+where people mess up: they copy random GitHub bots and get burned, so start from official libs/docs first.pypi​
+the bot loop (in plain English)
+
+Pull live prices / order book for a market.pypi​
+
+Compute: price(YES)+price(NO)price(YES) + price(NO)price(YES)+price(NO).polytrackhq​
+
+If the sum is < 1.00 by enough margin (to cover mistakes/slippage), send both orders.polytrackhq​
+Log everything: timestamp, market, prices, expected edge, filled/not filled.
+Repeat forever.
+that’s it. no “AI alpha”, no predictions, no news scraping.polytrackhq​
+where to get real references (not vibes)
+
+The simplest “how-to” style arbitrage guide with concrete logic: PolyTrackHQ’s arbitrage bot guide.polytrackhq​
+
+Official building blocks / client: py-clob-client on PyPI (use this instead of sketchy wrappers).pypi​
+
+If you want a ready-made automation framework directionally (not necessarily arb-only): Polymarket’s own Agents repo.github​
+Reddit angle: people discussing arb tooling and calculators (useful for thinking about execution + “non-atomic” risk): r/arbitragebetting thread about Kalshi x Polymarket arb calculator.reddit​
+two real-world gotchas (that decide profit vs loss)
+Non-atomic execution: you can get one side filled and the other not, especially in thin books (this is why people talk about “execution risk” in arb threads).reddit​
+
+Threshold selection: “sum < 0.99” is a meme number - in practice you want margin for slippage and failed fills, otherwise you’ll churn.polytrackhq​
+
+how to make it feel “pro” fast
+Run it only on high-volume markets at first (fills matter more than theoretical edge).polytrackhq​
+
+Start with tiny sizing until logs show stable behavior (then scale).polytrackhq​
+
+Treat every GitHub bot as malicious until proven otherwise; build on official libs.pypi
+
+tweet 5:
+You will 𝗡𝗘𝗩𝗘𝗥 find better 𝗪𝗜𝗡 𝗥𝗔𝗧𝗘 on Polymarket!
+
+This user isn’t a trader.
+
+It’s a bot that turned $313 into $414k in one month.
+
+𝗛𝗶𝘀 𝘀𝗲𝗰𝗿𝗲𝘁?
+He's running one simple strategy.
+
+No narratives.
+No adjustments.
+Same loop thousands of times.
+
+𝗪𝗵𝗮𝘁 𝗶𝘁 𝗱𝗼𝗲𝘀:
+> Trades $BTC / $ETH / $SOL 15-minute Up/Down markets only
+> Over 6,300 bets since early December
+> 98% win rate
+> $4-5k bet every time
+
+His edge isn’t prediction, but timing.
+
+The bot watches spot $BTC on Binance + Coinbase.
+
+When price momentum is already confirmed there, Polymarket is still pricing the previous state for a short window.
+
+That lag is the trade.
+
+𝗜𝘁 𝗲𝗻𝘁𝗲𝗿𝘀 𝗼𝗻𝗹𝘆 𝗱𝘂𝗿𝗶𝗻𝗴 𝘁𝗵𝗮𝘁 𝗴𝗮𝗽:
+When real probability is already ~85%
+But Polymarket still offers 50/50 pricing.
+
+So it’s not guessing direction.
+It’s buying mispriced certainty.
+
+𝗪𝗵𝘆 𝘁𝗵𝗲 𝗣𝗻𝗟 𝗰𝘂𝗿𝘃𝗲 𝗶𝘀 𝗮𝗹𝗺𝗼𝘀𝘁 𝗹𝗶𝗻𝗲𝗮𝗿:
+
+> Thousands of identical micro windows
+> Wins capped, but repeated
+> Losses diluted by frequency
+> Variance crushed by repetition
+
+𝗛𝘂𝗺𝗮𝗻𝘀 𝘄𝗼𝘂𝗹𝗱’𝘃𝗲:
+> sized up
+> tweaked rules
+> chased higher ROI
+
+The bot didn’t.
+Same size & same logic every time.
+
+This is temporal arbitrage.
+
+While CT argues about catalysts,
+this script just waits 30 seconds and harvests math.
+
+Added the wallet to my watchlist.
+
+tweet 6:
+Weather bot on Polymarket ran $204 into ~$24,000
+
+Bot trades only one type of market: London daily high temperature ranges
+
+Every position is a variation of will the highest temperature fall between X-Y°F on date Z
+
+Account has over 1,300 trades and a ~73% win rate
+
+There are no single standout wins - pnl comes from repeating the same setup
+
+Strategy targets how probability is split across adjacent buckets.
+
+Bot buys narrow YES ranges priced around 20-30¢ and often spreads exposure across neighboring ranges
+
+Live positions show simultaneous YES and NO exposure on adjacent buckets at very different prices
+
+At resolution, several positions can go to 0
+
+One bucket settles at $1 and covers the rest
+
+Entire edge comes from exploiting bucket mispricing in these markets
+
+tweet 7:
+A Python script is draining Polymarket.
+$325K extracted from the same math bug, over and over.
+The gap appears for seconds.
+This bot hits it first. Every time.
+
+I found distinct-baguette buried deep in the leaderboard.
+Another crypto bot grinding 15-minute windows. Almost ignored it.
+Then I saw the win rate.
+80%.
+
+Too low for a profitable trader.
+Way too low.
+That’s when it clicked — I was measuring the wrong thing.
+
+This bot does not predict.
+Does not care if BTC goes up or down.
+Does not read charts.
+Does not time entries.
+
+It watches one thing only: prices that violate basic math.
+Here’s the mechanic.
+
+Every 15-minute Polymarket window has two outcomes: YES and NO.
+One of them must pay $1. Always.
+
+So YES + NO should equal $1.
+That’s not a theory. That’s arithmetic.
+
+But when crypto moves fast, the book breaks.
+YES at 48¢
+NO at 49¢
+Total: 97¢
+The bot sees it.
+Buys both sides.
+Waits.
+Market resolves.
+One side pays $1.
+
+Cost: 97¢
+Payout: $1
+Profit: 3¢
+
+Outcome doesn’t matter.
+
+The script polls Polymarket every few seconds.
+BTC. SOL. XRP. Any market with volume.
+The moment combined prices drop below ~99¢, it fires.
+
+3¢ per trade.
+Tens of thousands of executions.
+That’s how you get to $325K.
+
+Now the 80% win rate makes sense.
+He isn’t trying to win bets.
+
+He’s locking profit before the bet even resolves.
+Everyone else bets on outcomes.
+This bot bets on broken math.
+
+tweet 8:
+I found a secret Market Maker on Polymarket (where none should exist)
+
+This bot has been printing stable profits for over a year
+
+- $181k profit
+- 22,790 markets snipped
+- Almost a million trades executed
+
+Found wallet here: https://polymarket.com/profile/@cry.eth2?via=lirrato
+
+The Strategy is very simple:
+
+- Enters the second a market opens. Secures the mathematical best entry unavailable to users
+
+- It operates with strictly capped downside (risking just 1-3¢) while maintaining massive upside potential (growth to 99¢)
+
+- Systematically buys cheap probability before the market efficiency kicks in
+
+I'm honestly shocked this exists. The logic is simple, yet genius
+
+Since Polymarket has no official AMM, users are coding their own - exploiting inefficiencies while making the entire platform more stable and liquid
+
+tweet 9:
+A high-frequency ai bot earned $120K by recycling capital every 15 minutes.
+
+I found the hardest-working bot on Polymarket. He trades using a simple algorithm. Now I'll tell you the secret.
+
+Joined in December, it executed 7,948 predictions in about 30 days roughly 265 trades per day.
+
+Its strategy is pure high-frequency compounding:
+> Smaller bets: $2K–$7K per window.
+> Dual assets: Trades BTC and ETH 15-minute windows simultaneously.
+> Extreme ROI: +169% on BTC, +227% on ETH.
+
+This isn't gambling it's a capital recycling machine.
+
+It puts $4,000 into a window, gets $8,600 back 15 minutes later, and immediately redeploys into the next.
+
+Most traders run out of ammo. This wallet reuses the same dollars 20 times a day.
+
+The strategy is easy.
+
+When the market moves, the UI lags for 3-5 seconds. The API does not. In that blind spot, pricing breaks.
+
+He buys "YES" at 45¢ and "NO" at 48¢. Total cost: 93¢. Guaranteed payout: $1.00.
+
+It turned a mid-sized bankroll into $120,676 in one month by pressing the button more often than anyone else.
+
+Structure > Conviction.
+
+
+tweet 10:
+This bot bets $0.01 on events with 0.01% odds and actually makes money.
+
+I found an interesting Polymarket account created in September 2025.
+
+The bot automatically buys YES shares at the absolute minimum price (0.1¢) across thousands of different markets.
+
+At first glance, this looks questionable. But the logic is simple:
+the downside is strictly capped, while the upside comes from rare but inevitable resolutions.
+
+You only need a handful of unlikely events to resolve YES for the entire strategy to turn profitable.
+
+And it works.
+Current PNL: +$960.
+
+Everyone talks about "INSANE TRADING BOTS" on Polymarket.
+
+This is one of the few strategies that is actually rational.
+
+tweet 11:
+i tried to visualize how Scottynooo’s trading actually works and why this low-latency, event-driven market making + micro-arbitrage bot managed to print $300k+ on Polymarket
+
+this isn’t about predicting outcomes. it’s about reacting faster than the market
+
+the bot trades both sides, stays mostly delta-neutral, waits for mispricing, spread dislocations, volatility compression, and exits fast when liquidity shows up
+
+what most people miss:
+
+> the edge isn’t a single strategy
+
+it’s infra, monitoring, execution logic, and constant tuning. code is just the starting point
+
+most people underestimate how hard that is
+
+account: https://polymarket.com/@ScottyNooo?via=gusik4ever
+
+tweet 12:
+AI bot turned a measly $50 deposit into $230K on Polymarket
+
+That's a clean x4600 return in just two months, esports markets only
+
+Everyone's buzzing because this isn't gambling, pure mechanical edgee
+
+The math doesn't lie and the results speak for themselves:
+
+Here's the machine:
+
+> Monitors live LoL/Dota 2 streams faster than Polymarket can price
+> Kill happens, teamfight shifts, bot snags the 2-5c mispricing instantly
+> Pure spread capture, no predictions. Just reaction speed beating liquidity
+
+Esports = perfect bot food. Clean signals, repeatable patterns, no geopolitics fog

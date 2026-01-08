@@ -1,0 +1,15 @@
+Polymarket generally has a zero-fee model for most markets, but introduced taker-only fees for 15-minute crypto markets to fund liquidity, with fees varying by market odds (higher near 50%) and rebated to market makers; a separate U.S. exchange also uses a low 0.01% taker fee, but makers often earn rewards. For the main platform, most makers and takers pay 0% fees, while specific crypto markets have taker fees (e.g., ~3% at peak) paid to makers, who may receive rebates. 
+Current Fee Structure (as of early 2026):
+Most Markets (Global/General):
+Makers: 0 bps (basis points).
+Takers: 0 bps (basis points).
+15-Minute Crypto Markets:
+Makers: 0 bps (receive rebates from taker fees).
+Takers: Fees apply, varying by odds (e.g., up to ~3% at 50/50 odds).
+Polymarket U.S. Exchange:
+Makers: Generally 0 bps (plus potential rewards).
+Takers: 0.01% (1 bps) flat fee on contracts. 
+Key Points:
+Maker Rebate Program: Taker fees from certain crypto markets fund payments to liquidity providers (makers).
+Fee Variation: Fees on those crypto markets are dynamic, dropping as prices approach 0% or 100%.
+Zero Fees for Most: The primary platform remains fee-free for most market participants. 

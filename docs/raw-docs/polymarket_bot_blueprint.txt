@@ -1,0 +1,751 @@
+================================================================================
+                    POLYMARKET BOT - TECHNICAL BLUEPRINT
+                         Maximum Efficiency Stack
+================================================================================
+
+Created: January 2026
+Purpose: High-frequency arbitrage/trading bot for Polymarket prediction markets
+
+================================================================================
+                            TABLE OF CONTENTS
+================================================================================
+
+1.  Architecture Overview
+2.  Language Choice Analysis
+3.  Signing Speed Comparison
+4.  HTTP Client Optimization
+5.  WebSocket Setup
+6.  VPS Location & Specs
+7.  Complete Latency Breakdown
+8.  Additional Optimizations
+9.  Complete Tech Stack Summary
+10. Linux Kernel Tuning
+11. Development Roadmap
+12. Existing Libraries & Resources
+13. Polymarket API Endpoints Reference
+14. Strategy Options Summary
+15. Risk Considerations & Market Statistics
+
+.
+                        1. ARCHITECTURE OVERVIEW
+.
+
+┌─────────────────────────────────────────────────────────────────┐
+│                         VPS (Near Polymarket)                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐      │
+│   │  WebSocket  │────▶│   Decision  │────▶│   Order     │      │
+│   │  Listener   │     │   Engine    │     │   Signer    │      │
+│   │  (Rust/Go)  │     │  (Rust/Go)  │     │   (Rust)    │      │
+│   └─────────────┘     └─────────────┘     └─────────────┘      │
+│         │                   │                   │               │
+│         ▼                   ▼                   ▼               │
+│   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐      │
+│   │  In-Memory  │     │    Async    │     │   Direct    │      │
+│   │    State    │     │   HTTP/2    │     │   POST to   │      │
+│   │   (Redis?)  │     │   Client    │     │    CLOB     │      │
+│   └─────────────┘     └─────────────┘     └─────────────┘      │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+Data Flow:
+1. WebSocket receives real-time market data
+2. Decision engine analyzes for opportunities
+3. If opportunity found → construct order
+4. Sign order cryptographically
+5. POST to CLOB API
+6. Monitor execution status
+
+
+                        2. LANGUAGE CHOICE ANALYSIS
+.
+
+COMPONENT-BY-COMPONENT RECOMMENDATION:
+
+┌──────────────────────┬─────────────┬─────────────────────────────────────────┐
+│ Component            │ Best Choice │ Why                                     │
+├──────────────────────┼─────────────┼─────────────────────────────────────────┤
+│ Crypto Signing       │ Rust        │ Fastest for elliptic curve ops,         │
+│                      │             │ memory safe, existing ethers-rs library │
+├──────────────────────┼─────────────┼─────────────────────────────────────────┤
+│ Main Loop / Decision │ Rust or Go  │ Both excellent. Rust slightly faster,   │
+│ Engine               │             │ Go easier to write                      │
+├──────────────────────┼─────────────┼─────────────────────────────────────────┤
+│ WebSocket Client     │ Rust or Go  │ Native async support in both            │
+├──────────────────────┼─────────────┼─────────────────────────────────────────┤
+│ HTTP Client          │ Rust or Go  │ Avoid Python's GIL entirely             │
+└──────────────────────┴─────────────┴─────────────────────────────────────────┘
+
+WHY NOT C?
+- C would be fastest theoretically, but:
+  - No good Ethereum/signing libraries (you'd write from scratch)
+  - Memory management hell for a trading bot
+  - Development time 10x longer
+  - Rust is ~95% of C speed with much better safety
+
+WHY NOT PYTHON?
+- Global Interpreter Lock (GIL) limits true parallelism
+- Order signing takes ~1000ms (vs ~2-5ms in Rust)
+- Higher memory overhead
+- Fine for prototyping, not for production HFT
+
+FINAL RECOMMENDATION:
+- Primary:   Rust for everything
+- Secondary: Go (easier, 90% as fast, faster development time)
+
+.
+                      3. SIGNING SPEED COMPARISON
+.
+
+┌─────────────────────────────┬──────────────────────┐
+│ Language                    │ Signing Time (approx)│
+├─────────────────────────────┼──────────────────────┤
+│ Python (py-clob-client)     │ ~1000ms              │
+│ Go (go-ethereum)            │ ~5-15ms              │
+│ Rust (ethers-rs)            │ ~1-5ms               │
+│ C (manual implementation)   │ ~1-3ms               │
+└─────────────────────────────┴──────────────────────┘
+
+KEY INSIGHT: 
+Rust gets you 99% of C performance with existing libraries.
+The jump from Python to Rust is 200-500x improvement in signing speed.
+
+.
+                      4. HTTP CLIENT OPTIMIZATION
+.
+
+FOR RUST (reqwest):
+--------------------------------------------------------------------------------
+use reqwest::Client;
+use std::time::Duration;
+
+let client = Client::builder()
+    .pool_max_idle_per_host(10)       // Keep connections alive
+    .http2_prior_knowledge()           // Force HTTP/2 (faster)
+    .tcp_nodelay(true)                 // Disable Nagle's algorithm
+    .timeout(Duration::from_millis(500))
+    .build()?;
+--------------------------------------------------------------------------------
+
+FOR GO (net/http):
+--------------------------------------------------------------------------------
+import "net/http"
+
+var client = &http.Client{
+    Transport: &http.Transport{
+        MaxIdleConns:        100,
+        MaxIdleConnsPerHost: 100,
+        IdleConnTimeout:     90 * time.Second,
+        DisableKeepAlives:   false,
+    },
+    Timeout: 500 * time.Millisecond,
+}
+--------------------------------------------------------------------------------
+
+KEY OPTIMIZATIONS EXPLAINED:
+
+┌─────────────────────┬───────────────────────────────────────────────────────┐
+│ Setting             │ Why                                                   │
+├─────────────────────┼───────────────────────────────────────────────────────┤
+│ Connection pooling  │ Reuse TCP connections, skip handshake overhead        │
+│ HTTP/2              │ Multiplexing, faster than HTTP/1.1                    │
+│ TCP_NODELAY         │ Send packets immediately, don't buffer (Nagle's off)  │
+│ Keep-alive          │ Don't close connections between requests              │
+└─────────────────────┴───────────────────────────────────────────────────────┘
+
+.
+                         5. WEBSOCKET SETUP
+.
+
+POLYMARKET WEBSOCKET ENDPOINTS:
+
+┌─────────────────┬────────────────────────────────────────────────────────────┐
+│ WebSocket       │ URL                                                        │
+├─────────────────┼────────────────────────────────────────────────────────────┤
+│ CLOB WebSocket  │ wss://ws-subscriptions-clob.polymarket.com/ws/market       │
+│ (Order book)    │                                                            │
+├─────────────────┼────────────────────────────────────────────────────────────┤
+│ User WebSocket  │ wss://ws-subscriptions-clob.polymarket.com/ws/user         │
+│ (Your orders)   │                                                            │
+├─────────────────┼────────────────────────────────────────────────────────────┤
+│ RTDS            │ wss://ws-live-data.polymarket.com                          │
+│ (General data)  │                                                            │
+└─────────────────┴────────────────────────────────────────────────────────────┘
+
+RUST IMPLEMENTATION (tokio-tungstenite):
+--------------------------------------------------------------------------------
+use tokio_tungstenite::connect_async;
+use futures_util::{StreamExt, SinkExt};
+use serde_json::json;
+
+async fn connect_to_polymarket(token_id: &str) -> Result<(), Box<dyn Error>> {
+    let url = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+    let (mut ws_stream, _) = connect_async(url).await?;
+
+    // Subscribe to the market
+    let subscribe_msg = json!({
+        "assets_ids": [token_id],
+        "type": "market"
+    });
+    ws_stream.send(Message::Text(subscribe_msg.to_string())).await?;
+
+    // Read with zero-copy where possible
+    while let Some(msg) = ws_stream.next().await {
+        match msg? {
+            Message::Text(text) => {
+                // Parse and process - use simd-json for speed
+                let data: BookUpdate = serde_json::from_str(&text)?;
+                
+                // Your decision logic here
+                if should_trade(&data) {
+                    execute_trade(&data).await?;
+                }
+            }
+            Message::Ping(payload) => {
+                ws_stream.send(Message::Pong(payload)).await?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+--------------------------------------------------------------------------------
+
+GO IMPLEMENTATION (gorilla/websocket):
+--------------------------------------------------------------------------------
+package main
+
+import (
+    "encoding/json"
+    "github.com/gorilla/websocket"
+    "log"
+)
+
+func connectToPolymarket(tokenId string) error {
+    url := "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    
+    conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+    if err != nil {
+        return err
+    }
+    defer conn.Close()
+
+    // Subscribe
+    subscription := map[string]interface{}{
+        "assets_ids": []string{tokenId},
+        "type":       "market",
+    }
+    conn.WriteJSON(subscription)
+
+    // Read loop
+    for {
+        _, message, err := conn.ReadMessage()
+        if err != nil {
+            log.Println("read error:", err)
+            break
+        }
+        
+        var data BookUpdate
+        json.Unmarshal(message, &data)
+        
+        // Your decision logic here
+        if shouldTrade(data) {
+            executeTrade(data)
+        }
+    }
+    return nil
+}
+--------------------------------------------------------------------------------
+
+IMPORTANT WEBSOCKET NOTES:
+- Send PING every 5 seconds to maintain connection
+- Handle reconnection logic (connection can drop after ~20 minutes)
+- Subscribe to multiple assets by adding to assets_ids array
+
+.
+                       6. VPS LOCATION & SPECS
+.
+
+HOW TO FIND OPTIMAL LOCATION:
+--------------------------------------------------------------------------------
+# Ping test from different regions
+ping clob.polymarket.com
+
+# Traceroute to find their hosting
+traceroute clob.polymarket.com
+
+# Check DNS
+nslookup clob.polymarket.com
+--------------------------------------------------------------------------------
+
+RECOMMENDED VPS LOCATIONS (in order of preference):
+
+┌──────────┬─────────────────────────┬─────────────────────────────────────────┐
+│ Provider │ Region                  │ Why                                     │
+├──────────┼─────────────────────────┼─────────────────────────────────────────┤
+│ AWS      │ us-east-1 (N. Virginia) │ Most crypto infrastructure is here      │
+│ GCP      │ us-east4                │ Alternative, good connectivity          │
+│ Hetzner  │ US East (Ashburn)       │ Cheaper, still fast                     │
+│ Vultr    │ New Jersey              │ Budget option                           │
+└──────────┴─────────────────────────┴─────────────────────────────────────────┘
+
+VPS SPECIFICATIONS:
+
+┌──────────┬─────────────┬─────────────────┐
+│ Spec     │ Minimum     │ Recommended     │
+├──────────┼─────────────┼─────────────────┤
+│ CPU      │ 2 cores     │ 4 cores         │
+│ RAM      │ 2GB         │ 4GB             │
+│ Storage  │ 20GB SSD    │ 40GB NVMe       │
+│ Network  │ 1Gbps       │ 1Gbps+          │
+│ Latency  │ <20ms       │ <10ms           │
+└──────────┴─────────────┴─────────────────┘
+
+ESTIMATED MONTHLY COST: $20-50/month
+
+.
+                     7. COMPLETE LATENCY BREAKDOWN
+.
+
+┌───────────────────────────┬─────────────────┬─────────────────┐
+│ Step                      │ Optimized (Rust)│ Python          │
+├───────────────────────────┼─────────────────┼─────────────────┤
+│ WebSocket message receive │ ~1-2ms          │ ~1-2ms          │
+│ JSON parsing              │ ~0.1ms (simd)   │ ~1-5ms          │
+│ Decision logic            │ ~0.01ms         │ ~0.1ms          │
+│ Order construction        │ ~0.1ms          │ ~1ms            │
+│ Crypto signing            │ ~2-5ms          │ ~1000ms ← SLOW  │
+│ HTTP POST to CLOB         │ ~10-30ms        │ ~50-100ms       │
+├───────────────────────────┼─────────────────┼─────────────────┤
+│ TOTAL                     │ ~15-40ms        │ ~1050-1100ms    │
+└───────────────────────────┴─────────────────┴─────────────────┘
+
+SPEED IMPROVEMENT: 25-70x faster than Python
+
+.
+                      8. ADDITIONAL OPTIMIZATIONS
+.
+
+A. PRE-COMPUTE WHAT YOU CAN
+--------------------------------------------------------------------------------
+// Pre-generate order templates, only fill in price/size at execution time
+struct OrderTemplate {
+    token_id: String,
+    side: Side,
+    // price and size filled at runtime
+}
+
+// Pre-compute common values
+let fee_multiplier = 0.98;  // 2% fee pre-calculated
+--------------------------------------------------------------------------------
+
+B. USE SIMD JSON PARSING (Rust)
+--------------------------------------------------------------------------------
+// Use simd-json instead of serde_json for 2-3x faster parsing
+use simd_json;
+
+let mut bytes = text.into_bytes();
+let data: Value = simd_json::from_slice(&mut bytes)?;
+--------------------------------------------------------------------------------
+
+C. MEMORY PRE-ALLOCATION
+--------------------------------------------------------------------------------
+// Don't allocate during hot path - pre-allocate buffers
+let mut buffer = Vec::with_capacity(4096);
+let mut order_queue = Vec::with_capacity(100);
+--------------------------------------------------------------------------------
+
+D. AVOID LOCKS IN HOT PATH
+--------------------------------------------------------------------------------
+// Use lock-free data structures for shared state
+use crossbeam::queue::ArrayQueue;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Atomic for simple counters
+static TRADE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// Lock-free queue for order passing between threads
+let order_queue: ArrayQueue<Order> = ArrayQueue::new(1000);
+--------------------------------------------------------------------------------
+
+E. BATCH OPERATIONS WHERE POSSIBLE
+--------------------------------------------------------------------------------
+// Instead of checking one market at a time, check multiple
+async fn check_opportunities(markets: &[Market]) -> Vec<Opportunity> {
+    markets.par_iter()  // Parallel iteration
+        .filter_map(|m| find_arbitrage(m))
+        .collect()
+}
+--------------------------------------------------------------------------------
+
+F. CONNECTION WARMING
+--------------------------------------------------------------------------------
+// Keep connections warm by sending periodic requests
+// Don't let TCP connections go idle and get closed
+tokio::spawn(async move {
+    loop {
+        client.get("https://clob.polymarket.com/time").await.ok();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+});
+--------------------------------------------------------------------------------
+
+G. KERNEL BYPASS (ADVANCED - probably overkill)
+- DPDK (Data Plane Development Kit)
+- io_uring for async I/O
+- Only needed for microsecond-level improvements
+
+.
+                     9. COMPLETE TECH STACK SUMMARY
+.
+
+┌────────────────────────────────────────────────────────────────────────────┐
+│                         RECOMMENDED STACK                                  │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                            │
+│  Language:        Rust (or Go for faster development)                      │
+│                                                                            │
+│  WebSocket:       tokio-tungstenite (Rust)                                 │
+│                   gorilla/websocket (Go)                                   │
+│                                                                            │
+│  HTTP Client:     reqwest with HTTP/2 (Rust)                               │
+│                   net/http with tuning (Go)                                │
+│                                                                            │
+│  Signing:         ethers-rs (Rust)                                         │
+│                   go-ethereum (Go)                                         │
+│                                                                            │
+│  JSON Parsing:    simd-json (Rust) - 2-3x faster                           │
+│                   json-iterator (Go)                                       │
+│                                                                            │
+│  Async Runtime:   tokio (Rust)                                             │
+│                   goroutines (Go)                                          │
+│                                                                            │
+│  State Storage:   In-memory HashMap / DashMap                              │
+│                   Redis (if persistence needed)                            │
+│                                                                            │
+│  VPS:             AWS us-east-1 or similar                                 │
+│                   4 cores, 4GB RAM, 1Gbps                                  │
+│                                                                            │
+│  OS:              Linux (Ubuntu 22.04 or Debian 12)                        │
+│                   Tuned kernel parameters (see section 10)                 │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+
+.
+                       10. LINUX KERNEL TUNING
+.
+
+Add to /etc/sysctl.conf:
+--------------------------------------------------------------------------------
+# Increase network buffers
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+
+# Reduce latency
+net.ipv4.tcp_nodelay = 1
+net.ipv4.tcp_low_latency = 1
+
+# Faster connection handling
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.core.netdev_max_backlog = 65535
+
+# TCP keepalive (detect dead connections faster)
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 6
+
+# Reuse sockets quickly
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+
+# Increase file descriptors
+fs.file-max = 2097152
+--------------------------------------------------------------------------------
+
+Apply changes:
+--------------------------------------------------------------------------------
+sudo sysctl -p
+--------------------------------------------------------------------------------
+
+Also add to /etc/security/limits.conf:
+--------------------------------------------------------------------------------
+*         soft    nofile      1048576
+*         hard    nofile      1048576
+root      soft    nofile      1048576
+root      hard    nofile      1048576
+--------------------------------------------------------------------------------
+
+.
+                       11. DEVELOPMENT ROADMAP
+.
+
+┌───────┬────────────────────────────────────────┬─────────────────┐
+│ Phase │ Task                                   │ Time Estimate   │
+├───────┼────────────────────────────────────────┼─────────────────┤
+│ 1     │ Set up Rust/Go project structure       │ 1 day           │
+│ 2     │ Implement WebSocket listener           │ 2-3 days        │
+│ 3     │ Implement signing (ethers-rs/go-eth)   │ 2-3 days        │
+│ 4     │ Build decision engine / strategy       │ 3-5 days        │
+│ 5     │ HTTP client + order execution          │ 2 days          │
+│ 6     │ Testing with small amounts ($10-50)    │ 1 week          │
+│ 7     │ Deploy to VPS, optimize latency        │ 2-3 days        │
+│ 8     │ Monitor, iterate, scale                │ Ongoing         │
+├───────┼────────────────────────────────────────┼─────────────────┤
+│ TOTAL │                                        │ 3-4 weeks       │
+└───────┴────────────────────────────────────────┴─────────────────┘
+
+.
+                   12. EXISTING LIBRARIES & RESOURCES
+.
+
+RUST LIBRARIES:
+┌─────────────────────┬────────────────────────────────────────────────────────┐
+│ Library             │ Purpose                                                │
+├─────────────────────┼────────────────────────────────────────────────────────┤
+│ ethers-rs           │ Ethereum signing, transactions, wallet management      │
+│ tokio               │ Async runtime                                          │
+│ tokio-tungstenite   │ WebSocket client                                       │
+│ reqwest             │ HTTP client with connection pooling                    │
+│ simd-json           │ Fast JSON parsing (SIMD optimized)                     │
+│ serde               │ Serialization/deserialization                          │
+│ crossbeam           │ Lock-free data structures                              │
+│ dashmap             │ Concurrent HashMap                                     │
+└─────────────────────┴────────────────────────────────────────────────────────┘
+
+GO LIBRARIES:
+┌─────────────────────┬────────────────────────────────────────────────────────┐
+│ Library             │ Purpose                                                │
+├─────────────────────┼────────────────────────────────────────────────────────┤
+│ go-ethereum         │ Ethereum signing and transactions                      │
+│ gorilla/websocket   │ WebSocket client                                       │
+│ json-iterator       │ Fast JSON parsing                                      │
+│ fasthttp            │ Faster HTTP client than net/http                       │
+└─────────────────────┴────────────────────────────────────────────────────────┘
+
+OFFICIAL POLYMARKET CLIENTS:
+- Rust:       https://github.com/Polymarket/rs-clob-client
+- Python:     https://github.com/Polymarket/py-clob-client
+- TypeScript: https://github.com/Polymarket/clob-client
+- Agents:     https://github.com/Polymarket/agents (AI trading agents)
+
+DOCUMENTATION:
+- Official docs:    https://docs.polymarket.com/
+- CLOB API:         https://docs.polymarket.com/developers/CLOB/quickstart
+- Gamma API:        https://docs.polymarket.com/developers/gamma-markets-api
+
+.
+                  13. POLYMARKET API ENDPOINTS REFERENCE
+.
+
+REST ENDPOINTS (https://clob.polymarket.com):
+┌─────────────────────────────┬────────────────────────────────────────────────┐
+│ Endpoint                    │ Description                                    │
+├─────────────────────────────┼────────────────────────────────────────────────┤
+│ GET  /markets               │ List all markets                               │
+│ GET  /market/{id}           │ Get specific market                            │
+│ GET  /price                 │ Get current price for token                    │
+│ GET  /book                  │ Get order book                                 │
+│ GET  /midpoint              │ Get midpoint price                             │
+│ GET  /trades                │ Get trade history                              │
+│ GET  /orders                │ Get your open orders (authenticated)           │
+│ POST /order                 │ Place an order (authenticated)                 │
+│ DELETE /order/{id}          │ Cancel an order (authenticated)                │
+└─────────────────────────────┴────────────────────────────────────────────────┘
+
+GAMMA API (https://gamma-api.polymarket.com):
+┌─────────────────────────────┬────────────────────────────────────────────────┐
+│ Endpoint                    │ Description                                    │
+├─────────────────────────────┼────────────────────────────────────────────────┤
+│ GET  /markets               │ Market metadata with categories                │
+│ GET  /events                │ Event information                              │
+└─────────────────────────────┴────────────────────────────────────────────────┘
+
+WEBSOCKET ENDPOINTS:
+┌───────────────────────────────────────────────────────┬─────────────────────┐
+│ URL                                                   │ Purpose             │
+├───────────────────────────────────────────────────────┼─────────────────────┤
+│ wss://ws-subscriptions-clob.polymarket.com/ws/market  │ Order book updates  │
+│ wss://ws-subscriptions-clob.polymarket.com/ws/user    │ Your order updates  │
+│ wss://ws-live-data.polymarket.com                     │ General market data │
+└───────────────────────────────────────────────────────┴─────────────────────┘
+
+AUTHENTICATION:
+- Generate API credentials using your private key
+- Use HMAC signatures for authenticated endpoints
+- Polygon chain ID: 137
+
+.
+                      14. STRATEGY OPTIONS SUMMARY
+.
+
+STRATEGY 1: BINARY ARBITRAGE (15-min crypto markets)
+--------------------------------------------------------------------------------
+How it works:
+- In YES/NO markets, YES + NO should equal $1.00
+- When combined price < $0.97, buy both sides
+- Guaranteed profit at resolution
+
+Example:
+- YES price: $0.52
+- NO price:  $0.45
+- Combined:  $0.97
+- Buy both → pay $0.97 → receive $1.00 → profit $0.03 (3%)
+
+Difficulty: High competition, need speed
+Capital needed: $100-1000+
+--------------------------------------------------------------------------------
+
+STRATEGY 2: MULTI-OPTION ARBITRAGE
+--------------------------------------------------------------------------------
+How it works:
+- Markets with 3+ outcomes (e.g., "Who will win?")
+- All outcomes should sum to $1.00
+- When sum < $1.00, buy one of each
+
+Example (Fed rate decision):
+- Cut 50bp:   $0.001
+- Cut 25bp:   $0.008
+- No change:  $0.850
+- Raise 25bp: $0.100
+- Total:      $0.959 (sum < $1.00)
+- Buy all → profit $0.041 per set
+
+Difficulty: Medium, less competition
+Capital needed: $500-5000+
+--------------------------------------------------------------------------------
+
+STRATEGY 3: ESPORTS STREAM DELAY (HIGHEST REPORTED ROI)
+--------------------------------------------------------------------------------
+How it works:
+- Twitch/YouTube streams are delayed 30-40 seconds
+- Game server APIs provide real-time data
+- Bot sees events before stream viewers
+- Trade before market updates
+
+Games: LoL, Dota 2, CS2
+APIs: Riot API (LoL), Steam API (Dota 2)
+
+Reported results: $111 → $230,000 in 3 months (23,000% ROI)
+
+Difficulty: Medium-High (need game API knowledge)
+Capital needed: $100-500 to start
+--------------------------------------------------------------------------------
+
+STRATEGY 4: ENDGAME SWEEP
+--------------------------------------------------------------------------------
+How it works:
+- Buy outcomes priced at $0.95-0.99 (near certain)
+- Wait for official resolution
+- Collect $1.00 per share
+
+Example:
+- Event is 95% certain
+- Buy at $0.96
+- Wait for resolution
+- Profit: $0.04 per share (4%)
+
+Risk: Black swan events can reverse "certain" outcomes
+
+Difficulty: Low
+Capital needed: $1000+ (low margin, need volume)
+--------------------------------------------------------------------------------
+
+STRATEGY 5: CROSS-PLATFORM ARBITRAGE
+--------------------------------------------------------------------------------
+How it works:
+- Same event priced differently on Polymarket vs Kalshi
+- Buy YES on cheaper platform, NO on expensive platform
+- Profit regardless of outcome
+
+Example:
+- Polymarket: Trump wins at $0.52
+- Kalshi: Trump wins at $0.48
+- Spread: 4%
+
+Risks: 
+- Different resolution criteria between platforms
+- Execution timing across platforms
+
+Difficulty: High (need accounts on multiple platforms)
+Capital needed: $1000+
+--------------------------------------------------------------------------------
+
+.
+              15. RISK CONSIDERATIONS & MARKET STATISTICS
+.
+
+MARKET STATISTICS (from academic research):
+┌────────────────────────────────────────────────────────────────────────────┐
+│ - 70% of Polymarket addresses have never made a profit                     │
+│ - Only 0.51% of wallets have profits exceeding $1,000                      │
+│ - Only 0.04% of addresses captured 70% of total profits                    │
+│ - $40 million extracted by arbitrageurs (April 2024 - April 2025)          │
+│ - Top 3 wallets earned $4.2 million in arbitrage                           │
+│ - Top 10 arbitrageurs captured $8.18 million (21% of total)                │
+└────────────────────────────────────────────────────────────────────────────┘
+
+RISKS TO CONSIDER:
+
+1. EXECUTION RISK
+   - Opportunities vanish in seconds
+   - Partial fills leave you unhedged
+   - Network latency can turn profit into loss
+
+2. SMART CONTRACT RISK
+   - Polymarket uses UMA's Optimistic Oracle
+   - Oracle manipulation has occurred (March 2025 incident)
+   - $7M market manipulated by whale with 25% voting power
+
+3. PLATFORM RISK
+   - Resolution disputes can lock funds
+   - Definition differences between platforms
+   - Regulatory changes (especially US users)
+
+4. COMPETITION RISK
+   - HFT bots dominate most opportunities
+   - Latency arms race requires investment
+   - Margins shrinking over time
+
+5. CAPITAL RISK
+   - Fees: 2% on winning positions
+   - Gas fees on Polygon (small but exist)
+   - Slippage on large orders
+
+6. BLACK SWAN RISK
+   - "Certain" outcomes can reverse
+   - Sports: referee decisions overturned
+   - Politics: last-minute scandals
+   - Legal: court decisions reversed
+
+RECOMMENDED RISK MANAGEMENT:
+- Never bet more than 40% of capital on single event
+- Start with small amounts ($50-100) to learn
+- Build monitoring bot first, trade later
+- Diversify across multiple uncorrelated markets
+- Set strict loss limits per day/week
+
+.
+                           QUICK START CHECKLIST
+.
+
+[ ] 1. Choose language (Rust recommended, Go acceptable)
+[ ] 2. Set up development environment
+[ ] 3. Create Polygon wallet with USDC
+[ ] 4. Generate Polymarket API credentials
+[ ] 5. Build WebSocket monitor (read-only first)
+[ ] 6. Run monitor for 1-2 weeks, log opportunities
+[ ] 7. Analyze logs - which strategy fits best?
+[ ] 8. Implement signing and execution
+[ ] 9. Test with small amounts ($10-50)
+[ ] 10. Deploy to VPS
+[ ] 11. Monitor and iterate
+
+.
+                              END OF DOCUMENT
+.

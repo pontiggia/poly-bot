@@ -1,0 +1,79 @@
+Your current planning is already pointed in the right direction for a reusable “base_bot + pluggable strategies” architecture, because you’ve separated the invariants (ledger, execution engine, market data ingestion) from the changeable parts (strategy logic). The implementation plan even explicitly targets “multiple strategy support with market selection” as a deliverable.  ￼  ￼
+
+That said, if your goal is to pivot cleanly between taker/maker and different market types, there are 3 gaps you should tighten in the planning so the base stays truly reusable.
+
+⸻
+
+What’s already aligned with “base_bot + modules”
+
+Strong separation of concerns
+	•	Ledger is authoritative and everything else reads from it.  ￼
+	•	Execution is a state machine (this is exactly what makes strategies pluggable).  ￼
+	•	Strategies are conceptually “Decision Engine” sitting on top of WS + state.  ￼
+
+Strategy roadmap already anticipates multiple modules
+
+Your strategy doc covers multiple “modules” (math arb, temporal arb, spread capture, multi-outcome arb, etc.).  ￼
+And your implementation plan Phase 5 includes “Market Selection Scoring” + “Multiple strategy support.”  ￼
+
+So the direction is correct.
+
+⸻
+
+The 3 gaps to fix so it’s truly pivotable
+
+1) You need a formal strategy interface and a “router”
+
+Right now you describe “Decision Engine (Strategy)”, but the docs don’t lock in a clean contract like:
+	•	Strategy::on_book_update(...) -> Vec<OrderIntent>
+	•	Strategy::on_fill(...) -> Vec<OrderIntent>
+	•	Strategy::on_timer_tick(...) -> Vec<OrderIntent>
+
+And a StrategyRouter that decides:
+	•	which strategies are enabled
+	•	which markets they subscribe to
+	•	which one gets priority when they conflict
+
+Without this, strategies will end up coupled to book/ledger internals over time.
+
+Add to planning: “Strategy API + Router” as a core base_bot deliverable (ideally in Phase 3, right after execution engine).
+This matches your “multi strategy support” intent but makes it enforceable.  ￼
+
+⸻
+
+2) You need a unified OrderIntent abstraction (maker/taker is just a policy)
+
+Right now Phase 4 is very taker-centric (FOK/FAK, “never GTC for arb legs”).  ￼
+That’s fine for that strategy, but for pivotability, the base bot should treat this as:
+	•	Strategy outputs intents
+	•	ExecutionPolicy converts intents into actual CLOB orders:
+	•	maker policy → GTC + quoting + replace rules
+	•	taker policy → FOK/FAK + TTL + unwind rules
+
+So “maker vs taker” is not a strategy rewrite — it’s a different policy/adapter.
+
+Add to planning: ExecutionPolicy layer + OrderIntent schema.
+
+⸻
+
+3) Market-type capabilities need to be explicit (binary vs multi-outcome vs fee-markets)
+
+Your strategy doc includes multi-outcome arb and niche strategies.  ￼
+But the base bot needs a capability registry per market, e.g.:
+	•	MarketKind::Binary | MultiOutcome
+	•	FeeModel::Zero | FeeCurve (esp now with 15m crypto fees)
+	•	SupportsMakerRebates: bool
+	•	tick size, min size
+
+Otherwise you’ll hardcode “15-min crypto” into strategy logic. The plan currently says “auto-filter 15-min crypto markets”, which is good, but it’s still a bit ad hoc.  ￼
+
+Add to planning: MarketRegistry that exposes these capabilities so strategies are portable.
+
+⸻
+
+One specific thing to adjust in the docs
+
+In 02-RUST-ARCHITECTURE.md you still have some “strategy inside book state” style helper functions like check_arbitrage() on the book state. That’s convenient early, but it’s the opposite of “base_bot reusable”: it couples strategy logic into core state.  ￼
+
+Recommendation: move anything “opportunity-specific” out of OrderBookState and into strategies.
+Core state should expose primitives (best bid/ask, depth, etc.), not “arb detection”.
