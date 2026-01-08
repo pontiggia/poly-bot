@@ -78,6 +78,9 @@ pub struct OrderIntent {
 
     /// Created timestamp
     pub created_at: Instant,
+
+    /// Fee rate in basis points (1000 = 10% for 15-min crypto markets)
+    pub fee_rate_bps: u32,
 }
 
 impl OrderIntent {
@@ -104,7 +107,14 @@ impl OrderIntent {
             group_id: None,
             priority: 50, // Default middle priority
             created_at: Instant::now(),
+            fee_rate_bps: 0, // Default to 0, strategies should set this
         }
+    }
+
+    /// Set fee rate in basis points
+    pub fn with_fee_rate(mut self, fee_rate_bps: u32) -> Self {
+        self.fee_rate_bps = fee_rate_bps;
+        self
     }
 
     /// Set group ID for linked orders (e.g., arb legs)

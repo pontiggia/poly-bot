@@ -9,6 +9,7 @@
 //! - Aggressive timeouts for low-latency trading
 
 use reqwest::{Client, Response};
+use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -119,7 +120,25 @@ impl ApiClient {
             .body(body.to_string())
             .send()
             .await
-            .map_err(|e| BotError::Http(e))?;
+            .map_err(|e| {
+                // Extract detailed error info
+                let is_timeout = e.is_timeout();
+                let is_connect = e.is_connect();
+                let is_request = e.is_request();
+                let source = e.source().map(|s| s.to_string()).unwrap_or_default();
+
+                warn!(
+                    url = %url,
+                    is_timeout = is_timeout,
+                    is_connect = is_connect,
+                    is_request = is_request,
+                    source = %source,
+                    error = %e,
+                    "🔥 HTTP POST failed with details"
+                );
+
+                BotError::Http(e)
+            })?;
 
         Ok(response)
     }

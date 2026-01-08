@@ -43,14 +43,18 @@ Buy both → Pay $0.97 → Receive $1.00 → Profit: $0.03 (3.1%)
 > **IMPORTANT:** This is NOT "risk-free" on a CLOB. Profit is only guaranteed at resolution
 > IF you successfully acquire both legs at intended prices/sizes. See "CLOB Execution Risks" below.
 
-**Key Parameters:**
+**Key Parameters (As Implemented):**
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
-| Entry Threshold | Dynamic | Based on fees + slippage + book depth |
-| Min Edge | Dynamic | `required_edge = fees + slippage + partial_fill_risk` |
-| Polling Interval | 1-3 seconds | Balance speed vs rate limits |
-| Target Markets | 15-min crypto | Thin books, high volatility |
-| Order Type | FOK or FAK | Never GTC for arb legs |
+| Entry Threshold | 1% min edge | After fees/slippage |
+| Position Size | 5-15 shares | Dynamic based on $1 min order value |
+| Max Exposure | $50 | Total position limit |
+| Target Markets | 15-min crypto | BTC, ETH, SOL, XRP Up/Down |
+| Order Type | **GTC (Maker)** | Zero fees, possible rebate |
+| Execution | Parallel | Both legs via tokio::join! |
+
+> **UPDATE (2026-01-08):** Originally planned FOK/FAK, but switched to GTC maker orders
+> for zero fees on 15-min crypto markets. See STATE-OF-THE-BOT.md for current behavior.
 
 **Implementation Priority:** HIGHEST - Foundation strategy, but requires proper execution handling
 

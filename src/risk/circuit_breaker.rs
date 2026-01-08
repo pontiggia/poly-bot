@@ -36,6 +36,8 @@ pub enum OpenReason {
     ManualTrigger,
     /// Daily loss limit exceeded
     DailyLossExceeded,
+    /// Orphaned position detected (failed to cancel arb leg)
+    OrphanedPosition { order_id: String },
 }
 
 impl std::fmt::Display for OpenReason {
@@ -53,6 +55,9 @@ impl std::fmt::Display for OpenReason {
             }
             OpenReason::ManualTrigger => write!(f, "Manual trigger"),
             OpenReason::DailyLossExceeded => write!(f, "Daily loss limit exceeded"),
+            OpenReason::OrphanedPosition { order_id } => {
+                write!(f, "Orphaned position detected (order: {})", order_id)
+            }
         }
     }
 }
@@ -176,6 +181,14 @@ impl CircuitBreaker {
             }
             Some(ErrorType::Expected) => {
                 // Don't count toward threshold (e.g., FOK not filled)
+            }
+            Some(ErrorType::Critical) => {
+                // Critical error - immediately trip the circuit breaker
+                error!("Circuit breaker: Critical error detected, immediately tripping");
+                self.orders_rejected.fetch_add(1, Ordering::Relaxed);
+                self.open(OpenReason::OrphanedPosition { 
+                    order_id: "unknown".to_string() 
+                });
             }
         }
     }

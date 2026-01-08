@@ -49,7 +49,7 @@ pub struct TradeNotification {
     /// Trade ID
     #[serde(default)]
     pub id: String,
-    /// Order ID that was filled
+    /// Order ID that was filled (only valid when we are TAKER)
     #[serde(default)]
     pub taker_order_id: String,
     /// Market/condition ID
@@ -79,29 +79,116 @@ pub struct TradeNotification {
     /// Whether we are taker or maker
     #[serde(default)]
     pub trader_side: String,
+    /// Maker orders that were filled (contains our order_id when we are MAKER)
+    #[serde(default)]
+    pub maker_orders: Vec<MakerOrderFill>,
+}
+
+/// Individual maker order fill within a trade
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MakerOrderFill {
+    /// The maker's order ID
+    #[serde(default)]
+    pub order_id: String,
+    /// Amount matched
+    #[serde(default)]
+    pub matched_amount: String,
+    /// Price
+    #[serde(default)]
+    pub price: String,
 }
 
 impl TradeNotification {
-    /// Convert to Fill struct for ledger
+    /// Get the order ID that belongs to us (differs based on maker vs taker)
+    pub fn our_order_id(&self) -> Option<&str> {
+        if self.trader_side.to_uppercase() == "MAKER" {
+            // When we're maker, our order ID is in maker_orders
+            self.maker_orders.first().map(|m| m.order_id.as_str())
+        } else {
+            // When we're taker, our order ID is taker_order_id
+            if self.taker_order_id.is_empty() {
+                None
+            } else {
+                Some(&self.taker_order_id)
+            }
+        }
+    }
+    
+    /// Get all order IDs that could be ours (for maker fills, there may be multiple)
+    pub fn our_order_ids(&self) -> Vec<&str> {
+        if self.trader_side.to_uppercase() == "MAKER" {
+            self.maker_orders.iter().map(|m| m.order_id.as_str()).collect()
+        } else if !self.taker_order_id.is_empty() {
+            vec![&self.taker_order_id]
+        } else {
+            vec![]
+        }
+    }
+    
+    /// Convert to Fill struct for ledger (legacy, uses first order)
     pub fn to_fill(&self) -> Result<Fill> {
+        let order_id = self.our_order_id().unwrap_or("").to_string();
+        self.to_fill_for_order(&order_id)
+    }
+    
+    /// Convert to Fill struct for a specific order ID
+    /// This correctly uses matched_amount for maker fills instead of total trade size
+    pub fn to_fill_for_order(&self, our_order_id: &str) -> Result<Fill> {
         let side = match self.side.to_uppercase().as_str() {
             "BUY" => Side::Buy,
             "SELL" => Side::Sell,
             _ => return Err(BotError::Json(format!("Unknown side: {}", self.side))),
         };
 
-        let price = Decimal::from_str(&self.price)
-            .map_err(|e| BotError::Json(format!("Invalid price: {}", e)))?;
-
-        let size = Decimal::from_str(&self.size)
-            .map_err(|e| BotError::Json(format!("Invalid size: {}", e)))?;
-
-        // Calculate fee from fee_rate_bps
-        let fee_bps = self
-            .fee_rate_bps
-            .parse::<i64>()
-            .unwrap_or(0);
-        let fee = price * size * Decimal::new(fee_bps, 4);
+        let is_maker = self.trader_side.to_uppercase() == "MAKER";
+        
+        // ✅ FIX: For maker fills, use matched_amount from our specific maker order
+        // The trade.size is the TOTAL trade size, which could include many makers
+        let (size, price) = if is_maker {
+            // Find our specific maker order to get our matched_amount
+            let our_maker_order = self.maker_orders.iter()
+                .find(|m| m.order_id == our_order_id);
+            
+            match our_maker_order {
+                Some(maker) => {
+                    let matched = Decimal::from_str(&maker.matched_amount)
+                        .map_err(|e| BotError::Json(format!("Invalid matched_amount: {}", e)))?;
+                    // Use maker's price if available, otherwise fall back to trade price
+                    let maker_price = if !maker.price.is_empty() {
+                        Decimal::from_str(&maker.price)
+                            .unwrap_or_else(|_| Decimal::from_str(&self.price).unwrap_or(Decimal::ZERO))
+                    } else {
+                        Decimal::from_str(&self.price)
+                            .map_err(|e| BotError::Json(format!("Invalid price: {}", e)))?
+                    };
+                    (matched, maker_price)
+                }
+                None => {
+                    // Fallback: no matching maker order, use trade size
+                    let size = Decimal::from_str(&self.size)
+                        .map_err(|e| BotError::Json(format!("Invalid size: {}", e)))?;
+                    let price = Decimal::from_str(&self.price)
+                        .map_err(|e| BotError::Json(format!("Invalid price: {}", e)))?;
+                    (size, price)
+                }
+            }
+        } else {
+            // Taker: use trade.size directly (we took this amount)
+            let size = Decimal::from_str(&self.size)
+                .map_err(|e| BotError::Json(format!("Invalid size: {}", e)))?;
+            let price = Decimal::from_str(&self.price)
+                .map_err(|e| BotError::Json(format!("Invalid price: {}", e)))?;
+            (size, price)
+        };
+        
+        let fee = if is_maker {
+            // Makers pay no fees on 15-min crypto markets
+            Decimal::ZERO
+        } else {
+            // Takers pay fees based on rate
+            let fee_bps = self.fee_rate_bps.parse::<i64>().unwrap_or(0);
+            price * size * Decimal::new(fee_bps, 4)
+        };
 
         // Parse timestamp
         let timestamp = self
@@ -109,7 +196,6 @@ impl TradeNotification {
             .parse::<i64>()
             .ok()
             .and_then(|ts| {
-                // Could be seconds or milliseconds
                 if ts > 1_000_000_000_000 {
                     Utc.timestamp_millis_opt(ts).single()
                 } else {
@@ -120,7 +206,7 @@ impl TradeNotification {
 
         Ok(Fill {
             fill_id: self.id.clone(),
-            order_id: self.taker_order_id.clone(),
+            order_id: our_order_id.to_string(),
             token_id: self.asset_id.clone(),
             side,
             price,
@@ -373,7 +459,7 @@ mod tests {
     use rust_decimal_macros::dec;
 
     #[test]
-    fn test_trade_notification_to_fill() {
+    fn test_trade_notification_to_fill_taker() {
         let trade = TradeNotification {
             id: "trade123".to_string(),
             taker_order_id: "order456".to_string(),
@@ -386,6 +472,7 @@ mod tests {
             status: "MATCHED".to_string(),
             timestamp: "1704067200000".to_string(), // 2024-01-01
             trader_side: "TAKER".to_string(),
+            maker_orders: vec![],
         };
 
         let fill = trade.to_fill().unwrap();
@@ -397,6 +484,40 @@ mod tests {
         assert_eq!(fill.size, dec!(100));
         // Fee = 0.55 * 100 * 0.005 = 0.275
         assert_eq!(fill.fee, dec!(0.275));
+    }
+
+    #[test]
+    fn test_trade_notification_maker_order_id() {
+        // When we're maker, our order ID is in maker_orders, not taker_order_id
+        let trade = TradeNotification {
+            id: "trade_maker".to_string(),
+            taker_order_id: "other_persons_order".to_string(),
+            market: "market".to_string(),
+            asset_id: "token".to_string(),
+            side: "SELL".to_string(),
+            size: "50".to_string(),
+            price: "0.80".to_string(),
+            fee_rate_bps: "0".to_string(),
+            status: "MATCHED".to_string(),
+            timestamp: "1704067200".to_string(),
+            trader_side: "MAKER".to_string(),
+            maker_orders: vec![MakerOrderFill {
+                order_id: "my_maker_order_id".to_string(),
+                matched_amount: "50".to_string(),
+                price: "0.80".to_string(),
+            }],
+        };
+
+        // our_order_id() should return the maker order, not the taker
+        assert_eq!(trade.our_order_id(), Some("my_maker_order_id"));
+        
+        let fill = trade.to_fill().unwrap();
+        assert_eq!(fill.order_id, "my_maker_order_id");
+        assert_eq!(fill.side, Side::Sell);
+        assert_eq!(fill.size, dec!(50));
+        assert_eq!(fill.price, dec!(0.80));
+        // Maker pays no fees
+        assert_eq!(fill.fee, dec!(0));
     }
 
     #[test]
@@ -413,6 +534,11 @@ mod tests {
             status: "MATCHED".to_string(),
             timestamp: "1704067200".to_string(),
             trader_side: "MAKER".to_string(),
+            maker_orders: vec![MakerOrderFill {
+                order_id: "order_sell".to_string(),
+                matched_amount: "50".to_string(),
+                price: "0.80".to_string(),
+            }],
         };
 
         let fill = trade.to_fill().unwrap();

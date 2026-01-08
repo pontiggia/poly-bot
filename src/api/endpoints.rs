@@ -314,7 +314,26 @@ impl ApiClient {
         let body = serde_json::to_string(request)
             .map_err(|e| BotError::Json(format!("Failed to serialize order: {}", e)))?;
 
-        debug!(body = %body, "Placing order");
+        // Log credentials being used (INFO level to ensure visibility)
+        let creds = self.credentials();
+        warn!(
+            api_key = %creds.api_key,
+            wallet = %creds.wallet_address,
+            order_owner = %request.owner,
+            order_maker = %request.order.maker,
+            order_signer = %request.order.signer,
+            order_salt = request.order.salt,
+            signature = %request.order.signature,
+            signature_type = request.order.signature_type,
+            token_id = %request.order.token_id,
+            maker_amount = %request.order.maker_amount,
+            taker_amount = %request.order.taker_amount,
+            side = ?request.order.side,
+            "🔑 Placing order with credentials"
+        );
+
+        // Log full request body for debugging
+        warn!(request_body = %body, "📝 Full order request");
 
         let response = self.post_authenticated("/order", &body).await?;
         let status = response.status();
@@ -322,10 +341,26 @@ impl ApiClient {
 
         debug!(status = %status, body = %response_body, "Order response");
 
-        let order_response: OrderResponse =
-            serde_json::from_str(&response_body).map_err(|e| BotError::Json(e.to_string()))?;
+        // Handle HTTP-level errors first
+        if !status.is_success() {
+            warn!(
+                status = %status,
+                body = %response_body,
+                "Order placement HTTP error"
+            );
+            return Err(BotError::Api {
+                code: status.to_string(),
+                message: response_body,
+            });
+        }
 
-        // Check for API errors
+        let order_response: OrderResponse = serde_json::from_str(&response_body)
+            .map_err(|e| {
+                warn!(body = %response_body, error = %e, "Failed to parse order response");
+                BotError::Json(format!("Failed to parse order response: {} - body: {}", e, response_body))
+            })?;
+
+        // Check for API-level errors
         if !order_response.success && !order_response.error_msg.is_empty() {
             warn!(
                 error = %order_response.error_msg,

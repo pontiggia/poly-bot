@@ -63,6 +63,9 @@ pub struct OrderParams {
 
     /// Source intent's group ID (for linked orders)
     pub group_id: Option<String>,
+
+    /// Fee rate in basis points (1000 = 10% for 15-min crypto markets)
+    pub fee_rate_bps: u32,
 }
 
 // ============================================================================
@@ -99,6 +102,7 @@ pub struct IntentRef {
     pub urgency: Urgency,
     pub strategy_name: String,
     pub group_id: Option<String>,
+    pub fee_rate_bps: u32,
 }
 
 impl IntentRef {
@@ -112,6 +116,7 @@ impl IntentRef {
             urgency: intent.urgency,
             strategy_name: intent.strategy_name.clone(),
             group_id: intent.group_id.clone(),
+            fee_rate_bps: intent.fee_rate_bps,
         }
     }
 }
@@ -191,6 +196,7 @@ impl ExecutionPolicy for TakerPolicy {
             on_partial_fill: self.on_partial_fill(intent, Decimal::ZERO),
             strategy_name: intent.strategy_name.clone(),
             group_id: intent.group_id.clone(),
+            fee_rate_bps: intent.fee_rate_bps,
         }
     }
 
@@ -313,6 +319,7 @@ impl ExecutionPolicy for MakerPolicy {
             on_partial_fill: PartialFillAction::KeepRemainder,
             strategy_name: intent.strategy_name.clone(),
             group_id: intent.group_id.clone(),
+            fee_rate_bps: intent.fee_rate_bps,
         }
     }
 
@@ -415,6 +422,7 @@ mod tests {
             urgency,
             strategy_name: "TestStrategy".to_string(),
             group_id,
+            fee_rate_bps: 0,
         }
     }
 
@@ -534,6 +542,7 @@ mod tests {
             urgency: Urgency::Passive,
             strategy_name: "Test".to_string(),
             group_id: None,
+            fee_rate_bps: 0,
         };
 
         let params = policy.to_order_params(&intent);

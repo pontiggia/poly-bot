@@ -8,7 +8,7 @@
 //! - poly_signature: Base64 HMAC-SHA256 signature
 //! - poly_timestamp: Unix timestamp in seconds
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE as BASE64_URL_SAFE}, Engine};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -62,8 +62,10 @@ impl ApiCredentials {
         body: &str,
     ) -> Result<String> {
         // Decode the base64-encoded secret
-        let key = BASE64
+        // Try URL-safe first (contains - and _), then standard (contains + and /)
+        let key = BASE64_URL_SAFE
             .decode(&self.secret)
+            .or_else(|_| BASE64_STANDARD.decode(&self.secret))
             .map_err(|e| BotError::Signing(format!("Failed to decode secret: {}", e)))?;
 
         // Create HMAC instance
@@ -72,11 +74,23 @@ impl ApiCredentials {
 
         // Construct the message: timestamp + method + path + body
         let message = format!("{}{}{}{}", timestamp, method, path, body);
+
+        // Debug log the message being signed (truncate body for readability)
+        let body_preview = if body.len() > 100 { &body[..100] } else { body };
+        tracing::debug!(
+            timestamp = %timestamp,
+            method = %method,
+            path = %path,
+            body_preview = %body_preview,
+            message_len = message.len(),
+            "Signing message"
+        );
+
         mac.update(message.as_bytes());
 
-        // Finalize and encode as base64
+        // Finalize and encode as URL-safe base64 (matching Python/TS clients)
         let result = mac.finalize();
-        let signature = BASE64.encode(result.into_bytes());
+        let signature = BASE64_URL_SAFE.encode(result.into_bytes());
 
         Ok(signature)
     }
@@ -140,8 +154,8 @@ mod tests {
         assert!(result.is_ok());
         let signature = result.unwrap();
         assert!(!signature.is_empty());
-        // Signature should be base64 encoded
-        assert!(BASE64.decode(&signature).is_ok());
+        // Signature should be URL-safe base64 encoded
+        assert!(BASE64_URL_SAFE.decode(&signature).is_ok());
     }
 
     #[test]
@@ -173,5 +187,22 @@ mod tests {
         let parsed: u64 = timestamp.parse().expect("Timestamp should be a number");
         // Should be a reasonable Unix timestamp (after 2024)
         assert!(parsed > 1700000000);
+    }
+
+    #[test]
+    fn test_url_safe_base64_secret() {
+        // Test with URL-safe base64 secret (contains _ and -)
+        // This is the format Polymarket uses
+        let credentials = ApiCredentials::new(
+            "test-api-key".to_string(),
+            "ZXUszLhquwviNhvQMbleGSzAIjRPNG_L8wRcbCtyk28=".to_string(), // URL-safe base64
+            "test-passphrase".to_string(),
+            "0x1234567890123456789012345678901234567890".to_string(),
+        );
+
+        let result = credentials.generate_signature("1234567890", "POST", "/order", r#"{"test":"body"}"#);
+        assert!(result.is_ok(), "Should handle URL-safe base64 secrets");
+        let signature = result.unwrap();
+        assert!(!signature.is_empty());
     }
 }

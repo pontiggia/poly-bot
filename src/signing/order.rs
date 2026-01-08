@@ -32,12 +32,12 @@ use crate::error::{BotError, Result};
 /// EIP-712 domain separator type hash
 /// keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
 /// Standard EIP-712 domain type hash used by OpenZeppelin's EIP712 implementation
-const DOMAIN_TYPE_HASH: &str = "ddd4c7674758e5d4c23d41c55c47f7e721630ab5231f61f3fc4146a99a4880fe";
+const DOMAIN_TYPE_HASH: &str = "8b73c3c69bb8fe3d512ecc4cf759cc79239f7b179b0ffacaa9a75d522b39400f";
 
 /// Order type hash for Polymarket CTF Exchange
 /// keccak256("Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)")
 /// Source: https://github.com/Polymarket/ctf-exchange/blob/main/src/exchange/libraries/OrderStructs.sol
-const ORDER_TYPE_HASH: &str = "9f8492db71d3e815d8f340a0992d23281df61030061a6d1262548b51aaf94dd3";
+const ORDER_TYPE_HASH: &str = "a852566c4e14d00869b6db0220888a9090a13eccdaea03713ff0a3d27bf9767c";
 
 /// Order data for signing
 #[derive(Debug, Clone)]
@@ -129,6 +129,19 @@ impl Order {
         let side = U256::from(side_to_u8(self.side));
         let signature_type = U256::from(self.signature_type);
 
+        // Debug log all parsed values
+        tracing::debug!(
+            salt = %salt,
+            maker = %self.maker,
+            signer = %self.signer,
+            token_id = %token_id,
+            maker_amount = %maker_amount,
+            taker_amount = %taker_amount,
+            side = %side,
+            signature_type = %signature_type,
+            "Struct hash input values"
+        );
+
         // Encode the struct: typeHash || fields
         let mut encoded = Vec::with_capacity(32 * 13);
         encoded.extend_from_slice(order_type_hash.as_slice());
@@ -148,7 +161,14 @@ impl Order {
         encoded.extend_from_slice(&side.to_be_bytes::<32>());
         encoded.extend_from_slice(&signature_type.to_be_bytes::<32>());
 
-        Ok(keccak256(&encoded))
+        let result = keccak256(&encoded);
+        tracing::debug!(
+            encoded_len = encoded.len(),
+            struct_hash = %hex::encode(result.as_slice()),
+            "Computed struct hash"
+        );
+
+        Ok(result)
     }
 }
 
@@ -250,9 +270,10 @@ impl OrderSigner {
         })
     }
 
-    /// Get the signer's address
+    /// Get the signer's address (EIP-55 checksummed format)
     pub fn address(&self) -> String {
-        format!("{:?}", self.signer.address())
+        // Use checksummed format - Polymarket API expects EIP-55 checksummed addresses
+        self.signer.address().to_checksum(None)
     }
 
     /// Sign an order for the standard CTF Exchange
@@ -283,6 +304,15 @@ impl OrderSigner {
         digest_input.extend_from_slice(struct_hash.as_slice());
         let digest = keccak256(&digest_input);
 
+        // Debug: Log signing details
+        tracing::debug!(
+            domain_separator = %hex::encode(domain_separator.as_slice()),
+            struct_hash = %hex::encode(struct_hash.as_slice()),
+            digest = %hex::encode(digest.as_slice()),
+            signer_address = %self.address(),
+            "EIP-712 signing details"
+        );
+
         // Sign the digest
         let signature = self
             .signer
@@ -290,9 +320,15 @@ impl OrderSigner {
             .await
             .map_err(|e| BotError::Signing(format!("Failed to sign order: {}", e)))?;
 
-        // Format signature as 0x + hex
+        // Format signature as 0x + r + s + v (65 bytes total)
         let sig_bytes = signature.as_bytes();
         let signature_hex = format!("0x{}", hex::encode(sig_bytes));
+
+        tracing::debug!(
+            signature_len = sig_bytes.len(),
+            signature_hex = %signature_hex,
+            "Generated signature"
+        );
 
         // Create signed order
         let mut signed_order = order.to_unsigned_order();
@@ -329,12 +365,27 @@ fn calculate_domain_separator(verifying_contract: &str) -> Result<B256> {
     encoded.extend_from_slice(&[0u8; 12]); // padding for address
     encoded.extend_from_slice(contract.as_slice());
 
-    Ok(keccak256(&encoded))
+    let result = keccak256(&encoded);
+    tracing::info!(
+        contract = %verifying_contract,
+        domain_separator = %hex::encode(result.as_slice()),
+        name_hash = %hex::encode(name_hash.as_slice()),
+        version_hash = %hex::encode(version_hash.as_slice()),
+        "Computed domain separator"
+    );
+
+    Ok(result)
 }
 
 /// Parse an Ethereum address from string
 fn parse_address(s: &str) -> Result<Address> {
     Address::from_str(s).map_err(|e| BotError::Signing(format!("Invalid address '{}': {}", s, e)))
+}
+
+/// Convert an address string to EIP-55 checksummed format
+pub fn to_checksum_address(addr: &str) -> Result<String> {
+    let address = parse_address(addr)?;
+    Ok(address.to_checksum(None))
 }
 
 /// Parse a U256 from string
@@ -363,27 +414,35 @@ fn rand_salt() -> u64 {
 
 /// Calculate maker and taker amounts based on side, price, and size
 ///
-/// Amounts are in base units (6 decimals for USDC)
+/// Amounts are in base units (6 decimals for USDC/tokens)
 /// - BUY: makerAmount = USDC to spend, takerAmount = tokens to receive
 /// - SELL: makerAmount = tokens to sell, takerAmount = USDC to receive
+///
+/// Polymarket API requires both amounts to have max 2 decimal places
+/// (must be divisible by 10000 in base units)
 fn calculate_amounts(side: Side, price: Decimal, size: Decimal) -> (String, String) {
     let scale = Decimal::from(1_000_000u64); // 6 decimals
+    let round_to = Decimal::from(10_000u64); // 2 decimal places
 
     match side {
         Side::Buy => {
-            // BUY: spend USDC, receive tokens
-            // makerAmount = size * price (USDC)
-            // takerAmount = size (tokens)
-            let maker_amount = (size * price * scale).trunc();
-            let taker_amount = (size * scale).trunc();
+            // BUY: spend USDC, receive tokens - both 2 decimal places
+            let maker_raw = (size * price * scale).trunc();
+            let taker_raw = (size * scale).trunc();
+
+            let maker_amount = (maker_raw / round_to).trunc() * round_to;
+            let taker_amount = (taker_raw / round_to).trunc() * round_to;
+
             (maker_amount.to_string(), taker_amount.to_string())
         }
         Side::Sell => {
-            // SELL: sell tokens, receive USDC
-            // makerAmount = size (tokens)
-            // takerAmount = size * price (USDC)
-            let maker_amount = (size * scale).trunc();
-            let taker_amount = (size * price * scale).trunc();
+            // SELL: sell tokens, receive USDC - both 2 decimal places
+            let maker_raw = (size * scale).trunc();
+            let taker_raw = (size * price * scale).trunc();
+
+            let maker_amount = (maker_raw / round_to).trunc() * round_to;
+            let taker_amount = (taker_raw / round_to).trunc() * round_to;
+
             (maker_amount.to_string(), taker_amount.to_string())
         }
     }

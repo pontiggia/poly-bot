@@ -63,6 +63,9 @@ pub enum ErrorType {
     Fatal,
     /// Expected errors (e.g., FOK not filled) - don't count toward circuit breaker
     Expected,
+    /// Critical errors that should immediately trip the circuit breaker
+    /// Used for catastrophic failures like orphaned positions
+    Critical,
 }
 
 impl ErrorType {
@@ -93,7 +96,12 @@ impl ErrorType {
 
     /// Should this error count toward circuit breaker threshold?
     pub fn counts_toward_circuit_breaker(&self) -> bool {
-        matches!(self, ErrorType::Fatal)
+        matches!(self, ErrorType::Fatal | ErrorType::Critical)
+    }
+
+    /// Is this a critical error that should immediately trip the circuit breaker?
+    pub fn is_critical(&self) -> bool {
+        matches!(self, ErrorType::Critical)
     }
 
     /// Can this error be retried?

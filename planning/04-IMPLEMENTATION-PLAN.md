@@ -4,7 +4,9 @@
 
 ---
 
-## 🚀 Current Status: Phase 8 Complete (Updated: 2026-01-07)
+## 🚀 Current Status: Phase 9 Complete - PROFITABLE (Updated: 2026-01-08)
+
+> **See [STATE-OF-THE-BOT.md](../STATE-OF-THE-BOT.md) for the authoritative current behavior documentation.**
 
 ### ✅ Completed Phases
 
@@ -19,24 +21,24 @@
 - **Phase 7:** Math Arb Strategy (MVP) - Market pairs, edge calculator, MathArbStrategy (115 tests ✅)
 - **Phase 7.5:** API Fix & Market Discovery - Gamma API, slug-based discovery (136 tests ✅)
 - **Phase 8:** Wire Execution Policies - Full execution pipeline connected (136 tests ✅)
+- **Phase 9:** Integration & Live Testing - **PROFITABLE** +$1.10 (3.24%) (154 tests ✅)
 
-### 🚧 In Progress
+### ✅ Post-Phase 9 Fixes (2026-01-08)
 
-- **Phase 9:** Integration & Live Testing - Test with real orders
+- **Minimum Order Value:** Dynamic share sizing to meet $1.00 API minimum
+- **Parallel Execution:** Maker arb legs submitted via `tokio::join!`
+- **Critical Error Handling:** Circuit breaker trips on orphaned positions
+- **Fill Detection Fix:** Correct size matching with `to_fill_for_order()`
 
 ### 📊 Metrics
 
-- **Tests Passing:** 136/136 unit tests
-- **Build Time:** ~2s
-- **WebSocket:** Market data + User fills streaming
-- **Order Book:** Tracking markets with lock-free DashMap
-- **Ledger:** Orders, Positions, Cash tracking with DashMap
-- **Risk:** Circuit breaker integrated in execution path
-- **Strategy:** MathArbStrategy with dynamic edge detection
-- **Discovery:** Auto-discovers 15-min crypto markets (BTC, ETH, SOL)
-- **Execution:** Full pipeline: Strategy → Policy → Executor → API
+- **Tests Passing:** 154/154 unit tests
+- **Build Time:** ~2s (dev), ~26s (release)
+- **Live Session:** +$1.10 profit on $33.85 invested (3.24% return)
+- **WebSocket:** Market data + User fills streaming with auto-reconnect
+- **Order Book:** Tracking 24 tokens across 12 markets
+- **Execution:** Maker orders with zero fees, parallel submission
 - **Architecture:** Event-driven with tokio::select!, <1ms latency
-- **Code Quality:** Clean module separation
 
 ---
 

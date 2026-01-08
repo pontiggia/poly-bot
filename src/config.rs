@@ -7,12 +7,17 @@ use std::str::FromStr;
 /// Bot configuration loaded from environment
 #[derive(Debug, Clone)]
 pub struct Config {
-    // API credentials
+    // Builder API credentials (for order placement)
     pub api_key: String,
     pub secret_key: String,
     pub passphrase: String,
     pub private_key: String,
     pub wallet_address: String,
+
+    // User API credentials (for User WebSocket fills) - optional
+    pub user_api_key: Option<String>,
+    pub user_secret_key: Option<String>,
+    pub user_passphrase: Option<String>,
 
     // Operating mode
     pub mode: OperatingMode,
@@ -34,6 +39,10 @@ pub struct Config {
     pub maker_price_offset: Decimal,
     /// TTL for maker orders before cancellation (seconds)
     pub maker_order_ttl_secs: u64,
+
+    // Phase 9 live test configuration
+    /// Use aggressive live test mode (very low edge, small positions)
+    pub use_live_test_mode: bool,
 }
 
 /// Operating mode for the bot
@@ -71,6 +80,18 @@ impl Config {
             .or_else(|_| std::env::var("builder_address"))
             .map_err(|_| BotError::Config("Missing WALLET_ADDRESS or builder_address".into()))?;
 
+        // User API credentials (optional - for User WebSocket to get fills)
+        // These are your personal API keys, not builder keys
+        let user_api_key = std::env::var("USER_API_KEY")
+            .ok()
+            .map(|v| v.trim_matches('"').trim().to_string());
+        let user_secret_key = std::env::var("USER_SECRET_KEY")
+            .ok()
+            .map(|v| v.trim_matches('"').trim().to_string());
+        let user_passphrase = std::env::var("USER_PASSPHRASE")
+            .ok()
+            .map(|v| v.trim_matches('"').trim().to_string());
+
         // Operating mode (default to paper)
         let mode = match std::env::var("BOT_MODE").as_deref() {
             Ok("live") => OperatingMode::Live,
@@ -102,12 +123,20 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(120); // 2 minutes default
 
+        // Phase 9 live test mode - very aggressive settings for testing with small capital
+        let use_live_test_mode = std::env::var("USE_LIVE_TEST_MODE")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
         Ok(Config {
-            api_key,
-            secret_key: secret_key.trim_matches('"').to_string(),
-            passphrase: passphrase.trim_matches('"').to_string(),
-            private_key: private_key.trim_matches('"').to_string(),
-            wallet_address,
+            api_key: api_key.trim_matches('"').trim().to_string(),
+            secret_key: secret_key.trim_matches('"').trim().to_string(),
+            passphrase: passphrase.trim_matches('"').trim().to_string(),
+            private_key: private_key.trim_matches('"').trim().to_string(),
+            wallet_address: wallet_address.trim_matches('"').trim().to_string(),
+            user_api_key,
+            user_secret_key,
+            user_passphrase,
             mode,
             log_level,
             max_bet_usd,
@@ -118,12 +147,34 @@ impl Config {
             use_maker_mode,
             maker_price_offset,
             maker_order_ttl_secs,
+            use_live_test_mode,
         })
     }
 
     /// Check if running in paper trading mode
     pub fn is_paper_mode(&self) -> bool {
         self.mode == OperatingMode::Paper
+    }
+
+    /// Check if user credentials are configured for User WebSocket
+    pub fn has_user_credentials(&self) -> bool {
+        self.user_api_key.is_some()
+            && self.user_secret_key.is_some()
+            && self.user_passphrase.is_some()
+    }
+
+    /// Get user API credentials for User WebSocket (if configured)
+    pub fn user_credentials(&self) -> Option<crate::api::ApiCredentials> {
+        if self.has_user_credentials() {
+            Some(crate::api::ApiCredentials::new(
+                self.user_api_key.clone().unwrap(),
+                self.user_secret_key.clone().unwrap(),
+                self.user_passphrase.clone().unwrap(),
+                self.wallet_address.clone(),
+            ))
+        } else {
+            None
+        }
     }
 }
 

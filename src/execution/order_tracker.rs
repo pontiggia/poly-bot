@@ -130,6 +130,11 @@ impl OrderTracker {
         self.total_completed.load(Ordering::Relaxed)
     }
 
+    /// Check if we're tracking this order ID
+    pub fn contains(&self, order_id: &str) -> bool {
+        self.orders.contains_key(order_id)
+    }
+
     /// Track a new order
     pub fn track(&self, order: TrackedOrder) {
         let order_id = order.order_id.clone();

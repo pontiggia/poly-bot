@@ -48,6 +48,16 @@ impl std::fmt::Display for Side {
     }
 }
 
+impl Side {
+    /// Get the enum index as string for order signing (0 = BUY, 1 = SELL)
+    pub fn as_index_string(&self) -> &'static str {
+        match self {
+            Side::Buy => "0",
+            Side::Sell => "1",
+        }
+    }
+}
+
 /// Order type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderType {
@@ -132,6 +142,7 @@ pub struct PriceChangeMessage {
 // ============================================================================
 
 /// Signed order for submission
+/// Note: `side` is serialized as enum index ("0" for BUY, "1" for SELL) per Polymarket API spec
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignedOrder {
@@ -165,7 +176,7 @@ pub struct OrderRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderResponse {
-    #[serde(default, alias = "errorMsg")]
+    #[serde(default, alias = "errorMsg", alias = "error")]
     pub error_msg: String,
     #[serde(default, alias = "orderID")]
     pub order_id: OrderId,
@@ -177,6 +188,7 @@ pub struct OrderResponse {
     pub status: String,
     #[serde(default, alias = "transactionsHashes")]
     pub transactions_hashes: Vec<TxHash>,
+    #[serde(default)]
     pub success: bool,
 }
 

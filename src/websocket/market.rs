@@ -266,7 +266,7 @@ impl MarketWebSocket {
                 asks,
             };
 
-            info!(
+            debug!(
                 "Book snapshot: {} levels bid, {} levels ask",
                 book_update.bids.len(),
                 book_update.asks.len()

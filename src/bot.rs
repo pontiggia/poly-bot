@@ -17,7 +17,7 @@
 
 use crate::api::ApiClient;
 use crate::config::{Config, OperatingMode};
-use crate::execution::{DualPolicy, ExecutionResult, ExecutionStatus, OrderExecutor, OrderTracker};
+use crate::execution::{DualPolicy, ExecutionResult, ExecutionStatus, OrderExecutor, OrderTracker, TrackedOrder};
 use crate::kill_switch::KillSwitch;
 use crate::ledger::Ledger;
 use crate::risk::CircuitBreaker;
@@ -27,7 +27,7 @@ use crate::strategy::{
     MarketPair, MarketPairRegistry, MathArbStrategy, OrderIntent, StrategyContext, StrategyRouter,
 };
 use crate::websocket::{MarketMessage, MarketWebSocket, UserMessage, UserWebSocket};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -75,6 +75,8 @@ pub struct Bot {
     total_executions: u64,
     /// Total fills received
     total_fills: u64,
+    /// Seen trade IDs (for deduplication)
+    seen_trade_ids: HashSet<String>,
 }
 
 impl Bot {
@@ -105,7 +107,10 @@ impl Bot {
         let strategy_router = Arc::new(StrategyRouter::new());
 
         // Register MathArbStrategy with appropriate config
-        let arb_config = if config.use_maker_mode {
+        let arb_config = if config.use_live_test_mode {
+            info!("🧪 Using LIVE TEST mode for arb strategy (0.3% min edge, $2-3 positions, maker mode)");
+            crate::strategy::MathArbConfig::live_test()
+        } else if config.use_maker_mode {
             info!("Using MAKER mode for arb strategy (1% min edge, GTC orders, 0% fees)");
             crate::strategy::MathArbConfig::maker()
         } else {
@@ -120,22 +125,47 @@ impl Bot {
         // Set up circuit breaker for risk management
         let circuit_breaker = Arc::new(CircuitBreaker::new());
 
-        // Set up order executor
-        let credentials = crate::api::ApiCredentials::new(
-            config.api_key.clone(),
-            config.secret_key.clone(),
-            config.passphrase.clone(),
-            config.wallet_address.clone(),
-        );
-        
-        let api_client = Arc::new(
-            ApiClient::new(credentials)
-                .expect("Failed to create API client")
-        );
-        
+        // Create order signer first to get the EOA address
         let order_signer = Arc::new(
             OrderSigner::new(&config.private_key)
                 .expect("Failed to create order signer")
+        );
+
+        // The signer address (EOA) is what User API credentials are tied to
+        let signer_address = order_signer.address();
+        info!("EOA Signer address: {}", signer_address);
+        info!("Proxy wallet (funder): {}", config.wallet_address);
+
+        // Set up order executor with User API credentials (for L2 auth)
+        // IMPORTANT: POLY_ADDRESS header must be the EOA signer address, not the proxy wallet!
+        let (api_key, secret_key, passphrase) = if config.has_user_credentials() {
+            info!("Using USER credentials for order execution (L2 auth)");
+            (
+                config.user_api_key.clone().unwrap(),
+                config.user_secret_key.clone().unwrap(),
+                config.user_passphrase.clone().unwrap(),
+            )
+        } else {
+            warn!("⚠️ No USER credentials configured - using builder credentials (may fail!)");
+            warn!("  Run: cargo run --bin derive_creds  to get User API credentials");
+            (
+                config.api_key.clone(),
+                config.secret_key.clone(),
+                config.passphrase.clone(),
+            )
+        };
+
+        // Use signer_address (EOA) for POLY_ADDRESS header, NOT the proxy wallet
+        let credentials = crate::api::ApiCredentials::new(
+            api_key,
+            secret_key,
+            passphrase,
+            signer_address.clone(), // EOA address that derived the User API credentials
+        );
+
+        let api_client = Arc::new(
+            ApiClient::new(credentials)
+                .expect("Failed to create API client")
         );
         
         // Use DualPolicy: Taker for Immediate/Normal, Maker for Passive
@@ -151,13 +181,14 @@ impl Bot {
         );
         
         // Note: 15-min crypto markets use neg-risk exchange
+        // maker_address = proxy wallet (funder, where funds are)
         let executor = Arc::new(OrderExecutor::new(
             api_client,
-            order_signer,
+            order_signer.clone(),
             policy,
             circuit_breaker.clone(),
-            config.wallet_address.clone(),
-            true, // is_neg_risk for 15-min crypto markets
+            config.wallet_address.clone(), // maker = proxy wallet
+            false, // TODO: Detect from market data - using standard exchange for now
         ));
 
         // Set up order tracker for outstanding orders
@@ -174,11 +205,29 @@ impl Bot {
         });
 
         // Set up User WebSocket for fill notifications
+        // Use user credentials if available, otherwise fall back to builder credentials
         let (user_ws_tx, user_ws_rx) = mpsc::unbounded_channel();
+        let (user_api_key, user_secret, user_pass) = if config.has_user_credentials() {
+            info!("Using USER credentials for User WebSocket (fills)");
+            (
+                config.user_api_key.clone().unwrap(),
+                config.user_secret_key.clone().unwrap(),
+                config.user_passphrase.clone().unwrap(),
+            )
+        } else {
+            warn!("No USER credentials configured - using builder credentials for User WebSocket");
+            warn!("  Hint: Set USER_API_KEY, USER_SECRET_KEY, USER_PASSPHRASE for fill notifications");
+            (
+                config.api_key.clone(),
+                config.secret_key.clone(),
+                config.passphrase.clone(),
+            )
+        };
+
         let user_ws = Arc::new(UserWebSocket::new(
-            config.api_key.clone(),
-            config.secret_key.clone(),
-            config.passphrase.clone(),
+            user_api_key,
+            user_secret,
+            user_pass,
             user_ws_tx,
         ));
 
@@ -215,6 +264,7 @@ impl Bot {
             total_intents: 0,
             total_executions: 0,
             total_fills: 0,
+            seen_trade_ids: HashSet::new(),
         }
     }
 
@@ -312,18 +362,66 @@ impl Bot {
 
     /// Handle a trade/fill notification
     async fn handle_trade_notification(&mut self, trade: crate::websocket::TradeNotification) {
+        // Deduplicate: skip if we've already seen this trade ID
+        if !trade.id.is_empty() && self.seen_trade_ids.contains(&trade.id) {
+            debug!("Skipping duplicate trade notification: {}", &trade.id[..trade.id.len().min(12)]);
+            return;
+        }
+
+        // ✅ FIX: Get our order IDs based on whether we're maker or taker
+        // When we're MAKER, our order ID is in maker_orders[], not taker_order_id
+        let our_order_ids = trade.our_order_ids();
+        if our_order_ids.is_empty() {
+            debug!("Trade notification has no order_id, skipping (likely market data)");
+            return;
+        }
+        
+        // Check if ANY of these order IDs are ones we're tracking
+        let matched_order_id = our_order_ids
+            .iter()
+            .find(|id| self.order_tracker.contains(id));
+        
+        let order_id = match matched_order_id {
+            Some(id) => id.to_string(),
+            None => {
+                // Not our order - could be a market trade we're just seeing
+                debug!(
+                    "Trade for unknown order(s) {:?}, not ours - skipping (size: {}, price: {})",
+                    our_order_ids.iter().map(|id| &id[..id.len().min(16)]).collect::<Vec<_>>(),
+                    trade.size,
+                    trade.price
+                );
+                return;
+            }
+        };
+
+        // Mark as seen
+        if !trade.id.is_empty() {
+            self.seen_trade_ids.insert(trade.id.clone());
+        }
+
         self.total_fills += 1;
 
-        // Convert to Fill and record in ledger
-        match trade.to_fill() {
+        // Convert to Fill using the matched order ID (correctly uses matched_amount for makers)
+        match trade.to_fill_for_order(&order_id) {
             Ok(fill) => {
+                // ✅ FIX: Log whether this was maker or taker
+                let is_maker = trade.trader_side.to_uppercase() == "MAKER";
+                let execution_type = if is_maker {
+                    "MAKER ✅"
+                } else {
+                    "TAKER ⚠️"
+                };
+                
                 info!(
-                    "💰 Fill: {} {} {} @ ${} (fee: ${})",
+                    "💰 Fill [{}]: {} {} {} @ ${} (fee: ${:.6}, order: {})",
+                    execution_type,
                     format!("{:?}", fill.side),
                     fill.size,
                     &fill.token_id[..fill.token_id.len().min(12)],
                     fill.price,
-                    fill.fee
+                    fill.fee,
+                    &order_id[..order_id.len().min(16)]
                 );
 
                 // Record fill in ledger
@@ -517,10 +615,11 @@ impl Bot {
                 // Spawn execution as background task to not block event loop
                 let executor = self.executor.clone();
                 let circuit_breaker = self.circuit_breaker.clone();
+                let order_tracker = self.order_tracker.clone();
                 let intents_owned = intents.clone();
                 
                 tokio::spawn(async move {
-                    Self::execute_intents(executor, circuit_breaker, intents_owned).await;
+                    Self::execute_intents(executor, circuit_breaker, order_tracker, intents_owned).await;
                 });
                 
                 self.total_executions += intents.len() as u64;
@@ -532,15 +631,25 @@ impl Bot {
     async fn execute_intents(
         executor: Arc<OrderExecutor>,
         circuit_breaker: Arc<CircuitBreaker>,
+        order_tracker: Arc<OrderTracker>,
         intents: Vec<OrderIntent>,
     ) {
         info!("🚀 LIVE: Executing {} order(s)...", intents.len());
         
-        // Check if intents are grouped (arb legs)
+        // Check if intents are grouped (arb legs) and passive (maker orders)
         let has_group = intents.first().and_then(|i| i.group_id.as_ref()).is_some();
+        let is_passive = intents.first()
+            .map(|i| i.urgency == crate::strategy::Urgency::Passive)
+            .unwrap_or(false);
         
-        let results = if has_group {
-            // Execute as grouped orders (handles partial fills)
+        let results = if has_group && is_passive {
+            // PARALLEL execution for maker arb legs
+            // Both orders go to the book simultaneously, minimizing time window
+            // The min order value check in strategy prevents API rejections
+            executor.execute_batch(&intents).await
+        } else if has_group {
+            // SEQUENTIAL execution for taker arb legs (FOK orders)
+            // Sequential allows cancellation if second leg fails
             executor.execute_grouped(&intents).await
         } else {
             // Execute as batch (concurrent but independent)
@@ -549,7 +658,7 @@ impl Bot {
         
         // Process results
         for (intent, result) in intents.iter().zip(results.iter()) {
-            Self::handle_execution_result(intent, result, &circuit_breaker);
+            Self::handle_execution_result(intent, result, &circuit_breaker, &order_tracker);
         }
     }
 
@@ -558,7 +667,31 @@ impl Bot {
         intent: &OrderIntent,
         result: &ExecutionResult,
         circuit_breaker: &CircuitBreaker,
+        order_tracker: &OrderTracker,
     ) {
+        // ✅ FIX: Track pending/partial orders so we can match fills later
+        if let Some(ref order_id) = result.order_id {
+            if result.status == ExecutionStatus::Pending || result.status == ExecutionStatus::PartialFill {
+                let tracked = TrackedOrder {
+                    order_id: order_id.clone(),
+                    token_id: intent.token_id.clone(),
+                    market_id: intent.market_id.clone(),
+                    side: intent.side,
+                    price: intent.price,
+                    original_size: intent.size,
+                    filled_size: result.filled_size,
+                    created_at: std::time::Instant::now(),
+                    strategy_name: intent.strategy_name.clone(),
+                    group_id: intent.group_id.clone(),
+                };
+                order_tracker.track(tracked);
+                debug!(
+                    "Tracking order {} for fill matching",
+                    &order_id[..order_id.len().min(16)]
+                );
+            }
+        }
+
         match result.status {
             ExecutionStatus::FullyFilled => {
                 info!(

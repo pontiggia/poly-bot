@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 use crate::api::types::{OrderRequest, OrderResponse, OrderType};
 use crate::api::ApiClient;
 use crate::error::ErrorType;
-use crate::execution::policy::{ExecutionPolicy, IntentRef, OrderParams, PartialFillAction};
+use crate::execution::policy::{ExecutionPolicy, IntentRef, OrderParams};
 use crate::risk::circuit_breaker::CircuitBreaker;
 use crate::signing::{Order, OrderBuilder, OrderSigner};
 use crate::strategy::OrderIntent;
@@ -93,7 +93,7 @@ pub struct OrderExecutor {
     /// Circuit breaker to check before submission
     circuit_breaker: Arc<CircuitBreaker>,
 
-    /// Maker address (proxy wallet)
+    /// Maker address (proxy/funder wallet where funds are held)
     maker_address: String,
 
     /// Whether this is a neg-risk market (affects signing)
@@ -102,6 +102,9 @@ pub struct OrderExecutor {
 
 impl OrderExecutor {
     /// Create a new order executor
+    ///
+    /// # Arguments
+    /// * `maker_address` - Proxy wallet address (funder, where funds are held)
     pub fn new(
         client: Arc<ApiClient>,
         signer: Arc<OrderSigner>,
@@ -110,12 +113,16 @@ impl OrderExecutor {
         maker_address: String,
         is_neg_risk: bool,
     ) -> Self {
+        // Ensure maker address is checksummed (EIP-55 format)
+        let checksummed_maker = crate::signing::to_checksum_address(&maker_address)
+            .unwrap_or_else(|_| maker_address.clone());
+
         Self {
             client,
             signer,
             policy,
             circuit_breaker,
-            maker_address,
+            maker_address: checksummed_maker,
             is_neg_risk,
         }
     }
@@ -173,10 +180,13 @@ impl OrderExecutor {
         };
 
         // Create order request
+        // IMPORTANT: owner = API key string (NOT an address!)
+        // This is how Polymarket's API validates the request
+        let api_key = self.client.credentials().api_key.clone();
         let request = OrderRequest {
             defer_exec: false,
             order: signed_order,
-            owner: self.maker_address.clone(),
+            owner: api_key, // API key, not address!
             order_type: params.order_type,
         };
 
@@ -234,66 +244,81 @@ impl OrderExecutor {
         }
     }
 
-    /// Execute a grouped set of intents and handle partial fills
+    /// Execute a grouped set of intents with sequential submission and rollback
     ///
-    /// For grouped orders (like arb legs), we need to ensure both legs
-    /// fill equally. If they don't, the policy determines how to handle it.
+    /// For grouped orders (like arb legs), we execute sequentially to ensure
+    /// we can cancel the first leg if the second fails, preventing one-legged exposure.
     pub async fn execute_grouped(&self, intents: &[OrderIntent]) -> Vec<ExecutionResult> {
-        // First, submit all orders concurrently
-        let results = self.execute_batch(intents).await;
-
-        // Check if any need partial fill handling
-        let group_id = intents.first().and_then(|i| i.group_id.clone());
-        if group_id.is_none() {
-            return results;
+        // For non-grouped or single orders, use batch execution
+        if intents.len() != 2 {
+            return self.execute_batch(intents).await;
         }
 
-        // Collect indices of filled orders
-        let filled_indices: Vec<usize> = results
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.filled && r.filled_size > Decimal::ZERO)
-            .map(|(i, _)| i)
-            .collect();
+        // Execute first leg
+        let result1 = self.execute(&intents[0]).await;
 
-        let unfilled_count = results.len() - filled_indices.len();
-
-        // If all filled or all unfilled, nothing to do
-        if filled_indices.is_empty() || unfilled_count == 0 {
-            return results;
+        // If first leg failed completely (submission error), don't execute second
+        if result1.status == ExecutionStatus::SubmissionFailed
+            || result1.status == ExecutionStatus::CircuitOpen {
+            warn!(
+                token = %intents[0].token_id,
+                error = ?result1.error,
+                "First leg failed, skipping second leg to prevent exposure"
+            );
+            let result2 = ExecutionResult {
+                intent_token_id: intents[1].token_id.clone(),
+                order_id: None,
+                filled: false,
+                filled_size: Decimal::ZERO,
+                requested_size: intents[1].size,
+                status: ExecutionStatus::Cancelled,
+                error: Some("Skipped: first leg failed".to_string()),
+            };
+            return vec![result1, result2];
         }
 
-        // Handle imbalanced fills based on policy
-        for idx in filled_indices {
-            let result = &results[idx];
-            if result.filled_size < result.requested_size {
-                // Partial fill - check policy
-                let intent_ref = IntentRef::from_intent(&intents[idx]);
-                let action = self.policy.on_partial_fill(&intent_ref, result.filled_size);
+        // Execute second leg
+        let result2 = self.execute(&intents[1]).await;
 
-                match action {
-                    PartialFillAction::UnwindFilled => {
-                        info!(
-                            token = %result.intent_token_id,
-                            filled = %result.filled_size,
-                            "Unwinding partial fill for grouped order"
+        // If second leg failed but first succeeded with pending order, cancel first
+        if (result2.status == ExecutionStatus::SubmissionFailed
+            || result2.status == ExecutionStatus::Rejected)
+            && result1.order_id.is_some()
+            && result1.status == ExecutionStatus::Pending {
+
+            if let Some(ref order_id) = result1.order_id {
+                warn!(
+                    order_id = %order_id,
+                    "Second leg failed, cancelling first leg to prevent one-legged exposure"
+                );
+                match self.client.cancel_order(order_id).await {
+                    Ok(_) => {
+                        info!(order_id = %order_id, "Successfully cancelled first leg");
+                    }
+                    Err(e) => {
+                        // Cancel failed - this is critical!
+                        // The first leg may have filled or is being matched
+                        error!(
+                            order_id = %order_id,
+                            error = %e,
+                            "🚨 CRITICAL: Failed to cancel first leg - ORPHANED POSITION!"
                         );
-                        // TODO: Submit unwind order
-                        // For now, just log - actual unwind requires inverse order
-                    }
-                    PartialFillAction::CancelRemainder => {
-                        // FAK already does this
-                        debug!(token = %result.intent_token_id, "Cancelling remainder");
-                    }
-                    PartialFillAction::KeepRemainder => {
-                        // GTC keeps working
-                        debug!(token = %result.intent_token_id, "Keeping remainder on book");
+                        error!(
+                            token_id = %intents[0].token_id,
+                            market_id = %intents[0].market_id,
+                            side = ?intents[0].side,
+                            price = %intents[0].price,
+                            size = %intents[0].size,
+                            "🚨 Orphaned position details - MANUAL REVIEW REQUIRED"
+                        );
+                        // Trip the circuit breaker to prevent further damage
+                        self.circuit_breaker.record_order_result(Some(ErrorType::Critical));
                     }
                 }
             }
         }
 
-        results
+        vec![result1, result2]
     }
 
     /// Build an order from params
@@ -308,6 +333,7 @@ impl OrderExecutor {
         )
         .with_price_size(params.price, params.size)
         .with_expiration(params.expiration)
+        .with_fee_rate_bps(params.fee_rate_bps)
         .build()
     }
 

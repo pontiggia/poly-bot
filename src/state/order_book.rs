@@ -44,11 +44,25 @@ impl OrderBookState {
         &self,
         token_id: TokenId,
         market: String,
-        bids: Vec<PriceLevel>,
-        asks: Vec<PriceLevel>,
+        mut bids: Vec<PriceLevel>,
+        mut asks: Vec<PriceLevel>,
         timestamp: Option<i64>,
         hash: Option<String>,
     ) {
+        // Sort bids descending by price (highest first)
+        bids.sort_by(|a, b| {
+            let price_a: Decimal = a.price.parse().unwrap_or(Decimal::ZERO);
+            let price_b: Decimal = b.price.parse().unwrap_or(Decimal::ZERO);
+            price_b.cmp(&price_a) // Descending
+        });
+
+        // Sort asks ascending by price (lowest first)
+        asks.sort_by(|a, b| {
+            let price_a: Decimal = a.price.parse().unwrap_or(Decimal::ZERO);
+            let price_b: Decimal = b.price.parse().unwrap_or(Decimal::ZERO);
+            price_a.cmp(&price_b) // Ascending
+        });
+
         let snapshot = BookSnapshot {
             token_id: token_id.clone(),
             market,

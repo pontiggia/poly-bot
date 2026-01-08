@@ -5,4 +5,4 @@
 
 pub mod order;
 
-pub use order::{Order, OrderBuilder, OrderSigner};
+pub use order::{to_checksum_address, Order, OrderBuilder, OrderSigner};

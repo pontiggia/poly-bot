@@ -41,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Configuration loaded successfully");
     info!("  Wallet: {}", config.wallet_address);
+    info!("  API Key: {}...{}", &config.api_key[..8], &config.api_key[config.api_key.len()-4..]);
     info!("  Mode: {:?}", config.mode);
     info!("  Max bet: ${}", config.max_bet_usd);
     info!("  Max daily loss: ${}", config.max_daily_loss_usd);
@@ -82,8 +83,8 @@ async fn main() -> anyhow::Result<()> {
     // Discover 15-min crypto markets (Up/Down) using slug pattern discovery
     let discovered = match discovery.discover_crypto_15min().await {
         Ok(markets) => {
-            // Limit to first 5 markets
-            markets.into_iter().take(5).collect::<Vec<_>>()
+            // Limit to first 40 markets (Phase 9: increased from 5 for more coverage)
+            markets.into_iter().take(40).collect::<Vec<_>>()
         }
         Err(e) => {
             warn!("Failed to discover markets from API: {}", e);

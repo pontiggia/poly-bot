@@ -55,11 +55,11 @@ pub const WS_RECONNECT_DELAY: Duration = Duration::from_millis(1000);
 /// WebSocket reconnect delay in milliseconds (for non-const contexts)
 pub const WEBSOCKET_RECONNECT_DELAY_MS: u64 = 1000;
 
-/// HTTP request timeout
-pub const HTTP_TIMEOUT: Duration = Duration::from_millis(500);
+/// HTTP request timeout (increased from 500ms to reduce timeouts on API latency)
+pub const HTTP_TIMEOUT: Duration = Duration::from_millis(2000);
 
-/// HTTP connection timeout
-pub const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+/// HTTP connection timeout (increased from 200ms)
+pub const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// Reconciliation interval (REST sync with server)
 pub const RECONCILIATION_INTERVAL: Duration = Duration::from_secs(120);
@@ -75,10 +75,12 @@ pub const PARTIAL_FILL_UNWIND_MS: u64 = 500;
 // ============================================================================
 
 /// Maximum bet size per trade (USD)
-pub const MAX_BET_SIZE_USD: Decimal = dec!(5000.0);
+/// Phase 9 live test: lowered from $5000 to $5 for safety
+pub const MAX_BET_SIZE_USD: Decimal = dec!(5.0);
 
 /// Minimum bet size (USD)
-pub const MIN_BET_SIZE_USD: Decimal = dec!(10.0);
+/// Phase 9 live test: lowered from $10 to $2 for small position testing
+pub const MIN_BET_SIZE_USD: Decimal = dec!(2.0);
 
 /// Maximum capital percentage per event
 pub const MAX_CAPITAL_PCT: Decimal = dec!(0.40);
@@ -133,6 +135,7 @@ pub const DEFAULT_MIN_EDGE: Decimal = dec!(0.03);
 pub const THIN_BOOK_EXTRA_MARGIN: Decimal = dec!(0.01);
 
 /// Minimum edge for maker arb (no fees)
+/// Phase 9 live test: 1% edge for safer execution
 pub const MAKER_MIN_EDGE: Decimal = dec!(0.01);
 
 // ============================================================================

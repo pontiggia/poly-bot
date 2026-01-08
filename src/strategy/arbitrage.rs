@@ -1,7 +1,7 @@
 //! Mathematical Arbitrage Strategy
 //!
 //! Detects arbitrage opportunities where YES + NO < $1.00 - required_edge
-//! and returns two OrderIntents to execute both legs atomically.
+//! and returns two OrderIntents to execute both legs.
 //!
 //! ## Strategy Logic
 //!
@@ -9,10 +9,19 @@
 //! If we can buy both for less than $1.00 (minus fees/slippage),
 //! we profit at resolution regardless of outcome.
 //!
-//! ## Execution
+//! ## Execution Modes
 //!
-//! Returns `Urgency::Immediate` intents → converted to FOK orders by TakerPolicy.
-//! Both legs are grouped so partial fill handling knows they're linked.
+//! - **Maker mode (default for live_test):** Returns `Urgency::Passive` intents
+//!   → converted to GTC orders by MakerPolicy. Zero fees on 15-min crypto markets.
+//!   Both legs submitted in parallel via `tokio::join!`.
+//!
+//! - **Taker mode:** Returns `Urgency::Immediate` intents → converted to FOK orders.
+//!   Sequential execution with rollback if second leg fails.
+//!
+//! ## Dynamic Share Sizing
+//!
+//! Polymarket requires minimum $1.00 order value. The strategy calculates
+//! `min_shares = ceil($1.00 / min_leg_price)` and ensures both legs exceed this.
 
 use crate::api::types::{ConditionId, Side, TokenId};
 use crate::ledger::Fill;
@@ -21,6 +30,10 @@ use crate::strategy::market_pair::{MarketPair, MarketPairRegistry};
 use crate::strategy::traits::{OrderIntent, Strategy, StrategyContext, Urgency};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+
+/// Minimum order value required by Polymarket API
+/// Orders with notional value (price × size) below this will be rejected
+const MIN_ORDER_VALUE: Decimal = dec!(1.00);
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -76,6 +89,25 @@ impl MathArbConfig {
             ..Self::default()
         }
     }
+
+    /// Config for Phase 9 live testing with $100 capital
+    ///
+    /// Settings:
+    /// - 1% min edge for safer arbitrage
+    /// - Position sizes $5-$15 per leg to allow dynamic sizing for $1 min order value
+    /// - $50 max exposure (aggressive risk tolerance)
+    /// - Maker execution for zero fees + rebates
+    /// - Share count auto-adjusts to meet $1.00 minimum order value
+    pub fn live_test() -> Self {
+        Self {
+            min_edge: dec!(0.01),         // 1% - safer edge requirement
+            max_position_size: dec!(15),  // Allow up to 15 shares for low-priced legs
+            min_position_size: dec!(5),   // $5 per leg min (market min is 5)
+            max_total_exposure: dec!(50), // $50 max exposure
+            cooldown_ms: 3000,            // 3 second cooldown
+            use_maker_execution: true,    // Maker mode for zero fees
+        }
+    }
 }
 
 /// Mathematical arbitrage strategy
@@ -106,6 +138,15 @@ pub struct MathArbStrategy {
 
     /// Current exposure (approximate, for quick checks)
     current_exposure: std::sync::RwLock<Decimal>,
+
+    /// Best edge observed (even if not profitable) - for diagnostics
+    best_edge_seen: std::sync::RwLock<Decimal>,
+
+    /// Count of near-miss opportunities (edge > 0 but < threshold)
+    near_misses: AtomicU64,
+
+    /// Count of opportunities that passed quick check
+    quick_check_passes: AtomicU64,
 }
 
 impl MathArbStrategy {
@@ -131,6 +172,9 @@ impl MathArbStrategy {
             last_trade: dashmap::DashMap::new(),
             trade_count: AtomicU64::new(0),
             current_exposure: std::sync::RwLock::new(Decimal::ZERO),
+            best_edge_seen: std::sync::RwLock::new(Decimal::ZERO),
+            near_misses: AtomicU64::new(0),
+            quick_check_passes: AtomicU64::new(0),
         }
     }
 
@@ -142,6 +186,29 @@ impl MathArbStrategy {
     /// Get trade count
     pub fn trade_count(&self) -> u64 {
         self.trade_count.load(Ordering::Relaxed)
+    }
+
+    /// Get near-miss count (edge > 0 but below threshold)
+    pub fn near_miss_count(&self) -> u64 {
+        self.near_misses.load(Ordering::Relaxed)
+    }
+
+    /// Get quick check pass count
+    pub fn quick_check_pass_count(&self) -> u64 {
+        self.quick_check_passes.load(Ordering::Relaxed)
+    }
+
+    /// Get best edge seen (for diagnostics)
+    pub fn best_edge_seen(&self) -> Decimal {
+        *self.best_edge_seen.read().unwrap()
+    }
+
+    /// Update best edge tracking
+    fn update_best_edge(&self, edge: Decimal) {
+        let mut best = self.best_edge_seen.write().unwrap();
+        if edge > *best {
+            *best = edge;
+        }
     }
 
     /// Check if market is on cooldown
@@ -191,6 +258,10 @@ impl MathArbStrategy {
             self.edge_calculator
                 .quick_check(ctx.books, &pair.yes_token_id, &pair.no_token_id)?;
 
+        // Track that we passed quick check
+        self.quick_check_passes.fetch_add(1, Ordering::Relaxed);
+        self.update_best_edge(edge);
+
         debug!(
             market = %pair.condition_id,
             yes_ask = %yes_ask,
@@ -208,6 +279,18 @@ impl MathArbStrategy {
         );
 
         if !calc.is_profitable {
+            // Track near-miss: edge > 0 but below required threshold
+            if calc.actual_edge > Decimal::ZERO && calc.actual_edge < calc.required_edge {
+                self.near_misses.fetch_add(1, Ordering::Relaxed);
+                info!(
+                    market = %pair.condition_id,
+                    actual_edge = %calc.actual_edge,
+                    required_edge = %calc.required_edge,
+                    yes_ask = %yes_ask,
+                    no_ask = %no_ask,
+                    "📊 Near-miss: edge positive but below threshold"
+                );
+            }
             debug!(
                 market = %pair.condition_id,
                 actual_edge = %calc.actual_edge,
@@ -217,7 +300,31 @@ impl MathArbStrategy {
             return None;
         }
 
-        // Determine trade size
+        // Calculate maker prices (1 tick below ask) - need these for min size calculation
+        let tick = dec!(0.01);
+        let yes_maker_price = yes_ask - tick;
+        let no_maker_price = no_ask - tick;
+
+        // Get prices for orders (maker or taker)
+        let (yes_price, no_price) = if self.config.use_maker_execution {
+            (yes_maker_price, no_maker_price)
+        } else {
+            (yes_ask, no_ask)
+        };
+
+        // Calculate minimum shares needed for each leg to meet $1.00 order value
+        // Formula: min_shares = ceil($1.00 / price)
+        // We use the lower of the two prices to ensure BOTH legs meet the minimum
+        let min_price = yes_price.min(no_price);
+        let min_shares_for_order_value = if min_price > Decimal::ZERO {
+            (MIN_ORDER_VALUE / min_price).ceil()
+        } else {
+            return None; // Can't divide by zero price
+        };
+
+        // Determine trade size - use the HIGHER of config minimum and order value minimum
+        let effective_min_size = self.config.min_position_size.max(min_shares_for_order_value);
+        
         let max_by_book = calc.max_size;
         let max_by_config = self.config.max_position_size;
         let max_by_exposure = {
@@ -230,12 +337,16 @@ impl MathArbStrategy {
             .min(max_by_exposure)
             .max(Decimal::ZERO);
 
-        if trade_size < self.config.min_position_size {
+        // Check if trade size meets the effective minimum (includes $1 order value requirement)
+        if trade_size < effective_min_size {
             debug!(
                 market = %pair.condition_id,
                 trade_size = %trade_size,
-                min_size = %self.config.min_position_size,
-                "Trade size below minimum"
+                effective_min_size = %effective_min_size,
+                config_min = %self.config.min_position_size,
+                min_for_order_value = %min_shares_for_order_value,
+                min_price = %min_price,
+                "Trade size below effective minimum (includes $1 order value requirement)"
             );
             return None;
         }
@@ -254,8 +365,12 @@ impl MathArbStrategy {
             market = %pair.condition_id,
             yes_ask = %yes_ask,
             no_ask = %no_ask,
+            yes_price = %yes_price,
+            no_price = %no_price,
             edge_cents = %((calc.actual_edge * dec!(100)).round()),
             trade_size = %trade_size,
+            min_shares_required = %min_shares_for_order_value,
+            maker_mode = %self.config.use_maker_execution,
             "🎯 Arb opportunity! Executing..."
         );
 
@@ -274,27 +389,29 @@ impl MathArbStrategy {
             pair.condition_id.clone(),
             pair.yes_token_id.clone(),
             Side::Buy,
-            yes_ask, // Buy at ask
+            yes_price, // Bid for maker, ask for taker
             trade_size,
             urgency,
             format!("Arb YES leg, edge: {:.1}%", calc.actual_edge * dec!(100)),
             self.name.clone(),
         )
         .with_group(group_id.clone())
-        .with_priority(100); // High priority for arb
+        .with_priority(100) // High priority for arb
+        .with_fee_rate(pair.fee_rate_bps);
 
         let no_intent = OrderIntent::new(
             pair.condition_id.clone(),
             pair.no_token_id.clone(),
             Side::Buy,
-            no_ask, // Buy at ask
+            no_price, // Bid for maker, ask for taker
             trade_size,
             urgency,
             format!("Arb NO leg, edge: {:.1}%", calc.actual_edge * dec!(100)),
             self.name.clone(),
         )
         .with_group(group_id)
-        .with_priority(100);
+        .with_priority(100)
+        .with_fee_rate(pair.fee_rate_bps);
 
         // Record trade for cooldown
         self.record_trade(&pair.condition_id);
@@ -390,11 +507,14 @@ impl Strategy for MathArbStrategy {
     }
 
     fn on_shutdown(&self, _ctx: &StrategyContext) -> Vec<OrderIntent> {
-        // TODO: Could generate intents to close all positions
-        // For now, just log
+        // Log comprehensive diagnostics on shutdown
+        let best_edge = self.best_edge_seen();
         info!(
             trades = self.trade_count(),
-            "MathArbStrategy shutting down"
+            quick_check_passes = self.quick_check_pass_count(),
+            near_misses = self.near_miss_count(),
+            best_edge_pct = %((best_edge * dec!(100)).round_dp(2)),
+            "📊 MathArbStrategy shutting down - Final stats"
         );
         vec![]
     }
@@ -649,5 +769,29 @@ mod tests {
 
         // Trade size would be ~$9.70 which is below min of $10
         assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn test_live_test_config() {
+        let config = MathArbConfig::live_test();
+
+        // Verify Phase 9 live test settings (1% edge for better fills)
+        assert_eq!(config.min_edge, dec!(0.01));          // 1% edge (more conservative)
+        assert_eq!(config.max_position_size, dec!(15));  // Up to 15 shares for low-priced legs
+        assert_eq!(config.min_position_size, dec!(5));   // $5 per leg (market min)
+        assert_eq!(config.max_total_exposure, dec!(50)); // $50 max exposure
+        assert_eq!(config.cooldown_ms, 3000);            // 3 second cooldown
+        assert!(config.use_maker_execution);             // Maker mode enabled
+    }
+
+    #[test]
+    fn test_near_miss_tracking() {
+        let registry = setup_registry();
+        let strategy = MathArbStrategy::with_config(registry, MathArbConfig::live_test());
+
+        // Initial state
+        assert_eq!(strategy.near_miss_count(), 0);
+        assert_eq!(strategy.quick_check_pass_count(), 0);
+        assert_eq!(strategy.best_edge_seen(), Decimal::ZERO);
     }
 }

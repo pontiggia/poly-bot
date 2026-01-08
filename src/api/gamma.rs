@@ -327,18 +327,18 @@ impl GammaClient {
     }
     
     /// Supported crypto assets for 15-min Up/Down markets
-    pub const CRYPTO_ASSETS: &'static [&'static str] = &["btc", "eth", "sol"];
-    
+    pub const CRYPTO_ASSETS: &'static [&'static str] = &["btc", "eth", "sol", "xrp"];
+
     /// Discover 15-minute crypto markets by slug pattern
-    /// 
+    ///
     /// 15-min crypto markets use slug format: `{asset}-updown-15m-{timestamp}`
     /// where timestamp is a Unix epoch rounded to 15-minute intervals.
-    /// 
+    ///
     /// This method queries for:
-    /// - Current active market (current 15-min interval)  
+    /// - Current active market (current 15-min interval)
     /// - Next upcoming market (next 15-min interval)
-    /// 
-    /// For each supported crypto asset (BTC, ETH, SOL).
+    ///
+    /// For each supported crypto asset (BTC, ETH, SOL, XRP).
     pub async fn discover_crypto_15min_markets(&self) -> Result<Vec<GammaEvent>> {
         use std::time::{SystemTime, UNIX_EPOCH};
         

@@ -1,5 +1,8 @@
 What Was Built
 
+> **⚠️ HISTORICAL DOCUMENT** - This file documents the build process.
+> For current behavior, see [STATE-OF-THE-BOT.md](../STATE-OF-THE-BOT.md)
+
   Phase 0: Wallet Setup ✅
 
   - User already had trading wallet with API credentials in .env file
@@ -908,19 +911,29 @@ Heartbeat [PAPER]: 8 markets | 6297 msgs | 629.7 msg/s | 0 intents | 0 execs | 0
 
 ---
 
-## Next Steps: Phase 9 - Integration & Live Testing
+## Next Steps: Phase 9 - Integration & Live Testing ✅ COMPLETE
 
-**What needs to be done:**
-1. Test with `BOT_MODE=live` on a funded wallet (small amounts)
-2. Set `USE_MAKER_MODE=true` to test maker strategy
-3. Verify order signing works correctly (may need to test with cancel_order first)
-4. Monitor for actual arb opportunities and execution
-5. Add reconciliation between ledger and API positions
+**Status: PROFITABLE** (Updated 2026-01-08)
 
-**Current State:**
-- ✅ Full execution pipeline wired
-- ✅ Paper mode working correctly
-- ✅ Circuit breaker integrated
-- ✅ Maker strategy infrastructure complete
-- ✅ User WebSocket wired to ledger
-- ⏳ Live mode needs testing with real orders
+### Live Session Results
+- **Profit:** +$1.10 (3.24% return on $33.85 invested)
+- **Orders Placed:** 8
+- **Orders Filled:** 7
+- **Fees Paid:** $0.00 (all maker)
+
+### Post-Phase 9 Fixes Applied
+1. ✅ Dynamic share sizing to meet $1.00 minimum order value
+2. ✅ Parallel execution for maker arb legs (tokio::join!)
+3. ✅ Critical error handling (circuit breaker trips on orphaned positions)
+4. ✅ Fill detection fix (correct size matching with to_fill_for_order)
+
+### Known Remaining Issues
+1. ⚠️ Rounding precision for fractional share sizes (causes some order rejections)
+2. ⚠️ Partial fills may linger on shutdown (requires manual cleanup)
+
+### Test Coverage
+- **154 tests passing** (up from 150)
+
+### See Also
+- [STATE-OF-THE-BOT.md](../STATE-OF-THE-BOT.md) - Authoritative current behavior documentation
+- [planning/04-IMPLEMENTATION-PLAN.md](../planning/04-IMPLEMENTATION-PLAN.md) - Updated phase status
