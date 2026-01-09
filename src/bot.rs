@@ -377,9 +377,29 @@ impl Bot {
         }
         
         // Check if ANY of these order IDs are ones we're tracking
+        // CRITICAL: Also verify the token_id matches to prevent cross-token fill misattribution
         let matched_order_id = our_order_ids
             .iter()
-            .find(|id| self.order_tracker.contains(id));
+            .find(|id| {
+                let order_id_str = id.to_string();
+                if let Some(tracked) = self.order_tracker.get(&order_id_str) {
+                    // Must match BOTH order_id AND token_id
+                    if tracked.token_id == trade.asset_id {
+                        true
+                    } else {
+                        // Order ID matches but token doesn't - this is a critical mismatch!
+                        warn!(
+                            "⚠️ TOKEN MISMATCH: Fill for token {}... claims order {}... which tracks token {}...",
+                            &trade.asset_id[..trade.asset_id.len().min(12)],
+                            &id[..id.len().min(16)],
+                            &tracked.token_id[..tracked.token_id.len().min(12)]
+                        );
+                        false
+                    }
+                } else {
+                    false
+                }
+            });
         
         let order_id = match matched_order_id {
             Some(id) => id.to_string(),
