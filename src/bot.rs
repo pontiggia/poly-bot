@@ -15,13 +15,12 @@
 //! - Heartbeat for logging (10s)
 //! - Async kill signal for shutdown
 
-use crate::api::ApiClient;
 use crate::config::{Config, OperatingMode};
+use crate::exchange::{Exchange, SdkExchange};
 use crate::execution::{DualPolicy, ExecutionResult, ExecutionStatus, OrderExecutor, OrderTracker, TrackedOrder};
 use crate::kill_switch::KillSwitch;
 use crate::ledger::Ledger;
 use crate::risk::CircuitBreaker;
-use crate::signing::OrderSigner;
 use crate::state::OrderBookState;
 use crate::strategy::{
     MarketPair, MarketPairRegistry, MathArbStrategy, OrderIntent, StrategyContext, StrategyRouter,
@@ -125,70 +124,39 @@ impl Bot {
         // Set up circuit breaker for risk management
         let circuit_breaker = Arc::new(CircuitBreaker::new());
 
-        // Create order signer first to get the EOA address
-        let order_signer = Arc::new(
-            OrderSigner::new(&config.private_key)
-                .expect("Failed to create order signer")
-        );
+        // Create SDK exchange - handles authentication and signing internally
+        // The SDK derives credentials from private key using L1 auth flow
+        let exchange = SdkExchange::new(
+            config.private_key.clone(),
+            config.wallet_address.clone(), // maker = proxy wallet (funder)
+            false, // TODO: Detect neg-risk from market data
+        )
+        .await
+        .expect("Failed to create SDK exchange");
 
-        // The signer address (EOA) is what User API credentials are tied to
-        let signer_address = order_signer.address();
-        info!("EOA Signer address: {}", signer_address);
-        info!("Proxy wallet (funder): {}", config.wallet_address);
+        let exchange = Arc::new(exchange);
 
-        // Set up order executor with User API credentials (for L2 auth)
-        // IMPORTANT: POLY_ADDRESS header must be the EOA signer address, not the proxy wallet!
-        let (api_key, secret_key, passphrase) = if config.has_user_credentials() {
-            info!("Using USER credentials for order execution (L2 auth)");
-            (
-                config.user_api_key.clone().unwrap(),
-                config.user_secret_key.clone().unwrap(),
-                config.user_passphrase.clone().unwrap(),
-            )
-        } else {
-            warn!("⚠️ No USER credentials configured - using builder credentials (may fail!)");
-            warn!("  Run: cargo run --bin derive_creds  to get User API credentials");
-            (
-                config.api_key.clone(),
-                config.secret_key.clone(),
-                config.passphrase.clone(),
-            )
-        };
+        // Log addresses
+        info!("EOA Signer address: {}", exchange.signer_address());
+        info!("Proxy wallet (funder): {}", exchange.maker_address());
 
-        // Use signer_address (EOA) for POLY_ADDRESS header, NOT the proxy wallet
-        let credentials = crate::api::ApiCredentials::new(
-            api_key,
-            secret_key,
-            passphrase,
-            signer_address.clone(), // EOA address that derived the User API credentials
-        );
-
-        let api_client = Arc::new(
-            ApiClient::new(credentials)
-                .expect("Failed to create API client")
-        );
-        
         // Use DualPolicy: Taker for Immediate/Normal, Maker for Passive
         // Maker orders post inside spread for better fill probability
         let policy = Arc::new(
             DualPolicy::new()
                 .with_maker_offset(config.maker_price_offset)
         );
-        
+
         info!(
             "Execution policy: DualPolicy (Taker=FOK/FAK, Maker=GTC offset={} cents)",
             config.maker_price_offset
         );
-        
-        // Note: 15-min crypto markets use neg-risk exchange
-        // maker_address = proxy wallet (funder, where funds are)
+
+        // Create executor with SDK exchange (handles signing/amounts correctly)
         let executor = Arc::new(OrderExecutor::new(
-            api_client,
-            order_signer.clone(),
+            exchange.clone(),
             policy,
             circuit_breaker.clone(),
-            config.wallet_address.clone(), // maker = proxy wallet
-            false, // TODO: Detect from market data - using standard exchange for now
         ));
 
         // Set up order tracker for outstanding orders
@@ -654,7 +622,17 @@ impl Bot {
         order_tracker: Arc<OrderTracker>,
         intents: Vec<OrderIntent>,
     ) {
-        info!("🚀 LIVE: Executing {} order(s)...", intents.len());
+        // Calculate total USDC required for all orders
+        let total_cost: rust_decimal::Decimal = intents
+            .iter()
+            .map(|i| i.price * i.size)
+            .sum();
+
+        info!(
+            "🚀 LIVE: Executing {} order(s) - Total USDC required: ${:.2}",
+            intents.len(),
+            total_cost
+        );
         
         // Check if intents are grouped (arb legs) and passive (maker orders)
         let has_group = intents.first().and_then(|i| i.group_id.as_ref()).is_some();

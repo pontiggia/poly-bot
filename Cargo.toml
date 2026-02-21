@@ -54,6 +54,15 @@ sha2 = "0.10"
 base64 = "0.21"
 hex = "0.4"
 
+# Polymarket Official SDK
+polymarket-client-sdk = "0.3"
+
+# Async trait for Exchange abstraction
+async-trait = "0.1"
+
+# k256 for signer type (required by SDK)
+k256 = "0.13"
+
 [dev-dependencies]
 tokio-test = "0.4"
 serial_test = "3"

@@ -72,9 +72,10 @@ impl Config {
             .or_else(|_| std::env::var("passphrase"))
             .map_err(|_| BotError::Config("Missing POLYMARKET_PASSPHRASE or passphrase".into()))?;
 
-        let private_key = std::env::var("PRIVATE_KEY")
+        let private_key = std::env::var("POLYMARKET_PRIVATE_KEY")
+            .or_else(|_| std::env::var("PRIVATE_KEY"))
             .or_else(|_| std::env::var("private_key"))
-            .map_err(|_| BotError::Config("Missing PRIVATE_KEY or private_key".into()))?;
+            .map_err(|_| BotError::Config("Missing POLYMARKET_PRIVATE_KEY, PRIVATE_KEY or private_key".into()))?;
 
         let wallet_address = std::env::var("WALLET_ADDRESS")
             .or_else(|_| std::env::var("builder_address"))
@@ -161,20 +162,6 @@ impl Config {
         self.user_api_key.is_some()
             && self.user_secret_key.is_some()
             && self.user_passphrase.is_some()
-    }
-
-    /// Get user API credentials for User WebSocket (if configured)
-    pub fn user_credentials(&self) -> Option<crate::api::ApiCredentials> {
-        if self.has_user_credentials() {
-            Some(crate::api::ApiCredentials::new(
-                self.user_api_key.clone().unwrap(),
-                self.user_secret_key.clone().unwrap(),
-                self.user_passphrase.clone().unwrap(),
-                self.wallet_address.clone(),
-            ))
-        } else {
-            None
-        }
     }
 }
 

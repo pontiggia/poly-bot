@@ -291,6 +291,14 @@ impl GammaClient {
         let url = format!("{}/events?active=true&closed=false", self.base_url);
         self.fetch_events(&url).await
     }
+
+    /// Get all events (no active/closed filters). This will return active, closed,
+    /// and archived events and is useful when you need to look up historical
+    /// markets by token id or condition id.
+    pub async fn get_all_events(&self) -> Result<Vec<GammaEvent>> {
+        let url = format!("{}/events", self.base_url);
+        self.fetch_events(&url).await
+    }
     
     /// Get event by slug
     pub async fn get_event_by_slug(&self, slug: &str) -> Result<Option<GammaEvent>> {
@@ -326,8 +334,16 @@ impl GammaClient {
         Ok(crypto_events)
     }
     
-    /// Supported crypto assets for 15-min Up/Down markets
+    /// Supported crypto assets for Up/Down markets
     pub const CRYPTO_ASSETS: &'static [&'static str] = &["btc", "eth", "sol", "xrp"];
+
+    /// Crypto asset names for 1-hour markets (use full names in slugs)
+    pub const CRYPTO_ASSET_NAMES: &'static [(&'static str, &'static str)] = &[
+        ("btc", "bitcoin"),
+        ("eth", "ethereum"),
+        ("sol", "solana"),
+        ("xrp", "xrp"),
+    ];
 
     /// Discover 15-minute crypto markets by slug pattern
     ///
@@ -398,7 +414,140 @@ impl GammaClient {
         debug!(count = all_events.len(), "Discovered 15-min crypto events");
         Ok(all_events)
     }
-    
+
+    /// Discover hourly crypto markets by slug pattern
+    ///
+    /// Hourly markets use slug format: `{asset}-up-or-down-{month}-{day}-{hour}{am/pm}-et`
+    /// Example: `bitcoin-up-or-down-january-8-9pm-et`
+    pub async fn discover_crypto_hourly_markets(&self) -> Result<Vec<GammaEvent>> {
+        use chrono::{Datelike, Timelike, Utc, Duration};
+
+        let now = Utc::now();
+        // Convert to Eastern Time (UTC-5)
+        let et_offset = Duration::hours(-5);
+        let et_now = now + et_offset;
+
+        let months = [
+            "january", "february", "march", "april", "may", "june",
+            "july", "august", "september", "october", "november", "december"
+        ];
+
+        let mut all_events = Vec::new();
+
+        // Check current hour and next few hours
+        let hours_to_check = [
+            et_now,
+            et_now + Duration::hours(1),
+            et_now + Duration::hours(2),
+            et_now + Duration::hours(3),
+        ];
+
+        for (_, asset_name) in Self::CRYPTO_ASSET_NAMES {
+            for check_time in &hours_to_check {
+                let month = months[check_time.month0() as usize];
+                let day = check_time.day();
+                let hour_24 = check_time.hour();
+
+                // Convert to 12-hour format
+                let (hour_12, am_pm) = if hour_24 == 0 {
+                    (12, "am")
+                } else if hour_24 < 12 {
+                    (hour_24, "am")
+                } else if hour_24 == 12 {
+                    (12, "pm")
+                } else {
+                    (hour_24 - 12, "pm")
+                };
+
+                // Format: bitcoin-up-or-down-january-8-9pm-et
+                let slug = format!("{}-up-or-down-{}-{}-{}{}-et",
+                    asset_name, month, day, hour_12, am_pm);
+
+                if let Ok(Some(event)) = self.get_event_by_slug(&slug).await {
+                    if event.markets.iter().any(|m| m.is_tradeable() && m.is_binary()) {
+                        debug!(slug = %slug, "Found hourly crypto event");
+                        all_events.push(event);
+                    }
+                }
+            }
+        }
+
+        debug!(count = all_events.len(), "Discovered hourly crypto events");
+        Ok(all_events)
+    }
+
+    /// Discover daily crypto markets by slug pattern
+    ///
+    /// Daily markets use slug format: `{asset}-up-or-down-on-{month}-{day}`
+    /// Example: `bitcoin-up-or-down-on-january-9`
+    pub async fn discover_crypto_daily_markets(&self) -> Result<Vec<GammaEvent>> {
+        use chrono::{Datelike, Utc, Duration};
+
+        let now = Utc::now();
+        // Convert to Eastern Time
+        let et_offset = Duration::hours(-5);
+        let et_now = now + et_offset;
+
+        let months = [
+            "january", "february", "march", "april", "may", "june",
+            "july", "august", "september", "october", "november", "december"
+        ];
+
+        let mut all_events = Vec::new();
+
+        // Check today and tomorrow
+        let days_to_check = [
+            et_now,
+            et_now + Duration::days(1),
+        ];
+
+        for (_, asset_name) in Self::CRYPTO_ASSET_NAMES {
+            for check_time in &days_to_check {
+                let month = months[check_time.month0() as usize];
+                let day = check_time.day();
+
+                // Format: bitcoin-up-or-down-on-january-9
+                let slug = format!("{}-up-or-down-on-{}-{}", asset_name, month, day);
+
+                if let Ok(Some(event)) = self.get_event_by_slug(&slug).await {
+                    if event.markets.iter().any(|m| m.is_tradeable() && m.is_binary()) {
+                        debug!(slug = %slug, "Found daily crypto event");
+                        all_events.push(event);
+                    }
+                }
+            }
+        }
+
+        debug!(count = all_events.len(), "Discovered daily crypto events");
+        Ok(all_events)
+    }
+
+    /// Discover all crypto markets (15-min, hourly, daily)
+    pub async fn discover_all_crypto_markets(&self) -> Result<Vec<GammaEvent>> {
+        let mut all_events = Vec::new();
+
+        // Discover 15-min markets
+        if let Ok(events) = self.discover_crypto_15min_markets().await {
+            debug!(count = events.len(), "Found 15-min markets");
+            all_events.extend(events);
+        }
+
+        // Discover hourly markets
+        if let Ok(events) = self.discover_crypto_hourly_markets().await {
+            debug!(count = events.len(), "Found hourly markets");
+            all_events.extend(events);
+        }
+
+        // Discover daily markets
+        if let Ok(events) = self.discover_crypto_daily_markets().await {
+            debug!(count = events.len(), "Found daily markets");
+            all_events.extend(events);
+        }
+
+        debug!(count = all_events.len(), "Total crypto events discovered");
+        Ok(all_events)
+    }
+
     /// Internal fetch helper
     async fn fetch_events(&self, url: &str) -> Result<Vec<GammaEvent>> {
         debug!(url = %url, "Fetching from Gamma API");

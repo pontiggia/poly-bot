@@ -281,10 +281,13 @@ impl MakerPolicy {
 
         let offset = self.price_offset_cents / Decimal::from(100); // Convert cents to price
 
-        match side {
+        let adjusted = match side {
             Side::Buy => price + offset, // More aggressive bid
             Side::Sell => price - offset, // More aggressive ask
-        }
+        };
+
+        // Round to tick size (2 decimal places for 0.01 tick)
+        adjusted.round_dp(2)
     }
 }
 
@@ -615,8 +618,8 @@ mod tests {
 
         let params = policy.to_order_params(&intent);
 
-        // Buy price should be adjusted (0.55 + 0.005 = 0.555)
-        assert_eq!(params.price, dec!(0.555));
+        // Buy price adjusted: 0.55 + 0.005 = 0.555, rounded to tick size → 0.56
+        assert_eq!(params.price, dec!(0.56));
         assert_eq!(params.order_type, OrderType::GTC);
     }
 

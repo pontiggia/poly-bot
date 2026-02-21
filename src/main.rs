@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
             error!("  - api_key or POLYMARKET_API_KEY");
             error!("  - secret_key or POLYMARKET_SECRET");
             error!("  - passphrase or POLYMARKET_PASSPHRASE");
-            error!("  - private_key or PRIVATE_KEY");
+            error!("  - private_key, PRIVATE_KEY or POLYMARKET_PRIVATE_KEY");
             error!("  - builder_address or WALLET_ADDRESS");
             return Err(e.into());
         }
@@ -72,19 +72,21 @@ async fn main() -> anyhow::Result<()> {
     // ===========================================================================
     // MARKET DISCOVERY
     // ===========================================================================
-    // Discover 15-minute crypto markets from Gamma API
-    // Uses slug-based discovery: btc-updown-15m-{timestamp}, etc.
+    // Discover all crypto markets from Gamma API:
+    // - 15-min markets: btc-updown-15m-{timestamp}
+    // - Hourly markets: bitcoin-up-or-down-january-8-9pm-et
+    // - Daily markets:  bitcoin-up-or-down-on-january-9
     // ===========================================================================
 
-    info!("Discovering 15-min crypto markets from Gamma API...");
-    
+    info!("Discovering all crypto markets from Gamma API (15-min + hourly + daily)...");
+
     let discovery = MarketDiscovery::new();
-    
-    // Discover 15-min crypto markets (Up/Down) using slug pattern discovery
-    let discovered = match discovery.discover_crypto_15min().await {
+
+    // Discover all crypto markets for maximum coverage
+    let discovered = match discovery.discover_all_crypto().await {
         Ok(markets) => {
-            // Limit to first 40 markets (Phase 9: increased from 5 for more coverage)
-            markets.into_iter().take(40).collect::<Vec<_>>()
+            // Limit to first 80 markets for broader coverage
+            markets.into_iter().take(80).collect::<Vec<_>>()
         }
         Err(e) => {
             warn!("Failed to discover markets from API: {}", e);
@@ -94,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
     };
     
     let (market_pairs, token_ids): (Vec<MarketPair>, Vec<String>) = if !discovered.is_empty() {
-        info!("Discovered {} tradeable 15-min crypto markets", discovered.len());
+        info!("Discovered {} tradeable crypto markets", discovered.len());
         
         let mut pairs = Vec::new();
         let mut tokens = Vec::new();

@@ -4,8 +4,8 @@
 //!
 //! ## Architecture
 //!
-//! - `api` - HTTP client and API types
-//! - `signing` - EIP-712 order signing for Polymarket CTF Exchange
+//! - `api` - Types and market discovery for Polymarket APIs
+//! - `exchange` - Exchange abstraction layer (SDK wrapper)
 //! - `websocket` - Real-time market data
 //! - `state` - Order book and market registry
 //! - `ledger` - Authoritative state (orders, fills, positions, cash)
@@ -18,19 +18,18 @@ pub mod bot;
 pub mod config;
 pub mod constants;
 pub mod error;
+pub mod exchange;
 pub mod execution;
 pub mod kill_switch;
 pub mod ledger;
 pub mod risk;
-pub mod signing;
 pub mod state;
 pub mod strategy;
 pub mod websocket;
 
-pub use api::{ApiClient, ApiCredentials};
 pub use bot::Bot;
 pub use config::Config;
 pub use error::{BotError, Result};
+pub use exchange::{Exchange, ExchangeError, SdkExchange};
 pub use kill_switch::KillSwitch;
-pub use signing::{Order, OrderBuilder, OrderSigner};
 

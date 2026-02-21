@@ -3,12 +3,11 @@
 //! Periodically fetches open orders from the server and compares with local ledger.
 //! Detects discrepancies and triggers circuit breaker if needed.
 
-use crate::api::client::ApiClient;
 use crate::constants::RECONCILIATION_INTERVAL;
+use crate::exchange::Exchange;
 use crate::execution::Discrepancy;
 use crate::ledger::{OpenOrders, OrderState};
 use crate::risk::CircuitBreaker;
-use rust_decimal::Decimal;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,8 +41,8 @@ pub enum ReconciliationMessage {
 
 /// Reconciliation loop - runs in background
 pub struct ReconciliationLoop {
-    /// API client for REST calls
-    client: Arc<ApiClient>,
+    /// Exchange for REST calls
+    exchange: Arc<dyn Exchange>,
     /// Local orders state
     orders: Arc<OpenOrders>,
     /// Circuit breaker to trigger on failures
@@ -57,13 +56,13 @@ pub struct ReconciliationLoop {
 impl ReconciliationLoop {
     /// Create a new reconciliation loop
     pub fn new(
-        client: Arc<ApiClient>,
+        exchange: Arc<dyn Exchange>,
         orders: Arc<OpenOrders>,
         circuit_breaker: Arc<CircuitBreaker>,
         tx: mpsc::UnboundedSender<ReconciliationMessage>,
     ) -> Self {
         Self {
-            client,
+            exchange,
             orders,
             circuit_breaker,
             interval: RECONCILIATION_INTERVAL,
@@ -73,14 +72,14 @@ impl ReconciliationLoop {
 
     /// Create with custom interval (for testing)
     pub fn with_interval(
-        client: Arc<ApiClient>,
+        exchange: Arc<dyn Exchange>,
         orders: Arc<OpenOrders>,
         circuit_breaker: Arc<CircuitBreaker>,
         tx: mpsc::UnboundedSender<ReconciliationMessage>,
         interval: Duration,
     ) -> Self {
         Self {
-            client,
+            exchange,
             orders,
             circuit_breaker,
             interval,
@@ -136,8 +135,8 @@ impl ReconciliationLoop {
     pub async fn reconcile_once(&self) -> Result<ReconciliationResult, String> {
         // Fetch server orders
         let server_orders = self
-            .client
-            .get_orders()
+            .exchange
+            .get_open_orders()
             .await
             .map_err(|e| format!("Failed to fetch orders: {}", e))?;
 
@@ -148,7 +147,7 @@ impl ReconciliationLoop {
         let local_order_count = local_orders.len();
 
         // Build sets for comparison
-        let server_ids: HashSet<String> = server_orders.iter().map(|o| o.id.clone()).collect();
+        let server_ids: HashSet<String> = server_orders.iter().map(|o| o.order_id.clone()).collect();
 
         let local_ids: HashSet<String> = local_orders
             .iter()
@@ -159,9 +158,9 @@ impl ReconciliationLoop {
 
         // Check for orders on server that we don't have locally
         for server_order in &server_orders {
-            if !local_ids.contains(&server_order.id) {
+            if !local_ids.contains(&server_order.order_id) {
                 discrepancies.push(Discrepancy::RemoteNotLocal {
-                    order_id: server_order.id.clone(),
+                    order_id: server_order.order_id.clone(),
                 });
             }
         }
@@ -186,17 +185,16 @@ impl ReconciliationLoop {
         for server_order in &server_orders {
             if let Some(local_order) = local_orders
                 .iter()
-                .find(|o| o.order_id.as_ref() == Some(&server_order.id))
+                .find(|o| o.order_id.as_ref() == Some(&server_order.order_id))
             {
-                let server_state = parse_server_status(&server_order.status);
-                
+                let server_state = map_domain_status(&server_order.status);
+
                 // If server says filled but we don't, that's a mismatch
                 if server_state == OrderState::Filled && local_order.state != OrderState::Filled {
-                    let server_filled = parse_filled_size(&server_order.size_matched);
                     discrepancies.push(Discrepancy::StateMismatch {
-                        order_id: server_order.id.clone(),
+                        order_id: server_order.order_id.clone(),
                         local_state: local_order.state,
-                        remote_filled: server_filled,
+                        remote_filled: server_order.filled_size,
                         local_filled: local_order.filled_size,
                     });
                 }
@@ -215,21 +213,18 @@ impl ReconciliationLoop {
     }
 }
 
-/// Parse server status string to OrderState
-fn parse_server_status(status: &str) -> OrderState {
-    match status.to_lowercase().as_str() {
-        "live" | "open" => OrderState::Acked,
-        "matched" | "filled" => OrderState::Filled,
-        "cancelled" | "canceled" => OrderState::Cancelled,
-        "expired" => OrderState::Expired,
-        "rejected" => OrderState::Rejected,
-        _ => OrderState::Unknown,
+/// Map DomainOrder OrderStatus to local OrderState
+fn map_domain_status(status: &crate::exchange::OrderStatus) -> OrderState {
+    use crate::exchange::OrderStatus;
+    match status {
+        OrderStatus::Open => OrderState::Acked,
+        OrderStatus::PartiallyFilled => OrderState::PartiallyFilled,
+        OrderStatus::Filled => OrderState::Filled,
+        OrderStatus::Cancelled => OrderState::Cancelled,
+        OrderStatus::Expired => OrderState::Expired,
+        OrderStatus::Rejected => OrderState::Rejected,
+        OrderStatus::Pending => OrderState::Submitted,
     }
-}
-
-/// Parse filled size from string
-fn parse_filled_size(size_str: &str) -> Decimal {
-    size_str.parse().unwrap_or(Decimal::ZERO)
 }
 
 impl Discrepancy {
@@ -261,16 +256,16 @@ impl Discrepancy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exchange::OrderStatus;
     use rust_decimal_macros::dec;
 
     #[test]
-    fn test_parse_server_status() {
-        assert_eq!(parse_server_status("live"), OrderState::Acked);
-        assert_eq!(parse_server_status("LIVE"), OrderState::Acked);
-        assert_eq!(parse_server_status("matched"), OrderState::Filled);
-        assert_eq!(parse_server_status("cancelled"), OrderState::Cancelled);
-        assert_eq!(parse_server_status("expired"), OrderState::Expired);
-        assert_eq!(parse_server_status("unknown_status"), OrderState::Unknown);
+    fn test_map_domain_status() {
+        assert_eq!(map_domain_status(&OrderStatus::Open), OrderState::Acked);
+        assert_eq!(map_domain_status(&OrderStatus::Filled), OrderState::Filled);
+        assert_eq!(map_domain_status(&OrderStatus::Cancelled), OrderState::Cancelled);
+        assert_eq!(map_domain_status(&OrderStatus::Expired), OrderState::Expired);
+        assert_eq!(map_domain_status(&OrderStatus::Pending), OrderState::Submitted);
     }
 
     #[test]

@@ -3,23 +3,20 @@
 //! The executor is the bridge between strategy decisions (OrderIntent)
 //! and actual order submission. It:
 //! 1. Applies ExecutionPolicy to convert intent → OrderParams
-//! 2. Signs orders using the OrderSigner
-//! 3. Submits orders to the exchange
-//! 4. Handles partial fills per policy rules
-//! 5. Tracks execution results
+//! 2. Uses the Exchange trait to submit orders (SDK handles signing/amounts)
+//! 3. Handles partial fills per policy rules
+//! 4. Tracks execution results
 
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
-use crate::api::types::{OrderRequest, OrderResponse, OrderType};
-use crate::api::ApiClient;
+use crate::api::types::OrderType;
 use crate::error::ErrorType;
-use crate::execution::policy::{ExecutionPolicy, IntentRef, OrderParams};
+use crate::exchange::{Exchange, ExchangeError, ExchangeOrderParams, ExchangeOrderType};
+use crate::execution::policy::{ExecutionPolicy, IntentRef};
 use crate::risk::circuit_breaker::CircuitBreaker;
-use crate::signing::{Order, OrderBuilder, OrderSigner};
 use crate::strategy::OrderIntent;
 use rust_decimal::Decimal;
-
 
 // ============================================================================
 // EXECUTION RESULT
@@ -79,51 +76,34 @@ pub enum ExecutionStatus {
 // ORDER EXECUTOR
 // ============================================================================
 
-/// Executes order intents by converting them to orders and submitting
+/// Executes order intents by converting them to orders and submitting via Exchange
 pub struct OrderExecutor {
-    /// API client for order submission
-    client: Arc<ApiClient>,
-
-    /// Order signer for EIP-712 signatures
-    signer: Arc<OrderSigner>,
+    /// Exchange for order submission (SDK-based)
+    exchange: Arc<dyn Exchange>,
 
     /// Execution policy (determines order type, partial fill handling)
     policy: Arc<dyn ExecutionPolicy>,
 
     /// Circuit breaker to check before submission
     circuit_breaker: Arc<CircuitBreaker>,
-
-    /// Maker address (proxy/funder wallet where funds are held)
-    maker_address: String,
-
-    /// Whether this is a neg-risk market (affects signing)
-    is_neg_risk: bool,
 }
 
 impl OrderExecutor {
     /// Create a new order executor
     ///
     /// # Arguments
-    /// * `maker_address` - Proxy wallet address (funder, where funds are held)
+    /// * `exchange` - Exchange implementation (SDK handles signing/amounts)
+    /// * `policy` - Execution policy for order type selection
+    /// * `circuit_breaker` - Circuit breaker for risk management
     pub fn new(
-        client: Arc<ApiClient>,
-        signer: Arc<OrderSigner>,
+        exchange: Arc<dyn Exchange>,
         policy: Arc<dyn ExecutionPolicy>,
         circuit_breaker: Arc<CircuitBreaker>,
-        maker_address: String,
-        is_neg_risk: bool,
     ) -> Self {
-        // Ensure maker address is checksummed (EIP-55 format)
-        let checksummed_maker = crate::signing::to_checksum_address(&maker_address)
-            .unwrap_or_else(|_| maker_address.clone());
-
         Self {
-            client,
-            signer,
+            exchange,
             policy,
             circuit_breaker,
-            maker_address: checksummed_maker,
-            is_neg_risk,
         }
     }
 
@@ -158,56 +138,96 @@ impl OrderExecutor {
             size = %params.size,
             order_type = ?params.order_type,
             policy = %self.policy.name(),
-            "Executing order"
+            "Executing order via SDK"
         );
 
-        // Build and sign the order
-        let order = self.build_order(&params);
-        let signed_order = match self.sign_order(&order).await {
-            Ok(signed) => signed,
+        // Get tick size for proper amount calculation
+        let tick_size = match self.exchange.get_minimum_tick_size(&params.token_id).await {
+            Ok(ts) => ts,
             Err(e) => {
-                error!(error = %e, "Failed to sign order");
-                return ExecutionResult {
-                    intent_token_id: intent.token_id.clone(),
-                    order_id: None,
-                    filled: false,
-                    filled_size: Decimal::ZERO,
-                    requested_size: intent.size,
-                    status: ExecutionStatus::SubmissionFailed,
-                    error: Some(format!("Signing failed: {}", e)),
-                };
+                error!(error = %e, "Failed to get tick size");
+                // Default to 0.01 if we can't fetch tick size
+                Decimal::new(1, 2)
             }
         };
 
-        // Create order request
-        // IMPORTANT: owner = API key string (NOT an address!)
-        // This is how Polymarket's API validates the request
-        let api_key = self.client.credentials().api_key.clone();
-        let request = OrderRequest {
-            defer_exec: false,
-            order: signed_order,
-            owner: api_key, // API key, not address!
-            order_type: params.order_type,
+        // Convert policy OrderParams to Exchange params
+        let exchange_params = ExchangeOrderParams {
+            token_id: params.token_id.clone(),
+            side: params.side,
+            price: params.price,
+            size: params.size,
+            order_type: self.map_order_type(params.order_type),
+            fee_rate_bps: params.fee_rate_bps,
+            minimum_tick_size: tick_size,
+            post_only: params.order_type == OrderType::GTC, // GTC orders can be post-only
         };
 
-        // Submit order
-        match self.client.place_order(&request).await {
-            Ok(response) => self.process_response(&params, response),
+        // Submit order via Exchange (SDK handles signing and amounts!)
+        match self.exchange.place_order(exchange_params).await {
+            Ok(order) => {
+                let filled = order.filled_size > Decimal::ZERO;
+                let status = if order.filled_size >= params.size {
+                    ExecutionStatus::FullyFilled
+                } else if filled {
+                    ExecutionStatus::PartialFill
+                } else if params.order_type == OrderType::FOK {
+                    ExecutionStatus::Cancelled
+                } else {
+                    ExecutionStatus::Pending
+                };
+
+                info!(
+                    order_id = %order.order_id,
+                    status = ?status,
+                    filled = %order.filled_size,
+                    requested = %params.size,
+                    "Order executed via SDK"
+                );
+
+                // Record success for circuit breaker
+                self.circuit_breaker.record_order_result(None);
+
+                ExecutionResult {
+                    intent_token_id: params.token_id.clone(),
+                    order_id: Some(order.order_id),
+                    filled,
+                    filled_size: order.filled_size,
+                    requested_size: params.size,
+                    status,
+                    error: None,
+                }
+            }
             Err(e) => {
                 error!(error = %e, "Order submission failed");
-                // Record failure for circuit breaker (treat network errors as retryable)
-                self.circuit_breaker
-                    .record_order_result(Some(ErrorType::Retryable));
+
+                // Classify error for circuit breaker
+                let error_type = ErrorType::from(&e);
+                self.circuit_breaker.record_order_result(Some(error_type));
+
                 ExecutionResult {
                     intent_token_id: intent.token_id.clone(),
                     order_id: None,
                     filled: false,
                     filled_size: Decimal::ZERO,
                     requested_size: intent.size,
-                    status: ExecutionStatus::SubmissionFailed,
+                    status: if e.is_retryable() {
+                        ExecutionStatus::SubmissionFailed
+                    } else {
+                        ExecutionStatus::Rejected
+                    },
                     error: Some(e.to_string()),
                 }
             }
+        }
+    }
+
+    /// Map policy OrderType to Exchange OrderType
+    fn map_order_type(&self, order_type: OrderType) -> ExchangeOrderType {
+        match order_type {
+            OrderType::GTC => ExchangeOrderType::GTC,
+            OrderType::FOK => ExchangeOrderType::FOK,
+            OrderType::FAK => ExchangeOrderType::FAK,
         }
     }
 
@@ -234,7 +254,6 @@ impl OrderExecutor {
             }
             _ => {
                 // For larger batches, execute sequentially
-                // (Could use futures_util::future::join_all for parallel if needed)
                 let mut results = Vec::with_capacity(intents.len());
                 for intent in intents {
                     results.push(self.execute(intent).await);
@@ -259,7 +278,8 @@ impl OrderExecutor {
 
         // If first leg failed completely (submission error), don't execute second
         if result1.status == ExecutionStatus::SubmissionFailed
-            || result1.status == ExecutionStatus::CircuitOpen {
+            || result1.status == ExecutionStatus::CircuitOpen
+        {
             warn!(
                 token = %intents[0].token_id,
                 error = ?result1.error,
@@ -284,24 +304,23 @@ impl OrderExecutor {
         if (result2.status == ExecutionStatus::SubmissionFailed
             || result2.status == ExecutionStatus::Rejected)
             && result1.order_id.is_some()
-            && result1.status == ExecutionStatus::Pending {
-
+            && result1.status == ExecutionStatus::Pending
+        {
             if let Some(ref order_id) = result1.order_id {
                 warn!(
                     order_id = %order_id,
                     "Second leg failed, cancelling first leg to prevent one-legged exposure"
                 );
-                match self.client.cancel_order(order_id).await {
+                match self.exchange.cancel_order(order_id).await {
                     Ok(_) => {
                         info!(order_id = %order_id, "Successfully cancelled first leg");
                     }
                     Err(e) => {
                         // Cancel failed - this is critical!
-                        // The first leg may have filled or is being matched
                         error!(
                             order_id = %order_id,
                             error = %e,
-                            "🚨 CRITICAL: Failed to cancel first leg - ORPHANED POSITION!"
+                            "CRITICAL: Failed to cancel first leg - ORPHANED POSITION!"
                         );
                         error!(
                             token_id = %intents[0].token_id,
@@ -309,10 +328,11 @@ impl OrderExecutor {
                             side = ?intents[0].side,
                             price = %intents[0].price,
                             size = %intents[0].size,
-                            "🚨 Orphaned position details - MANUAL REVIEW REQUIRED"
+                            "Orphaned position details - MANUAL REVIEW REQUIRED"
                         );
                         // Trip the circuit breaker to prevent further damage
-                        self.circuit_breaker.record_order_result(Some(ErrorType::Critical));
+                        self.circuit_breaker
+                            .record_order_result(Some(ErrorType::Critical));
                     }
                 }
             }
@@ -321,96 +341,24 @@ impl OrderExecutor {
         vec![result1, result2]
     }
 
-    /// Build an order from params
-    fn build_order(&self, params: &OrderParams) -> Order {
-        let signer_address = self.signer.address();
-
-        OrderBuilder::new(
-            self.maker_address.clone(),
-            signer_address,
-            params.token_id.clone(),
-            params.side,
-        )
-        .with_price_size(params.price, params.size)
-        .with_expiration(params.expiration)
-        .with_fee_rate_bps(params.fee_rate_bps)
-        .build()
+    /// Cancel an order by ID
+    pub async fn cancel_order(&self, order_id: &str) -> Result<(), ExchangeError> {
+        self.exchange.cancel_order(&order_id.to_string()).await
     }
 
-    /// Sign an order (handles neg-risk vs standard)
-    async fn sign_order(
-        &self,
-        order: &Order,
-    ) -> Result<crate::api::types::SignedOrder, crate::error::BotError> {
-        if self.is_neg_risk {
-            self.signer.sign_order_neg_risk(order).await
-        } else {
-            self.signer.sign_order(order).await
-        }
+    /// Check if exchange is healthy
+    pub fn is_exchange_healthy(&self) -> bool {
+        self.exchange.is_healthy()
     }
 
-    /// Process order response into execution result
-    fn process_response(&self, params: &OrderParams, response: OrderResponse) -> ExecutionResult {
-        if response.success {
-            // Parse filled amount if available
-            let filled_size = response
-                .taking_amount
-                .parse::<Decimal>()
-                .unwrap_or(Decimal::ZERO);
+    /// Get maker address
+    pub fn maker_address(&self) -> &str {
+        self.exchange.maker_address()
+    }
 
-            let filled = filled_size > Decimal::ZERO;
-
-            let status = if filled_size >= params.size {
-                ExecutionStatus::FullyFilled
-            } else if filled {
-                ExecutionStatus::PartialFill
-            } else if params.order_type == OrderType::FOK {
-                ExecutionStatus::Cancelled
-            } else {
-                ExecutionStatus::Pending
-            };
-
-            info!(
-                order_id = %response.order_id,
-                status = ?status,
-                filled = %filled_size,
-                requested = %params.size,
-                "Order executed"
-            );
-
-            // Record success for circuit breaker
-            self.circuit_breaker.record_order_result(None);
-
-            ExecutionResult {
-                intent_token_id: params.token_id.clone(),
-                order_id: Some(response.order_id),
-                filled,
-                filled_size,
-                requested_size: params.size,
-                status,
-                error: None,
-            }
-        } else {
-            warn!(
-                error = %response.error_msg,
-                token = %params.token_id,
-                "Order rejected"
-            );
-
-            // Classify error and record for circuit breaker
-            let error_type = ErrorType::from_error_msg(&response.error_msg);
-            self.circuit_breaker.record_order_result(Some(error_type));
-
-            ExecutionResult {
-                intent_token_id: params.token_id.clone(),
-                order_id: None,
-                filled: false,
-                filled_size: Decimal::ZERO,
-                requested_size: params.size,
-                status: ExecutionStatus::Rejected,
-                error: Some(response.error_msg),
-            }
-        }
+    /// Get signer address
+    pub fn signer_address(&self) -> &str {
+        self.exchange.signer_address()
     }
 }
 

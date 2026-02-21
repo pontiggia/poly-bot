@@ -5,8 +5,8 @@
 //! - Orders for a specific market (before market close)
 //! - All orders (emergency shutdown)
 
-use crate::api::ApiClient;
 use crate::api::types::{ConditionId, OrderId};
+use crate::exchange::Exchange;
 use crate::execution::OrderTracker;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,8 +14,8 @@ use tracing::{debug, error, info, warn};
 
 /// Manages order cancellations
 pub struct CancellationManager {
-    /// API client for cancellation requests
-    api_client: Arc<ApiClient>,
+    /// Exchange for cancellation requests
+    exchange: Arc<dyn Exchange>,
 
     /// Order tracker to know which orders exist
     order_tracker: Arc<OrderTracker>,
@@ -27,12 +27,12 @@ pub struct CancellationManager {
 impl CancellationManager {
     /// Create a new cancellation manager
     pub fn new(
-        api_client: Arc<ApiClient>,
+        exchange: Arc<dyn Exchange>,
         order_tracker: Arc<OrderTracker>,
         stale_order_ttl: Duration,
     ) -> Self {
         Self {
-            api_client,
+            exchange,
             order_tracker,
             stale_order_ttl,
         }
@@ -42,7 +42,7 @@ impl CancellationManager {
     pub async fn cancel(&self, order_id: &OrderId) -> Result<(), String> {
         debug!(order_id = %order_id, "Cancelling order");
 
-        match self.api_client.cancel_order(order_id).await {
+        match self.exchange.cancel_order(order_id).await {
             Ok(_) => {
                 self.order_tracker.remove(order_id);
                 info!(order_id = %order_id, "Order cancelled");
@@ -170,9 +170,7 @@ impl CancellationManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    // Note: Full tests would require mocking ApiClient
+    // Note: Full tests would require mocking Exchange trait
     // These are placeholder tests for the structure
 
     #[test]

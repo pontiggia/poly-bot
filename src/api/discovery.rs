@@ -263,19 +263,66 @@ impl MarketDiscovery {
     }
     
     /// Discover 15-minute crypto markets specifically
-    /// 
+    ///
     /// Uses slug-based discovery to find markets like:
     /// - btc-updown-15m-{timestamp}
     /// - eth-updown-15m-{timestamp}
     /// - sol-updown-15m-{timestamp}
     pub async fn discover_crypto_15min(&self) -> Result<Vec<DiscoveredMarket>> {
         info!("Discovering 15-min crypto markets via slug pattern...");
-        
+
         // Use the new slug-based discovery method
         let events = self.gamma_client.discover_crypto_15min_markets().await?;
         info!(event_count = events.len(), "Found crypto events via slug discovery");
-        
+
         let filter = MarketFilter::crypto_15min();
+        self.process_events(events, &filter)
+    }
+
+    /// Discover hourly crypto markets
+    ///
+    /// Uses slug-based discovery to find markets like:
+    /// - bitcoin-up-or-down-january-8-9pm-et
+    /// - ethereum-up-or-down-january-8-9pm-et
+    /// - solana-up-or-down-january-8-9pm-et
+    /// - xrp-up-or-down-january-8-9pm-et
+    pub async fn discover_crypto_hourly(&self) -> Result<Vec<DiscoveredMarket>> {
+        info!("Discovering hourly crypto markets via slug pattern...");
+
+        let events = self.gamma_client.discover_crypto_hourly_markets().await?;
+        info!(event_count = events.len(), "Found hourly crypto events");
+
+        let filter = MarketFilter::default();
+        self.process_events(events, &filter)
+    }
+
+    /// Discover daily crypto markets
+    ///
+    /// Uses slug-based discovery to find markets like:
+    /// - bitcoin-up-or-down-on-january-9
+    /// - ethereum-up-or-down-on-january-9
+    /// - solana-up-or-down-on-january-9
+    /// - xrp-up-or-down-on-january-9
+    pub async fn discover_crypto_daily(&self) -> Result<Vec<DiscoveredMarket>> {
+        info!("Discovering daily crypto markets via slug pattern...");
+
+        let events = self.gamma_client.discover_crypto_daily_markets().await?;
+        info!(event_count = events.len(), "Found daily crypto events");
+
+        let filter = MarketFilter::default();
+        self.process_events(events, &filter)
+    }
+
+    /// Discover all crypto markets (15-min, hourly, and daily)
+    ///
+    /// This is the recommended method for maximum market coverage.
+    pub async fn discover_all_crypto(&self) -> Result<Vec<DiscoveredMarket>> {
+        info!("Discovering all crypto markets (15-min + hourly + daily)...");
+
+        let events = self.gamma_client.discover_all_crypto_markets().await?;
+        info!(event_count = events.len(), "Found total crypto events");
+
+        let filter = MarketFilter::default();
         self.process_events(events, &filter)
     }
     

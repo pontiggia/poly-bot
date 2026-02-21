@@ -109,3 +109,23 @@ impl ErrorType {
         matches!(self, ErrorType::Retryable)
     }
 }
+
+/// Convert from ExchangeError to ErrorType
+impl From<&crate::exchange::ExchangeError> for ErrorType {
+    fn from(e: &crate::exchange::ExchangeError) -> Self {
+        use crate::exchange::ExchangeError;
+        match e {
+            ExchangeError::AuthenticationFailed(_) => ErrorType::Critical,
+            ExchangeError::InvalidParams(_) => ErrorType::Fatal,
+            ExchangeError::InsufficientBalance(_) => ErrorType::Fatal,
+            ExchangeError::Signing(_) => ErrorType::Critical,
+            ExchangeError::Configuration(_) => ErrorType::Critical,
+            ExchangeError::RateLimited(_) => ErrorType::Retryable,
+            ExchangeError::Network(_) => ErrorType::Retryable,
+            ExchangeError::OrderRejected { .. } => ErrorType::Fatal,
+            ExchangeError::OrderNotFound(_) => ErrorType::Expected,
+            ExchangeError::MarketClosed(_) => ErrorType::Expected,
+            ExchangeError::Sdk(_) => ErrorType::Fatal,
+        }
+    }
+}

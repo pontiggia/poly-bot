@@ -7,3 +7,5 @@ iso/
 *.iso
 .env
 .DS_Store
+logs.txt
+prompt.txt
