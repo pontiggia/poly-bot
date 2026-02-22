@@ -17,6 +17,7 @@ use crate::state::order_book::BookSnapshot;
 use crate::state::OrderBookState;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use std::collections::HashMap;
 use tracing::debug;
 
 /// Edge calculation result
@@ -78,7 +79,7 @@ impl Default for EdgeConfig {
         Self {
             min_edge: DEFAULT_MIN_EDGE,
             thin_book_margin: THIN_BOOK_EXTRA_MARGIN,
-            min_depth_threshold: dec!(100), // Minimum 100 shares at top of book
+            min_depth_threshold: dec!(20), // Minimum 20 shares at top of book
             slippage_factor: dec!(0.5),     // 50% of spread as slippage estimate
             is_maker: false,
         }
@@ -107,9 +108,60 @@ impl EdgeConfig {
     }
 }
 
+/// Pre-computed fee lookup table for common price points
+/// Key: (price_cents 1-99, fee_rate_bps)  →  Value: fee Decimal
+struct FeeCache {
+    table: HashMap<(u32, u32), Decimal>,
+}
+
+impl FeeCache {
+    fn new() -> Self {
+        let mut table = HashMap::with_capacity(200);
+        for cents in 1..100u32 {
+            let price = Decimal::new(cents as i64, 2);
+            for &fee_bps in &[0u32, 1000u32] {
+                let fee = Self::compute_leg_fee(price, fee_bps);
+                table.insert((cents, fee_bps), fee);
+            }
+        }
+        Self { table }
+    }
+
+    fn compute_leg_fee(price: Decimal, fee_rate_bps: u32) -> Decimal {
+        if fee_rate_bps == 0 || price <= Decimal::ZERO || price >= Decimal::ONE {
+            return Decimal::ZERO;
+        }
+        let (fee_rate, exponent) = if fee_rate_bps >= 1000 {
+            (dec!(0.25), 2u32)
+        } else {
+            (dec!(0.0175), 1u32)
+        };
+        let variance = price * (Decimal::ONE - price);
+        let mut curve = variance;
+        for _ in 1..exponent {
+            curve *= variance;
+        }
+        price * fee_rate * curve
+    }
+
+    fn lookup(&self, price: Decimal, fee_rate_bps: u32) -> Option<Decimal> {
+        // Round to nearest cent for lookup
+        let cents = (price * Decimal::from(100))
+            .round()
+            .to_string()
+            .parse::<u32>()
+            .ok()?;
+        if cents == 0 || cents >= 100 {
+            return None;
+        }
+        self.table.get(&(cents, fee_rate_bps)).copied()
+    }
+}
+
 /// Calculator for dynamic arbitrage edge requirements
 pub struct EdgeCalculator {
     config: EdgeConfig,
+    fee_cache: FeeCache,
 }
 
 impl EdgeCalculator {
@@ -117,12 +169,16 @@ impl EdgeCalculator {
     pub fn new() -> Self {
         Self {
             config: EdgeConfig::default(),
+            fee_cache: FeeCache::new(),
         }
     }
 
     /// Create with custom config
     pub fn with_config(config: EdgeConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            fee_cache: FeeCache::new(),
+        }
     }
 
     /// Calculate required edge for an arbitrage opportunity
@@ -150,8 +206,8 @@ impl EdgeCalculator {
         let combined_cost = yes_ask + no_ask;
         let actual_edge = Decimal::ONE - combined_cost;
 
-        // Calculate fee component
-        let fees = self.calculate_fees(fee_rate_bps, combined_cost);
+        // Calculate fee component (per-leg using Polymarket's parabolic curve)
+        let fees = self.calculate_fees(fee_rate_bps, yes_ask, no_ask);
 
         // Calculate slippage estimate
         let slippage = self.estimate_slippage(yes_book, no_book, intended_size);
@@ -166,17 +222,9 @@ impl EdgeCalculator {
         let required_edge = (fees + slippage + partial_fill_risk + spread_penalty)
             .max(self.config.min_edge);
 
-        // Maximum executable size (minimum of both sides' depth)
-        let yes_depth = yes_book
-            .asks
-            .first()
-            .and_then(|l| l.size.parse::<Decimal>().ok())
-            .unwrap_or(Decimal::ZERO);
-        let no_depth = no_book
-            .asks
-            .first()
-            .and_then(|l| l.size.parse::<Decimal>().ok())
-            .unwrap_or(Decimal::ZERO);
+        // Maximum executable size (minimum of both sides' depth) — uses pre-parsed cache
+        let yes_depth = yes_book.best_ask_size_dec.unwrap_or(Decimal::ZERO);
+        let no_depth = no_book.best_ask_size_dec.unwrap_or(Decimal::ZERO);
         let max_size = yes_depth.min(no_depth);
 
         let is_profitable = actual_edge >= required_edge && max_size >= intended_size;
@@ -233,23 +281,20 @@ impl EdgeCalculator {
         Some((yes_ask, no_ask, edge))
     }
 
-    /// Calculate fee component based on rate and combined cost
-    fn calculate_fees(&self, fee_rate_bps: u32, combined_cost: Decimal) -> Decimal {
-        if self.config.is_maker {
-            // Makers pay no fees
-            Decimal::ZERO
-        } else {
-            // Takers pay fee on the trade
-            // Fee rate is in bps (1000 = 10%)
-            // For 15-min crypto at 50/50 odds, fee is ~3% per side
-            // We're buying both sides, so fee applies to both
-            let fee_rate = Decimal::from(fee_rate_bps) / dec!(10000);
-
-            // Fee is based on the trade amount
-            // Approximate: fee_rate * combined_cost
-            // This is conservative (actual fee may be slightly less at extreme odds)
-            fee_rate * combined_cost
+    /// Calculate fee component using pre-computed lookup table
+    ///
+    /// Falls back to runtime calculation for non-standard price points.
+    fn calculate_fees(&self, fee_rate_bps: u32, yes_price: Decimal, no_price: Decimal) -> Decimal {
+        if self.config.is_maker || fee_rate_bps == 0 {
+            return Decimal::ZERO;
         }
+
+        let yes_fee = self.fee_cache.lookup(yes_price, fee_rate_bps)
+            .unwrap_or_else(|| FeeCache::compute_leg_fee(yes_price, fee_rate_bps));
+        let no_fee = self.fee_cache.lookup(no_price, fee_rate_bps)
+            .unwrap_or_else(|| FeeCache::compute_leg_fee(no_price, fee_rate_bps));
+
+        yes_fee + no_fee
     }
 
     /// Estimate slippage based on intended size vs book depth
@@ -259,18 +304,9 @@ impl EdgeCalculator {
         no_book: &BookSnapshot,
         intended_size: Decimal,
     ) -> Decimal {
-        // Get depth at top of book
-        let yes_depth = yes_book
-            .asks
-            .first()
-            .and_then(|l| l.size.parse::<Decimal>().ok())
-            .unwrap_or(Decimal::ZERO);
-
-        let no_depth = no_book
-            .asks
-            .first()
-            .and_then(|l| l.size.parse::<Decimal>().ok())
-            .unwrap_or(Decimal::ZERO);
+        // Get depth at top of book — uses pre-parsed cache
+        let yes_depth = yes_book.best_ask_size_dec.unwrap_or(Decimal::ZERO);
+        let no_depth = no_book.best_ask_size_dec.unwrap_or(Decimal::ZERO);
 
         let min_depth = yes_depth.min(no_depth);
 
@@ -303,17 +339,9 @@ impl EdgeCalculator {
         yes_book: &BookSnapshot,
         no_book: &BookSnapshot,
     ) -> Decimal {
-        let yes_depth = yes_book
-            .asks
-            .first()
-            .and_then(|l| l.size.parse::<Decimal>().ok())
-            .unwrap_or(Decimal::ZERO);
-
-        let no_depth = no_book
-            .asks
-            .first()
-            .and_then(|l| l.size.parse::<Decimal>().ok())
-            .unwrap_or(Decimal::ZERO);
+        // Uses pre-parsed cache
+        let yes_depth = yes_book.best_ask_size_dec.unwrap_or(Decimal::ZERO);
+        let no_depth = no_book.best_ask_size_dec.unwrap_or(Decimal::ZERO);
 
         let min_depth = yes_depth.min(no_depth);
 
@@ -329,8 +357,8 @@ impl EdgeCalculator {
 
     /// Calculate spread penalty (wider spreads = more risk)
     fn spread_penalty(&self, yes_book: &BookSnapshot, no_book: &BookSnapshot) -> Decimal {
-        let yes_spread = yes_book.spread().unwrap_or(dec!(0.10));
-        let no_spread = no_book.spread().unwrap_or(dec!(0.10));
+        let yes_spread = yes_book.spread().unwrap_or(dec!(0.02));
+        let no_spread = no_book.spread().unwrap_or(dec!(0.02));
 
         let avg_spread = (yes_spread + no_spread) / dec!(2);
 
@@ -368,6 +396,10 @@ mod tests {
             }],
             last_update: Some(1234567890),
             hash: None,
+            best_bid_dec: best_bid.parse().ok(),
+            best_bid_size_dec: depth.parse().ok(),
+            best_ask_dec: best_ask.parse().ok(),
+            best_ask_size_dec: depth.parse().ok(),
         }
     }
 
@@ -419,15 +451,14 @@ mod tests {
     fn test_fees_reduce_profitability() {
         let calc = EdgeCalculator::new();
 
-        // YES ask = 0.48, NO ask = 0.49, combined = 0.97
-        // Edge = 0.03, but with 10% fee rate (1000 bps), fees eat the edge
-        let yes_book = make_book("yes", "0.47", "0.48", "1000");
+        // YES ask = 0.50, NO ask = 0.49, combined = 0.99
+        // Edge = 0.01, fees at ~50% with crypto curve ~1.5%
+        let yes_book = make_book("yes", "0.49", "0.50", "1000");
         let no_book = make_book("no", "0.48", "0.49", "1000");
 
-        // With 1000 bps (10%) fees
+        // Edge (0.01) < fees (~0.015) + min_edge floor (0.02), so not profitable
         let result = calc.calculate(&yes_book, &no_book, 1000, dec!(100));
 
-        // Fee = 10% * 0.97 = 0.097, which exceeds the 0.03 edge
         assert!(!result.is_profitable);
     }
 

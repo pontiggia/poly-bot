@@ -141,15 +141,8 @@ impl OrderExecutor {
             "Executing order via SDK"
         );
 
-        // Get tick size for proper amount calculation
-        let tick_size = match self.exchange.get_minimum_tick_size(&params.token_id).await {
-            Ok(ts) => ts,
-            Err(e) => {
-                error!(error = %e, "Failed to get tick size");
-                // Default to 0.01 if we can't fetch tick size
-                Decimal::new(1, 2)
-            }
-        };
+        // Use cached tick size (warm from startup). No async/network call.
+        let tick_size = self.exchange.get_minimum_tick_size_cached(&params.token_id);
 
         // Convert policy OrderParams to Exchange params
         let exchange_params = ExchangeOrderParams {
@@ -263,82 +256,186 @@ impl OrderExecutor {
         }
     }
 
-    /// Execute a grouped set of intents with sequential submission and rollback
+    /// Execute a grouped set of intents via batch API submission
     ///
-    /// For grouped orders (like arb legs), we execute sequentially to ensure
-    /// we can cancel the first leg if the second fails, preventing one-legged exposure.
+    /// Uses the batch POST /orders endpoint to submit all legs in a single HTTP call.
+    /// Both orders are built+signed concurrently, then submitted atomically.
+    /// If one leg fails after submission, attempts to unwind the filled leg.
     pub async fn execute_grouped(&self, intents: &[OrderIntent]) -> Vec<ExecutionResult> {
-        // For non-grouped or single orders, use batch execution
+        // For non-grouped or single orders, use individual execution
         if intents.len() != 2 {
             return self.execute_batch(intents).await;
         }
 
-        // Execute first leg
-        let result1 = self.execute(&intents[0]).await;
-
-        // If first leg failed completely (submission error), don't execute second
-        if result1.status == ExecutionStatus::SubmissionFailed
-            || result1.status == ExecutionStatus::CircuitOpen
-        {
-            warn!(
-                token = %intents[0].token_id,
-                error = ?result1.error,
-                "First leg failed, skipping second leg to prevent exposure"
-            );
-            let result2 = ExecutionResult {
-                intent_token_id: intents[1].token_id.clone(),
+        // Check circuit breaker
+        if !self.circuit_breaker.is_trading_allowed() {
+            warn!("Circuit breaker open, rejecting grouped order");
+            return intents.iter().map(|i| ExecutionResult {
+                intent_token_id: i.token_id.clone(),
                 order_id: None,
                 filled: false,
                 filled_size: Decimal::ZERO,
-                requested_size: intents[1].size,
-                status: ExecutionStatus::Cancelled,
-                error: Some("Skipped: first leg failed".to_string()),
-            };
-            return vec![result1, result2];
+                requested_size: i.size,
+                status: ExecutionStatus::CircuitOpen,
+                error: Some("Circuit breaker open".to_string()),
+            }).collect();
         }
 
-        // Execute second leg
-        let result2 = self.execute(&intents[1]).await;
+        // Build ExchangeOrderParams for all legs
+        let params_list: Vec<_> = intents.iter().map(|intent| {
+            let intent_ref = IntentRef::from_intent(intent);
+            let params = self.policy.to_order_params(&intent_ref);
 
-        // If second leg failed but first succeeded with pending order, cancel first
-        if (result2.status == ExecutionStatus::SubmissionFailed
-            || result2.status == ExecutionStatus::Rejected)
-            && result1.order_id.is_some()
-            && result1.status == ExecutionStatus::Pending
-        {
-            if let Some(ref order_id) = result1.order_id {
-                warn!(
-                    order_id = %order_id,
-                    "Second leg failed, cancelling first leg to prevent one-legged exposure"
-                );
-                match self.exchange.cancel_order(order_id).await {
-                    Ok(_) => {
-                        info!(order_id = %order_id, "Successfully cancelled first leg");
-                    }
-                    Err(e) => {
-                        // Cancel failed - this is critical!
-                        error!(
-                            order_id = %order_id,
-                            error = %e,
-                            "CRITICAL: Failed to cancel first leg - ORPHANED POSITION!"
-                        );
-                        error!(
-                            token_id = %intents[0].token_id,
-                            market_id = %intents[0].market_id,
-                            side = ?intents[0].side,
-                            price = %intents[0].price,
-                            size = %intents[0].size,
-                            "Orphaned position details - MANUAL REVIEW REQUIRED"
-                        );
-                        // Trip the circuit breaker to prevent further damage
-                        self.circuit_breaker
-                            .record_order_result(Some(ErrorType::Critical));
+            // Use cached tick size (warm from startup), fallback to 0.01
+            let tick_size = self.exchange.get_minimum_tick_size_cached(&params.token_id);
+
+            ExchangeOrderParams {
+                token_id: params.token_id.clone(),
+                side: params.side,
+                price: params.price,
+                size: params.size,
+                order_type: self.map_order_type(params.order_type),
+                fee_rate_bps: params.fee_rate_bps,
+                minimum_tick_size: tick_size,
+                post_only: params.order_type == OrderType::GTC,
+            }
+        }).collect();
+
+        info!(
+            legs = params_list.len(),
+            "Batch submitting grouped order via POST /orders"
+        );
+
+        // Submit all legs via single batch HTTP call
+        let batch_results = match self.exchange.place_orders_batch(params_list).await {
+            Ok(results) => results,
+            Err(e) => {
+                // Entire batch failed (network error, etc.)
+                error!(error = %e, "Batch submission failed entirely");
+                self.circuit_breaker.record_order_result(Some(ErrorType::from(&e)));
+                return intents.iter().map(|i| ExecutionResult {
+                    intent_token_id: i.token_id.clone(),
+                    order_id: None,
+                    filled: false,
+                    filled_size: Decimal::ZERO,
+                    requested_size: i.size,
+                    status: ExecutionStatus::SubmissionFailed,
+                    error: Some(e.to_string()),
+                }).collect();
+            }
+        };
+
+        // Convert batch results to ExecutionResults
+        let results: Vec<ExecutionResult> = batch_results
+            .into_iter()
+            .zip(intents.iter())
+            .map(|(result, intent)| match result {
+                Ok(order) => {
+                    let filled = order.filled_size > Decimal::ZERO;
+                    let status = if order.filled_size >= intent.size {
+                        ExecutionStatus::FullyFilled
+                    } else if filled {
+                        ExecutionStatus::PartialFill
+                    } else if matches!(intent.urgency, crate::strategy::traits::Urgency::Immediate) {
+                        ExecutionStatus::Cancelled
+                    } else {
+                        ExecutionStatus::Pending
+                    };
+                    self.circuit_breaker.record_order_result(None);
+                    ExecutionResult {
+                        intent_token_id: intent.token_id.clone(),
+                        order_id: Some(order.order_id),
+                        filled,
+                        filled_size: order.filled_size,
+                        requested_size: intent.size,
+                        status,
+                        error: None,
                     }
                 }
+                Err(e) => {
+                    let error_type = ErrorType::from(&e);
+                    self.circuit_breaker.record_order_result(Some(error_type));
+                    let is_fak_killed = matches!(&e, ExchangeError::FakKilled(_));
+                    ExecutionResult {
+                        intent_token_id: intent.token_id.clone(),
+                        order_id: None,
+                        filled: false,
+                        filled_size: Decimal::ZERO,
+                        requested_size: intent.size,
+                        status: if is_fak_killed {
+                            ExecutionStatus::Cancelled
+                        } else if e.is_retryable() {
+                            ExecutionStatus::SubmissionFailed
+                        } else {
+                            ExecutionStatus::Rejected
+                        },
+                        error: Some(e.to_string()),
+                    }
+                }
+            })
+            .collect();
+
+        // Check for partial failure: one leg accepted, other failed.
+        // FAK killed = no liquidity, but if the OTHER leg matched, we have
+        // one-sided exposure that needs unwinding.
+        if results.len() == 2 {
+            let leg1_accepted = results[0].order_id.as_ref().map_or(false, |id| !id.is_empty());
+            let leg2_accepted = results[1].order_id.as_ref().map_or(false, |id| !id.is_empty());
+            let leg1_failed = results[0].status == ExecutionStatus::Rejected
+                || results[0].status == ExecutionStatus::SubmissionFailed
+                || results[0].status == ExecutionStatus::Cancelled;
+            let leg2_failed = results[1].status == ExecutionStatus::Rejected
+                || results[1].status == ExecutionStatus::SubmissionFailed
+                || results[1].status == ExecutionStatus::Cancelled;
+
+            // Unwind whichever leg was accepted if the other failed
+            let unwind_idx = if leg1_accepted && leg2_failed {
+                Some(0)
+            } else if leg2_accepted && leg1_failed {
+                Some(1)
+            } else {
+                None
+            };
+
+            if let Some(idx) = unwind_idx {
+                let other = 1 - idx;
+                warn!(
+                    accepted_token = %intents[idx].token_id,
+                    accepted_order = %results[idx].order_id.as_deref().unwrap_or("?"),
+                    accepted_size = %intents[idx].size,
+                    failed_token = %intents[other].token_id,
+                    failed_error = %results[other].error.as_deref().unwrap_or("?"),
+                    "Partial batch failure - cancelling+unwinding accepted leg"
+                );
+
+                // Cancel the accepted order to prevent further fills.
+                // For FAK orders that already matched (status=Matched), the cancel is a
+                // no-op since the order is already complete. But if it's still live,
+                // this prevents additional fills that deepen the exposure.
+                let order_id = results[idx].order_id.as_deref().unwrap_or("");
+                if !order_id.is_empty() {
+                    match self.cancel_order(order_id).await {
+                        Ok(_) => info!(order_id = %order_id, "Cancelled accepted leg before it could fill more"),
+                        Err(e) => info!(order_id = %order_id, error = %e, "Cancel attempt (order may already be matched)"),
+                    }
+                }
+
+                // NOTE: We do NOT attempt to sell immediately. For FAK orders, the fill
+                // has already happened on-chain but shares may not be in our wallet yet
+                // (settlement is async). Attempting to sell now fails with "not enough
+                // balance / allowance". The one-sided position will be visible in the
+                // ledger and can be unwound manually or by a future redemption cycle.
+                error!(
+                    token = %intents[idx].token_id,
+                    order_id = %order_id,
+                    size = %intents[idx].size,
+                    price = %intents[idx].price,
+                    "ONE-SIDED EXPOSURE: Accepted leg filled but other leg failed. Manual intervention may be needed."
+                );
             }
         }
 
-        vec![result1, result2]
+        results
     }
 
     /// Cancel an order by ID

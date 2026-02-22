@@ -23,6 +23,9 @@ pub const USER_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/use
 /// Live data WebSocket URL (activity feed)
 pub const LIVE_DATA_WS_URL: &str = "wss://ws-live-data.polymarket.com/";
 
+/// Binance WebSocket URL (spot prices)
+pub const BINANCE_WS_URL: &str = "wss://stream.binance.com:9443/ws";
+
 // ============================================================================
 // CHAIN CONFIGURATION
 // ============================================================================
@@ -128,11 +131,11 @@ pub const KILL_SWITCH_FILE: &str = "/tmp/polybot_kill";
 // STRATEGY THRESHOLDS
 // ============================================================================
 
-/// Default minimum edge for taker arb (covers ~3% fees)
-pub const DEFAULT_MIN_EDGE: Decimal = dec!(0.03);
+/// Default minimum edge for taker arb (parabolic fees are ~1-1.5%)
+pub const DEFAULT_MIN_EDGE: Decimal = dec!(0.02);
 
 /// Extra margin for thin order books
-pub const THIN_BOOK_EXTRA_MARGIN: Decimal = dec!(0.01);
+pub const THIN_BOOK_EXTRA_MARGIN: Decimal = dec!(0.005);
 
 /// Minimum edge for maker arb (no fees)
 /// Phase 9 live test: 1% edge for safer execution

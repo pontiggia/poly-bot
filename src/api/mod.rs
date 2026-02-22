@@ -10,10 +10,12 @@
 
 pub mod discovery;
 pub mod gamma;
+pub mod market_manager;
 pub mod types;
 
 pub use discovery::{DiscoveredMarket, MarketDiscovery, MarketFilter, OutcomeType};
 pub use gamma::{GammaClient, GammaEvent, GammaMarket};
+pub use market_manager::MarketManager;
 
 // Re-export core types
 pub use types::{

@@ -74,8 +74,14 @@ pub struct MarketPair {
     /// First outcome label (Yes, Up, etc.)
     pub first_outcome_label: String,
     
-    /// Second outcome label (No, Down, etc.)  
+    /// Second outcome label (No, Down, etc.)
     pub second_outcome_label: String,
+
+    /// Event slug from Gamma API (e.g., "btc-updown-5m-1740000000")
+    pub event_slug: String,
+
+    /// Unix timestamp when this market closes (if known)
+    pub close_time: Option<i64>,
 }
 
 impl MarketPair {
@@ -97,9 +103,11 @@ impl MarketPair {
             outcome_type: BinaryOutcomeType::YesNo,
             first_outcome_label: "Yes".to_string(),
             second_outcome_label: "No".to_string(),
+            event_slug: String::new(),
+            close_time: None,
         }
     }
-    
+
     /// Create a new Up/Down market pair (for 15-min crypto)
     pub fn new_up_down(
         condition_id: ConditionId,
@@ -118,6 +126,8 @@ impl MarketPair {
             outcome_type: BinaryOutcomeType::UpDown,
             first_outcome_label: "Up".to_string(),
             second_outcome_label: "Down".to_string(),
+            event_slug: String::new(),
+            close_time: None,
         }
     }
     
@@ -148,6 +158,8 @@ impl MarketPair {
             outcome_type,
             first_outcome_label: first,
             second_outcome_label: second,
+            event_slug: String::new(),
+            close_time: None,
         }
     }
     
@@ -188,6 +200,18 @@ impl MarketPair {
     /// Create with min order size
     pub fn with_min_order_size(mut self, min_order_size: Decimal) -> Self {
         self.min_order_size = min_order_size;
+        self
+    }
+
+    /// Set event slug
+    pub fn with_event_slug(mut self, slug: impl Into<String>) -> Self {
+        self.event_slug = slug.into();
+        self
+    }
+
+    /// Set close time (unix timestamp)
+    pub fn with_close_time(mut self, close_time: i64) -> Self {
+        self.close_time = Some(close_time);
         self
     }
 

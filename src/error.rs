@@ -123,6 +123,7 @@ impl From<&crate::exchange::ExchangeError> for ErrorType {
             ExchangeError::RateLimited(_) => ErrorType::Retryable,
             ExchangeError::Network(_) => ErrorType::Retryable,
             ExchangeError::OrderRejected { .. } => ErrorType::Fatal,
+            ExchangeError::FakKilled(_) => ErrorType::Expected,
             ExchangeError::OrderNotFound(_) => ErrorType::Expected,
             ExchangeError::MarketClosed(_) => ErrorType::Expected,
             ExchangeError::Sdk(_) => ErrorType::Fatal,

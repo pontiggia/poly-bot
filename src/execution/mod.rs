@@ -20,7 +20,9 @@
 pub mod cancellation;
 pub mod executor;
 pub mod order_tracker;
+pub mod pair_manager;
 pub mod policy;
+pub mod redeemer;
 pub mod state_machine;
 
 // Re-export state machine types
@@ -41,5 +43,11 @@ pub use executor::{ExecutionResult, ExecutionStatus, OrderExecutor};
 // Re-export order tracker types
 pub use order_tracker::{OrderTracker, TrackedOrder};
 
+// Re-export pair manager types
+pub use pair_manager::{PairManager, PairExecution, PairState, Leg, LegOutcome};
+
 // Re-export cancellation types
 pub use cancellation::CancellationManager;
+
+// Re-export redeemer
+pub use redeemer::PositionRedeemer;

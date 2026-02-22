@@ -16,16 +16,17 @@
 //! - Async kill signal for shutdown
 
 use crate::config::{Config, OperatingMode};
-use crate::exchange::{Exchange, SdkExchange};
+use crate::exchange::{Exchange, ExchangeError, SdkExchange};
 use crate::execution::{DualPolicy, ExecutionResult, ExecutionStatus, OrderExecutor, OrderTracker, TrackedOrder};
 use crate::kill_switch::KillSwitch;
 use crate::ledger::Ledger;
 use crate::risk::CircuitBreaker;
-use crate::state::OrderBookState;
+use crate::state::{OrderBookState, PriceHistory, SpotPriceState};
 use crate::strategy::{
-    MarketPair, MarketPairRegistry, MathArbStrategy, OrderIntent, StrategyContext, StrategyRouter,
+    MarketPair, MarketPairRegistry, MathArbStrategy, MomentumStrategy, OrderIntent,
+    StrategyContext, StrategyRouter,
 };
-use crate::websocket::{MarketMessage, MarketWebSocket, UserMessage, UserWebSocket};
+use crate::websocket::{BinanceWebSocket, MarketMessage, MarketWebSocket, UserMessage, UserWebSocket};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -50,6 +51,8 @@ pub struct Bot {
     strategy_router: Arc<StrategyRouter>,
     /// Circuit breaker for risk management
     circuit_breaker: Arc<CircuitBreaker>,
+    /// Exchange for direct operations (balance, cancel all)
+    exchange: Arc<dyn Exchange>,
     /// Order executor for submitting trades
     executor: Arc<OrderExecutor>,
     /// Order tracker for outstanding GTC orders
@@ -76,6 +79,12 @@ pub struct Bot {
     total_fills: u64,
     /// Seen trade IDs (for deduplication)
     seen_trade_ids: HashSet<String>,
+    /// Subscription sender for dynamic WS market subscriptions
+    ws_subscription_tx: mpsc::UnboundedSender<Vec<String>>,
+    /// Spot price state from Binance (BTC/ETH/SOL/XRP)
+    spot_prices: Arc<SpotPriceState>,
+    /// Price history for momentum calculation
+    price_history: Arc<PriceHistory>,
 }
 
 impl Bot {
@@ -94,7 +103,6 @@ impl Bot {
     ) -> Self {
         let config = Arc::new(config);
         let order_book_state = Arc::new(OrderBookState::new());
-        let ledger = Arc::new(Ledger::new(config.max_bet_usd));
 
         // Set up market pair registry
         let market_registry = Arc::new(MarketPairRegistry::new());
@@ -121,6 +129,17 @@ impl Bot {
             warn!("Failed to register MathArbStrategy: {}", e);
         }
 
+        // MomentumSniper disabled — risk/reward unfavorable at current config
+        // (need 93% accuracy at buy_price=0.93, signal only ~55-65%)
+        // TODO: re-enable with lower buy_price and stronger signal threshold
+        // let momentum = Arc::new(MomentumStrategy::new(
+        //     market_registry.clone(),
+        //     crate::strategy::MomentumConfig::default_test(),
+        // ));
+        // if let Err(e) = strategy_router.register(momentum) {
+        //     warn!("Failed to register MomentumStrategy: {}", e);
+        // }
+
         // Set up circuit breaker for risk management
         let circuit_breaker = Arc::new(CircuitBreaker::new());
 
@@ -134,11 +153,29 @@ impl Bot {
         .await
         .expect("Failed to create SDK exchange");
 
-        let exchange = Arc::new(exchange);
+        // Pre-warm SDK caches: tick_size, fee_rate, neg_risk for all tokens.
+        // Eliminates 3 HTTP calls per first-time order build+sign.
+        exchange.warm_caches(&token_ids).await;
+
+        let exchange: Arc<dyn Exchange> = Arc::new(exchange);
 
         // Log addresses
         info!("EOA Signer address: {}", exchange.signer_address());
         info!("Proxy wallet (funder): {}", exchange.maker_address());
+
+        // Fetch actual USDC balance from exchange for accurate ledger initialization
+        let initial_balance = match exchange.get_balance().await {
+            Ok(balance) => {
+                info!("Fetched USDC balance from exchange: ${}", balance);
+                balance
+            }
+            Err(e) => {
+                warn!("Failed to fetch balance from exchange: {}. Using config max_bet as fallback.", e);
+                config.max_bet_usd
+            }
+        };
+        // Re-create ledger with actual balance
+        let ledger = Arc::new(Ledger::new(initial_balance));
 
         // Use DualPolicy: Taker for Immediate/Normal, Maker for Passive
         // Maker orders post inside spread for better fill probability
@@ -162,9 +199,9 @@ impl Bot {
         // Set up order tracker for outstanding orders
         let order_tracker = Arc::new(OrderTracker::new());
 
-        // Set up Market WebSocket for order book data
+        // Set up Market WebSocket for order book data (with dynamic subscription support)
         let (market_ws_tx, market_ws_rx) = mpsc::unbounded_channel();
-        let market_ws = Arc::new(MarketWebSocket::new(token_ids.clone(), market_ws_tx));
+        let (market_ws, ws_subscription_tx) = MarketWebSocket::new(token_ids.clone(), market_ws_tx);
 
         // Spawn Market WebSocket task
         let market_ws_clone = market_ws.clone();
@@ -205,6 +242,18 @@ impl Bot {
             user_ws_clone.run().await;
         });
 
+        // Set up Binance WebSocket for spot prices
+        let spot_prices = Arc::new(SpotPriceState::new());
+        let price_history = Arc::new(PriceHistory::new(600)); // 10 min at ~1/sec
+        let binance_ws = Arc::new(BinanceWebSocket::new(
+            spot_prices.clone(),
+            price_history.clone(),
+        ));
+        let binance_ws_clone = binance_ws.clone();
+        tokio::spawn(async move {
+            binance_ws_clone.run().await;
+        });
+
         info!(
             "Bot initialized: {} token(s), {} market pair(s), {} strateg(ies)",
             token_ids.len(),
@@ -220,6 +269,7 @@ impl Bot {
             market_registry,
             strategy_router,
             circuit_breaker,
+            exchange,
             executor,
             order_tracker,
             market_ws_rx,
@@ -233,6 +283,9 @@ impl Bot {
             total_executions: 0,
             total_fills: 0,
             seen_trade_ids: HashSet::new(),
+            ws_subscription_tx,
+            spot_prices,
+            price_history,
         }
     }
 
@@ -249,9 +302,15 @@ impl Bot {
 
         // Periodic tick for strategy logic (100ms)
         let mut tick_interval = interval(Duration::from_millis(100));
-        
+
         // Heartbeat for logging (10s)
         let mut heartbeat_interval = interval(Duration::from_secs(10));
+
+        // Stale order cleanup (30s)
+        let mut stale_cleanup_interval = interval(Duration::from_secs(30));
+
+        // Balance reconciliation (60s)
+        let mut balance_reconcile_interval = interval(Duration::from_secs(60));
 
         loop {
             tokio::select! {
@@ -271,6 +330,16 @@ impl Bot {
                 // Strategy tick - 100ms periodic
                 _ = tick_interval.tick() => {
                     self.handle_tick().await;
+                }
+
+                // Stale order cleanup - 30s periodic
+                _ = stale_cleanup_interval.tick() => {
+                    self.cleanup_stale_orders().await;
+                }
+
+                // Balance reconciliation - 60s periodic
+                _ = balance_reconcile_interval.tick() => {
+                    self.reconcile_balance().await;
                 }
 
                 // Heartbeat - 10s periodic logging
@@ -457,7 +526,8 @@ impl Bot {
     /// Handle periodic tick (100ms)
     async fn handle_tick(&mut self) {
         // Create strategy context
-        let ctx = StrategyContext::new(&self.order_book_state, &self.ledger);
+        let ctx = StrategyContext::new(&self.order_book_state, &self.ledger)
+            .with_spot(&self.spot_prices, &self.price_history);
 
         // Run strategy on_tick() callbacks
         let intents = self.strategy_router.on_tick(&ctx);
@@ -482,8 +552,21 @@ impl Bot {
         
         let active_orders = self.order_tracker.active_count();
         
+        // Build spot price summary
+        let spot_info = if !self.spot_prices.is_empty() {
+            let mut parts = Vec::new();
+            for asset in &["btc", "eth", "sol", "xrp"] {
+                if let Some(p) = self.spot_prices.price(asset) {
+                    parts.push(format!("{}=${}", asset.to_uppercase(), p));
+                }
+            }
+            parts.join(" ")
+        } else {
+            "no spot data".to_string()
+        };
+
         info!(
-            "Heartbeat [{}]: {} markets | {} msgs | {:.1} msg/s | {} intents | {} execs | {} fills | {} active | CB: {}",
+            "Heartbeat [{}]: {} markets | {} msgs | {:.1} msg/s | {} intents | {} execs | {} fills | {} active | CB: {} | {}",
             mode_str,
             self.order_book_state.num_markets(),
             self.total_messages,
@@ -492,7 +575,8 @@ impl Bot {
             self.total_executions,
             self.total_fills,
             active_orders,
-            circuit_status
+            circuit_status,
+            spot_info
         );
         // Reset counter for next interval
         self.total_messages = 0;
@@ -537,8 +621,11 @@ impl Bot {
 
     /// Route a book update to strategies and process intents
     fn route_book_update(&mut self, market_id: &str, token_id: &str) {
+        let strategy_start = Instant::now();
+
         // Create strategy context
-        let ctx = StrategyContext::new(&self.order_book_state, &self.ledger);
+        let ctx = StrategyContext::new(&self.order_book_state, &self.ledger)
+            .with_spot(&self.spot_prices, &self.price_history);
 
         // Route to strategies
         let intents = self.strategy_router.on_book_update(
@@ -549,6 +636,12 @@ impl Bot {
 
         // Process any generated intents
         if !intents.is_empty() {
+            let strategy_us = strategy_start.elapsed().as_micros();
+            info!(
+                strategy_eval_us = strategy_us,
+                intents = intents.len(),
+                "[PERF] Strategy evaluation"
+            );
             self.process_intents(intents);
         }
     }
@@ -622,6 +715,8 @@ impl Bot {
         order_tracker: Arc<OrderTracker>,
         intents: Vec<OrderIntent>,
     ) {
+        let exec_start = Instant::now();
+
         // Calculate total USDC required for all orders
         let total_cost: rust_decimal::Decimal = intents
             .iter()
@@ -633,27 +728,24 @@ impl Bot {
             intents.len(),
             total_cost
         );
-        
-        // Check if intents are grouped (arb legs) and passive (maker orders)
+
+        // Check if intents are grouped (arb legs)
         let has_group = intents.first().and_then(|i| i.group_id.as_ref()).is_some();
-        let is_passive = intents.first()
-            .map(|i| i.urgency == crate::strategy::Urgency::Passive)
-            .unwrap_or(false);
-        
-        let results = if has_group && is_passive {
-            // PARALLEL execution for maker arb legs
-            // Both orders go to the book simultaneously, minimizing time window
-            // The min order value check in strategy prevents API rejections
-            executor.execute_batch(&intents).await
-        } else if has_group {
-            // SEQUENTIAL execution for taker arb legs (FOK orders)
-            // Sequential allows cancellation if second leg fails
+
+        let results = if has_group {
             executor.execute_grouped(&intents).await
         } else {
-            // Execute as batch (concurrent but independent)
             executor.execute_batch(&intents).await
         };
-        
+
+        let exec_ms = exec_start.elapsed().as_millis();
+        info!(
+            exec_total_ms = exec_ms,
+            orders = results.len(),
+            grouped = has_group,
+            "[PERF] Order execution complete"
+        );
+
         // Process results
         for (intent, result) in intents.iter().zip(results.iter()) {
             Self::handle_execution_result(intent, result, &circuit_breaker, &order_tracker);
@@ -735,7 +827,7 @@ impl Bot {
             }
             ExecutionStatus::Cancelled => {
                 info!(
-                    "🚫 CANCELLED: {} {} @ {} (FOK not filled)",
+                    "🚫 KILLED: {} {} @ {} (no matching liquidity)",
                     format!("{:?}", intent.side),
                     &intent.token_id[..intent.token_id.len().min(16)],
                     intent.price,
@@ -804,12 +896,79 @@ impl Bot {
         }
     }
 
+    /// Cancel stale orders that have been pending too long
+    async fn cleanup_stale_orders(&self) {
+        let stale = self.order_tracker.stale_orders(std::time::Duration::from_secs(60));
+        if stale.is_empty() {
+            return;
+        }
+
+        info!("Cleaning up {} stale order(s)", stale.len());
+        for order_id in &stale {
+            match self.exchange.cancel_order(order_id).await {
+                Ok(_) => {
+                    self.order_tracker.remove(order_id);
+                    info!("Cancelled stale order {}", &order_id[..order_id.len().min(16)]);
+                }
+                Err(ExchangeError::OrderNotFound(_)) => {
+                    // Already filled or cancelled
+                    self.order_tracker.remove(order_id);
+                    debug!("Stale order {} already gone", &order_id[..order_id.len().min(16)]);
+                }
+                Err(e) => {
+                    warn!("Failed to cancel stale order {}: {}", &order_id[..order_id.len().min(16)], e);
+                }
+            }
+        }
+    }
+
+    /// Reconcile ledger balance with exchange REST balance
+    async fn reconcile_balance(&self) {
+        let exchange_balance = match self.exchange.get_balance().await {
+            Ok(b) => b,
+            Err(e) => {
+                debug!("Balance reconciliation skipped: {}", e);
+                return;
+            }
+        };
+
+        let ledger_balance = self.ledger.cash_snapshot().total;
+        let drift = (exchange_balance - ledger_balance).abs();
+
+        if drift > rust_decimal_macros::dec!(1) {
+            warn!(
+                "Balance drift detected: exchange=${} vs ledger=${} (drift=${})",
+                exchange_balance, ledger_balance, drift
+            );
+        } else {
+            debug!(
+                "Balance reconciled: exchange=${} ledger=${}",
+                exchange_balance, ledger_balance
+            );
+        }
+    }
+
     /// Graceful shutdown
     async fn shutdown(&mut self) {
         info!("Bot shutting down...");
 
+        // Cancel all outstanding orders on the exchange
+        let active_count = self.order_tracker.active_count();
+        if active_count > 0 {
+            info!("Cancelling {} outstanding order(s) on shutdown...", active_count);
+            match self.exchange.cancel_all_orders().await {
+                Ok(cancelled) => {
+                    info!("Cancelled {} order(s) on shutdown", cancelled.len());
+                }
+                Err(e) => {
+                    error!("Failed to cancel orders on shutdown: {}", e);
+                }
+            }
+        }
+
         // Get shutdown intents from strategies
-        let ctx = StrategyContext::new(&self.order_book_state, &self.ledger);
+        let ctx = StrategyContext::new(&self.order_book_state, &self.ledger)
+            .with_spot(&self.spot_prices, &self.price_history);
         let shutdown_intents = self.strategy_router.on_shutdown(&ctx);
         if !shutdown_intents.is_empty() {
             info!("Processing {} shutdown intent(s)", shutdown_intents.len());
@@ -857,5 +1016,15 @@ impl Bot {
     /// Get reference to strategy router
     pub fn strategy_router(&self) -> &Arc<StrategyRouter> {
         &self.strategy_router
+    }
+
+    /// Get the WS subscription sender for dynamic market subscriptions
+    pub fn ws_subscription_tx(&self) -> &mpsc::UnboundedSender<Vec<String>> {
+        &self.ws_subscription_tx
+    }
+
+    /// Get reference to kill switch
+    pub fn kill_switch(&self) -> &Arc<KillSwitch> {
+        &self.kill_switch
     }
 }

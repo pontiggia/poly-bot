@@ -1,11 +1,10 @@
 use std::env;
 use std::str::FromStr as _;
 
+use alloy::primitives::U256;
 use alloy::providers::ProviderBuilder;
 use alloy::signers::local::LocalSigner;
-use alloy::signers::Signer as _;
 use alloy::sol;
-use alloy::primitives::U256;
 use polymarket_client_sdk::{POLYGON, contract_config};
 
 const RPC_URL: &str = "https://polygon-rpc.com";
@@ -28,31 +27,23 @@ async fn main() -> anyhow::Result<()> {
         .expect("Provide TOKEN_ID as first arg or TOKEN_ID env var");
 
     // Use private key from env if present so we can default owner to that EOA
-    let private_key = env::var("POLYMARKET_PRIVATE_KEY").ok();
+    let private_key = env::var("POLYMARKET_PRIVATE_KEY")
+        .expect("Need POLYMARKET_PRIVATE_KEY env var");
+    let signer = LocalSigner::from_str(&private_key)?;
+    let owner = signer.address();
 
-    let provider = if let Some(pk) = private_key.clone() {
-        let signer = LocalSigner::from_str(&pk)?; // no chain id needed for view calls
-        ProviderBuilder::new().wallet(signer.clone()).connect(RPC_URL).await?
-    } else {
-        ProviderBuilder::new().connect(RPC_URL).await?
-    };
+    let provider = ProviderBuilder::new()
+        .wallet(signer)
+        .connect(RPC_URL)
+        .await?;
 
     let chain = POLYGON;
-    let cfg = contract_config(chain, false)?;
+    let cfg = contract_config(chain, false).expect("contract_config for Polygon");
     let ctf_addr = cfg.conditional_tokens;
     let ctf = IERC1155::new(ctf_addr, provider.clone());
 
-    // owner address: use OWNER env var if set, otherwise use signer address from env private key
-    let owner: alloy::types::Address = if let Some(owner_str) = env::var("OWNER_ADDRESS").ok() {
-        owner_str.parse()?
-    } else if let Some(pk) = private_key {
-        let signer = LocalSigner::from_str(&pk)?;
-        signer.address()
-    } else {
-        panic!("Provide OWNER_ADDRESS env var or POLYMARKET_PRIVATE_KEY to infer owner");
-    };
-
-    let token_u256 = U256::from_dec_str(&token_id_str)?;
+    let token_u256 = U256::from_str_radix(&token_id_str, 10)
+        .expect("Invalid token ID — must be a decimal integer");
 
     let balance = ctf.balanceOf(owner, token_u256).call().await?;
 

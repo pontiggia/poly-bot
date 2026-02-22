@@ -145,13 +145,46 @@ pub struct DiscoveredMarket {
 impl DiscoveredMarket {
     /// Convert to MarketPair for the strategy layer
     pub fn to_market_pair(&self) -> MarketPair {
-        MarketPair::new(
+        let mut pair = MarketPair::new(
             self.condition_id.clone(),
             self.first_token_id.clone(),
             self.second_token_id.clone(),
         )
         .with_fee_rate(self.fee_rate_bps)
         .with_description(&self.question)
+        .with_event_slug(&self.event_slug);
+
+        // Compute close_time from event slug if it contains a timestamp
+        if let Some(close_time) = Self::parse_close_time(&self.event_slug) {
+            pair = pair.with_close_time(close_time);
+        }
+
+        pair
+    }
+
+    /// Parse close time from event slug
+    ///
+    /// Slug formats:
+    /// - `btc-updown-5m-{timestamp}` → timestamp + 300
+    /// - `btc-updown-15m-{timestamp}` → timestamp + 900
+    fn parse_close_time(slug: &str) -> Option<i64> {
+        let parts: Vec<&str> = slug.rsplitn(2, '-').collect();
+        if parts.len() != 2 {
+            return None;
+        }
+
+        let timestamp: i64 = parts[0].parse().ok()?;
+        let prefix = parts[1];
+
+        let duration = if prefix.ends_with("5m") {
+            300
+        } else if prefix.ends_with("15m") {
+            900
+        } else {
+            return None;
+        };
+
+        Some(timestamp + duration)
     }
 }
 

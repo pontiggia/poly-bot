@@ -40,6 +40,35 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+/// Snap `size` down so that `size * price` has at most 2 decimal places for
+/// both legs. Polymarket API rejects BUY orders where maker_amount (the USDC
+/// cost = size * price) has more than 2 decimal places.
+///
+/// Strategy: truncate size to whole shares. For any price with ≤2dp,
+/// `whole_size * price` is guaranteed to have ≤2dp. This is conservative
+/// (loses fractional share precision) but always correct.
+fn snap_size_to_notional_precision(size: Decimal, price_a: Decimal, price_b: Decimal) -> Decimal {
+    use rust_decimal::RoundingStrategy::ToZero;
+
+    // Start with whole shares — guaranteed safe for any 2dp price
+    let mut snapped = size.trunc();
+
+    // Try to recover the fractional part if it's safe.
+    // For 1dp prices (e.g. 0.7), size can have 1dp (e.g. 10.3 * 0.7 = 7.21 ≤2dp)
+    // For 2dp prices (e.g. 0.42), only whole sizes are safe.
+    let price_a_scale = price_a.normalize().scale();
+    let price_b_scale = price_b.normalize().scale();
+    let max_price_scale = price_a_scale.max(price_b_scale);
+
+    // size can have at most (2 - max_price_scale) decimal places
+    if max_price_scale < 2 {
+        let size_dp = 2 - max_price_scale;
+        snapped = size.round_dp_with_strategy(size_dp, ToZero);
+    }
+
+    snapped
+}
+
 /// Configuration for the math arb strategy
 #[derive(Debug, Clone)]
 pub struct MathArbConfig {
@@ -60,6 +89,16 @@ pub struct MathArbConfig {
 
     /// Whether to use maker execution (lower edge, GTC orders)
     pub use_maker_execution: bool,
+
+    /// Minimum liquidity depth multiplier relative to our trade size.
+    /// E.g., 3.0 means both sides must have 3x our order size in resting
+    /// ask liquidity (within `depth_price_range` of best ask) before we fire.
+    /// This ensures enough buffer survives latency-induced sniping.
+    pub min_depth_multiplier: Decimal,
+
+    /// Price range (in cents) around best ask to count towards depth.
+    /// E.g., 0.02 means we count ask liquidity within 2 cents of best ask.
+    pub depth_price_range: Decimal,
 }
 
 impl Default for MathArbConfig {
@@ -71,6 +110,8 @@ impl Default for MathArbConfig {
             max_total_exposure: dec!(2000), // Max $2000 total
             cooldown_ms: 1000,           // 1 second cooldown
             use_maker_execution: false,
+            min_depth_multiplier: dec!(3), // Need 3x our size in resting liquidity
+            depth_price_range: dec!(0.02), // Count liquidity within 2 cents of best ask
         }
     }
 }
@@ -86,26 +127,31 @@ impl MathArbConfig {
         Self {
             min_edge: dec!(0.01), // 1 cent minimum (no fees)
             use_maker_execution: true,
+            min_depth_multiplier: dec!(5), // Maker needs even more buffer (orders sit on book)
             ..Self::default()
         }
     }
 
-    /// Config for Phase 9 live testing with $100 capital
+    /// Config for live testing with $100 capital
     ///
     /// Settings:
-    /// - 1% min edge for safer arbitrage
+    /// - 0.3% min edge (FAK execution, no maker fee advantage)
     /// - Position sizes $5-$15 per leg to allow dynamic sizing for $1 min order value
     /// - $50 max exposure (aggressive risk tolerance)
-    /// - Maker execution for zero fees + rebates
+    /// - FAK execution to eliminate legging risk (post-500ms delay removal)
     /// - Share count auto-adjusts to meet $1.00 minimum order value
+    /// - 3x depth multiplier: both sides must have 3x our order size in resting
+    ///   ask liquidity before we fire. Prevents one-sided exposure from latency.
     pub fn live_test() -> Self {
         Self {
-            min_edge: dec!(0.01),         // 1% - safer edge requirement
+            min_edge: dec!(0.003),        // 0.3% - FAK execution, no maker fee advantage
             max_position_size: dec!(15),  // Allow up to 15 shares for low-priced legs
             min_position_size: dec!(5),   // $5 per leg min (market min is 5)
             max_total_exposure: dec!(50), // $50 max exposure
-            cooldown_ms: 3000,            // 3 second cooldown
-            use_maker_execution: true,    // Maker mode for zero fees
+            cooldown_ms: 2000,            // 2 second cooldown
+            use_maker_execution: false,   // FAK mode - eliminates legging risk
+            min_depth_multiplier: dec!(3), // Need 3x our size to survive latency sniping
+            depth_price_range: dec!(0.02), // Count liquidity within 2 cents of best ask
         }
     }
 }
@@ -147,6 +193,9 @@ pub struct MathArbStrategy {
 
     /// Count of opportunities that passed quick check
     quick_check_passes: AtomicU64,
+
+    /// Last near-miss log time per market (rate-limit log spam)
+    last_near_miss_log: dashmap::DashMap<ConditionId, Instant>,
 }
 
 impl MathArbStrategy {
@@ -175,6 +224,7 @@ impl MathArbStrategy {
             best_edge_seen: std::sync::RwLock::new(Decimal::ZERO),
             near_misses: AtomicU64::new(0),
             quick_check_passes: AtomicU64::new(0),
+            last_near_miss_log: dashmap::DashMap::new(),
         }
     }
 
@@ -253,6 +303,23 @@ impl MathArbStrategy {
             return None;
         }
 
+        // Skip stale books (no update in last 30 seconds) — prices are unreliable
+        let now_ts = ctx.utc_now.timestamp();
+        let max_stale_secs = 30;
+        for (label, book) in [("YES", &yes_book), ("NO", &no_book)] {
+            if let Some(last_update) = book.last_update {
+                if now_ts - last_update > max_stale_secs {
+                    debug!(
+                        market = %pair.condition_id,
+                        side = label,
+                        age_secs = now_ts - last_update,
+                        "Skipping arb: book is stale"
+                    );
+                    return None;
+                }
+            }
+        }
+
         // Quick check first
         let (yes_ask, no_ask, edge) =
             self.edge_calculator
@@ -270,6 +337,29 @@ impl MathArbStrategy {
             "Arb opportunity detected (quick check)"
         );
 
+        // Liquidity depth filter: require N× our trade size in resting ask liquidity
+        // on BOTH sides. This ensures enough buffer survives latency — even if a
+        // faster bot snipes some liquidity between our detection and FAK arrival,
+        // there's still enough left for both legs to fill.
+        let yes_total_depth = yes_book.ask_depth_within(self.config.depth_price_range);
+        let no_total_depth = no_book.ask_depth_within(self.config.depth_price_range);
+        let min_total_depth = yes_total_depth.min(no_total_depth);
+
+        // We need at least (min_position_size * depth_multiplier) in resting liquidity
+        let required_depth = self.config.min_position_size * self.config.min_depth_multiplier;
+
+        if min_total_depth < required_depth {
+            debug!(
+                market = %pair.condition_id,
+                yes_depth = %yes_total_depth,
+                no_depth = %no_total_depth,
+                required_depth = %required_depth,
+                multiplier = %self.config.min_depth_multiplier,
+                "Skipping arb: insufficient liquidity depth for safe FAK execution"
+            );
+            return None;
+        }
+
         // Full edge calculation
         let calc = self.edge_calculator.calculate(
             &yes_book,
@@ -282,14 +372,22 @@ impl MathArbStrategy {
             // Track near-miss: edge > 0 but below required threshold
             if calc.actual_edge > Decimal::ZERO && calc.actual_edge < calc.required_edge {
                 self.near_misses.fetch_add(1, Ordering::Relaxed);
-                info!(
-                    market = %pair.condition_id,
-                    actual_edge = %calc.actual_edge,
-                    required_edge = %calc.required_edge,
-                    yes_ask = %yes_ask,
-                    no_ask = %no_ask,
-                    "📊 Near-miss: edge positive but below threshold"
-                );
+                // Rate-limit near-miss logs: max once per 30s per market
+                let should_log = self.last_near_miss_log
+                    .get(&pair.condition_id)
+                    .map(|t| t.elapsed().as_secs() >= 30)
+                    .unwrap_or(true);
+                if should_log {
+                    self.last_near_miss_log.insert(pair.condition_id.clone(), Instant::now());
+                    info!(
+                        market = %pair.condition_id,
+                        actual_edge = %calc.actual_edge,
+                        required_edge = %calc.required_edge,
+                        yes_ask = %yes_ask,
+                        no_ask = %no_ask,
+                        "Near-miss: edge positive but below threshold"
+                    );
+                }
             }
             debug!(
                 market = %pair.condition_id,
@@ -331,11 +429,21 @@ impl MathArbStrategy {
             let current = *self.current_exposure.read().unwrap();
             (self.config.max_total_exposure - current) / dec!(2) // Divided by 2 since we're buying both sides
         };
+        // Cap trade size to 1/multiplier of available depth so we leave buffer
+        // for latency. E.g., with 3x multiplier, we use at most 1/3 of resting liquidity.
+        let max_by_depth = min_total_depth / self.config.min_depth_multiplier;
 
-        let trade_size = max_by_book
+        let trade_size_raw = max_by_book
             .min(max_by_config)
             .min(max_by_exposure)
-            .max(Decimal::ZERO);
+            .min(max_by_depth)
+            .max(Decimal::ZERO)
+            .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero);
+
+        // Polymarket API requires maker_amount (= size * price for BUY) to have
+        // at most 2 decimal places. Adjust size down so that both legs' notional
+        // values fit within this constraint.
+        let trade_size = snap_size_to_notional_precision(trade_size_raw, yes_price, no_price);
 
         // Check if trade size meets the effective minimum (includes $1 order value requirement)
         if trade_size < effective_min_size {
@@ -369,20 +477,19 @@ impl MathArbStrategy {
             no_price = %no_price,
             edge_cents = %((calc.actual_edge * dec!(100)).round()),
             trade_size = %trade_size,
-            min_shares_required = %min_shares_for_order_value,
-            maker_mode = %self.config.use_maker_execution,
-            "🎯 Arb opportunity! Executing..."
+            yes_depth = %yes_total_depth,
+            no_depth = %no_total_depth,
+            depth_ratio = %(min_total_depth / trade_size),
+            "Arb opportunity! Executing..."
         );
 
         // Generate group ID for linked orders
         let group_id = format!("arb-{}", Uuid::new_v4());
 
-        // Determine urgency based on config
-        let urgency = if self.config.use_maker_execution {
-            Urgency::Passive
-        } else {
-            Urgency::Immediate
-        };
+        // Always use Normal urgency for arb legs → maps to FAK via TakerPolicy
+        // FAK fills what it can immediately and cancels the rest, eliminating legging risk.
+        // Post-500ms delay removal (Feb 18 2026), GTC maker quotes are instantly snipeable.
+        let urgency = Urgency::Normal;
 
         // Create order intents for both legs
         let yes_intent = OrderIntent::new(
@@ -525,7 +632,45 @@ mod tests {
     use super::*;
     use crate::api::types::PriceLevel;
     use crate::ledger::Ledger;
+
+    #[test]
+    fn test_snap_size_2dp_prices() {
+        // 14.96 * 0.42 = 6.2832 (4dp) → snap to whole shares: 14
+        let snapped = snap_size_to_notional_precision(dec!(14.96), dec!(0.42), dec!(0.56));
+        assert_eq!(snapped, dec!(14));
+        assert!((snapped * dec!(0.42)).normalize().scale() <= 2);
+        assert!((snapped * dec!(0.56)).normalize().scale() <= 2);
+    }
+
+    #[test]
+    fn test_snap_size_already_whole() {
+        // 5 * 0.40 = 2.00 → already clean
+        let snapped = snap_size_to_notional_precision(dec!(5), dec!(0.40), dec!(0.58));
+        assert_eq!(snapped, dec!(5));
+    }
+
+    #[test]
+    fn test_snap_size_1dp_prices() {
+        // 0.7 has 1dp → size can have 1dp
+        let snapped = snap_size_to_notional_precision(dec!(10.34), dec!(0.7), dec!(0.3));
+        assert_eq!(snapped, dec!(10.3));
+        assert!((snapped * dec!(0.7)).normalize().scale() <= 2);
+        assert!((snapped * dec!(0.3)).normalize().scale() <= 2);
+    }
+
+    #[test]
+    fn test_snap_size_mixed_dp_prices() {
+        // 0.72 (2dp) and 0.26 (2dp) → must use whole shares
+        let snapped = snap_size_to_notional_precision(dec!(10.34), dec!(0.72), dec!(0.26));
+        assert_eq!(snapped, dec!(10));
+        assert!((snapped * dec!(0.72)).normalize().scale() <= 2);
+        assert!((snapped * dec!(0.26)).normalize().scale() <= 2);
+    }
     use crate::state::OrderBookState;
+
+    fn now_ts() -> Option<i64> {
+        Some(chrono::Utc::now().timestamp())
+    }
 
     fn setup_registry() -> Arc<MarketPairRegistry> {
         let registry = Arc::new(MarketPairRegistry::new());
@@ -558,7 +703,7 @@ mod tests {
                 price: "0.48".to_string(),
                 size: "1000".to_string(),
             }],
-            Some(1234567890),
+            now_ts(),
             None,
         );
 
@@ -574,7 +719,7 @@ mod tests {
                 price: "0.49".to_string(),
                 size: "1000".to_string(),
             }],
-            Some(1234567890),
+            now_ts(),
             None,
         );
 
@@ -596,7 +741,7 @@ mod tests {
                 price: "0.51".to_string(),
                 size: "1000".to_string(),
             }],
-            Some(1234567890),
+            now_ts(),
             None,
         );
 
@@ -611,7 +756,7 @@ mod tests {
                 price: "0.51".to_string(),
                 size: "1000".to_string(),
             }],
-            Some(1234567890),
+            now_ts(),
             None,
         );
 
@@ -642,8 +787,8 @@ mod tests {
         assert_eq!(intents[0].side, Side::Buy);
         assert_eq!(intents[1].side, Side::Buy);
 
-        // Verify urgency (taker = immediate)
-        assert_eq!(intents[0].urgency, Urgency::Immediate);
+        // Verify urgency (FAK for all arb legs)
+        assert_eq!(intents[0].urgency, Urgency::Normal);
     }
 
     #[test]
@@ -745,8 +890,8 @@ mod tests {
         // Should still detect opportunity
         assert_eq!(intents.len(), 2);
 
-        // But with Passive urgency
-        assert_eq!(intents[0].urgency, Urgency::Passive);
+        // Always Normal urgency (FAK) regardless of maker config
+        assert_eq!(intents[0].urgency, Urgency::Normal);
     }
 
     #[test]
@@ -775,13 +920,13 @@ mod tests {
     fn test_live_test_config() {
         let config = MathArbConfig::live_test();
 
-        // Verify Phase 9 live test settings (1% edge for better fills)
-        assert_eq!(config.min_edge, dec!(0.01));          // 1% edge (more conservative)
-        assert_eq!(config.max_position_size, dec!(15));  // Up to 15 shares for low-priced legs
-        assert_eq!(config.min_position_size, dec!(5));   // $5 per leg (market min)
-        assert_eq!(config.max_total_exposure, dec!(50)); // $50 max exposure
-        assert_eq!(config.cooldown_ms, 3000);            // 3 second cooldown
-        assert!(config.use_maker_execution);             // Maker mode enabled
+        // Verify FAK-mode live test settings
+        assert_eq!(config.min_edge, dec!(0.003));         // 0.3% edge (FAK, no maker advantage)
+        assert_eq!(config.max_position_size, dec!(15));   // Up to 15 shares for low-priced legs
+        assert_eq!(config.min_position_size, dec!(5));    // $5 per leg (market min)
+        assert_eq!(config.max_total_exposure, dec!(50));  // $50 max exposure
+        assert_eq!(config.cooldown_ms, 2000);             // 2 second cooldown
+        assert!(!config.use_maker_execution);             // FAK mode — no GTC
     }
 
     #[test]

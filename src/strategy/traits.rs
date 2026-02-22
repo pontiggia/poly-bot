@@ -5,7 +5,7 @@
 
 use crate::api::types::{ConditionId, Side, TokenId};
 use crate::ledger::{Fill, Ledger, Position};
-use crate::state::OrderBookState;
+use crate::state::{OrderBookState, PriceHistory, SpotPriceState};
 use rust_decimal::Decimal;
 use std::time::Instant;
 
@@ -160,6 +160,12 @@ pub struct StrategyContext<'a> {
 
     /// Current UTC timestamp for expiration calculations
     pub utc_now: chrono::DateTime<chrono::Utc>,
+
+    /// Spot prices from Binance (optional — None before Binance WS connects)
+    pub spot_prices: Option<&'a SpotPriceState>,
+
+    /// Price history for momentum calculation (optional)
+    pub price_history: Option<&'a PriceHistory>,
 }
 
 impl<'a> StrategyContext<'a> {
@@ -170,7 +176,30 @@ impl<'a> StrategyContext<'a> {
             ledger,
             now: Instant::now(),
             utc_now: chrono::Utc::now(),
+            spot_prices: None,
+            price_history: None,
         }
+    }
+
+    /// Add spot price references
+    pub fn with_spot(
+        mut self,
+        spot_prices: &'a SpotPriceState,
+        price_history: &'a PriceHistory,
+    ) -> Self {
+        self.spot_prices = Some(spot_prices);
+        self.price_history = Some(price_history);
+        self
+    }
+
+    /// Get the latest spot price for an asset (e.g., "btc")
+    pub fn spot_price(&self, asset: &str) -> Option<Decimal> {
+        self.spot_prices?.price(asset)
+    }
+
+    /// Get spot price percentage change over a window (in milliseconds)
+    pub fn spot_change_pct(&self, asset: &str, window_ms: i64) -> Option<Decimal> {
+        self.price_history?.price_change_pct(asset, window_ms)
     }
 
     /// Get best bid for a token

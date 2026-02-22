@@ -1,16 +1,30 @@
+//! Redeem winning positions from resolved Polymarket markets.
+//!
+//! Usage:
+//!   # Auto-discover and redeem ALL redeemable positions:
+//!   cargo run --example redeem
+//!
+//!   # Redeem a specific market by condition ID:
+//!   CONDITION_ID=0x... WINNING_INDEX=1 cargo run --example redeem
+//!
+//! Set POLYGON_RPC_URL in .env for a custom RPC endpoint.
+//! WINNING_INDEX: 1 = YES/UP (first outcome), 2 = NO/DOWN (second outcome)
+
 use std::env;
 use std::str::FromStr as _;
 
+use alloy::primitives::{FixedBytes, U256};
 use alloy::providers::ProviderBuilder;
-use alloy::signers::Signer as _;
 use alloy::signers::local::LocalSigner;
+use alloy::signers::Signer as _;
 use alloy::sol;
-use alloy::primitives::{U256, FixedBytes};
-use polymarket_client_sdk::types::{Address, address};
+use polymarket_client_sdk::data::types::request::PositionsRequest;
+use polymarket_client_sdk::types::{address, Address};
 use polymarket_client_sdk::{POLYGON, contract_config};
+use rust_decimal_macros::dec;
 
-const RPC_URL: &str = "https://polygon-rpc.com";
-const USDC: Address = address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"); // USDC on Polygon
+const DEFAULT_RPC: &str = "https://polygon-bor-rpc.publicnode.com";
+const USDC: Address = address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
 
 sol! {
     #[sol(rpc)]
@@ -19,53 +33,190 @@ sol! {
     }
 }
 
+fn rpc_url() -> String {
+    env::var("POLYGON_RPC_URL").unwrap_or_else(|_| DEFAULT_RPC.to_string())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    let private_key = env::var("POLYMARKET_PRIVATE_KEY").expect("Need POLYMARKET_PRIVATE_KEY");
+    let private_key = env::var("PRIVATE_KEY")
+        .or_else(|_| env::var("POLYMARKET_PRIVATE_KEY"))
+        .expect("Need PRIVATE_KEY or POLYMARKET_PRIVATE_KEY");
+    let proxy_wallet = env::var("WALLET_ADDRESS")
+        .or_else(|_| env::var("POLYMARKET_PROXY_WALLET"))
+        .expect("Need WALLET_ADDRESS or POLYMARKET_PROXY_WALLET");
+
     let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
+    let signer_addr = signer.address().to_checksum(None);
+    println!("Signer (EOA):    {}", signer_addr);
+    println!("Proxy wallet:    {}", proxy_wallet);
+    println!("RPC:             {}", rpc_url());
 
-    let provider = ProviderBuilder::new().wallet(signer.clone()).connect(RPC_URL).await?;
+    // Check if user wants manual mode (specific CONDITION_ID)
+    if let Ok(condition_hex) = env::var("CONDITION_ID") {
+        println!("\n--- Manual redemption mode ---");
+        let condition_id: [u8; 32] = hex::decode(condition_hex.trim_start_matches("0x"))?
+            .try_into()
+            .expect("CONDITION_ID must be 32 bytes");
+        let winning_index: u64 = env::var("WINNING_INDEX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1u64);
 
-    // Get the configured Conditional Tokens contract address for the chain
-    let chain = POLYGON;
-    let cfg = contract_config(chain, false).expect("contract_config available");
-    let ctf_addr = cfg.conditional_tokens;
-    let ctf = IConditionalTokens::new(ctf_addr, provider.clone());
+        let provider = ProviderBuilder::new()
+            .wallet(signer.clone())
+            .connect(&rpc_url())
+            .await?;
+        let cfg = contract_config(POLYGON, false).expect("contract_config");
+        let ctf = IConditionalTokens::new(cfg.conditional_tokens, provider);
 
-    // parentCollectionId is null in Polymarket case
-    let parent_collection: [u8;32] = [0u8; 32];
+        let parent: FixedBytes<32> = FixedBytes::from([0u8; 32]);
+        let cond: FixedBytes<32> = FixedBytes::from(condition_id);
+        let index_sets = vec![U256::from(winning_index)];
 
-    // condition_id: will be read from the environment variable `CONDITION_ID` if set.
-    // You can find the condition id using the included `examples/find_condition.rs` helper
-    // or via the Gamma API. CONDITION_ID must be a 32-byte hex string (0x...)
-    let condition_hex = std::env::var("CONDITION_ID").expect("Need CONDITION_ID env var (32-byte hex)");
-    let condition_id: [u8;32] = hex::decode(condition_hex.trim_start_matches("0x"))?.try_into().expect("CONDITION_ID must be 32 bytes");
+        println!(
+            "Redeeming condition {} with index_set={}...",
+            condition_hex, winning_index
+        );
+        let tx_hash = ctf
+            .redeemPositions(USDC, parent, cond, index_sets)
+            .send()
+            .await?
+            .watch()
+            .await?;
+        println!("Redeem tx: {:?}", tx_hash);
+        return Ok(());
+    }
 
-    // indexSets: for binary markets use the winning outcome index as a bitmask
-    // - YES / first outcome  => 0b01 = 1
-    // - NO  / second outcome => 0b10 = 2
-    // Provide WINNING_INDEX env var with value `1` or `2` (default = 1)
-    let winning_index: u64 = std::env::var("WINNING_INDEX").ok().and_then(|s| s.parse().ok()).unwrap_or(1u64);
-    let index_sets: Vec<U256> = vec![U256::from(winning_index)];
+    // --- Auto-discovery mode ---
+    println!("\n--- Auto-discovery: scanning both EOA signer and proxy wallet ---\n");
 
-    // convert arrays into FixedBytes<32> expected by the generated bindings
-    let parent_collection_fb: FixedBytes<32> = FixedBytes::from(parent_collection);
-    let condition_fb: FixedBytes<32> = FixedBytes::from(condition_id);
+    let data_client = polymarket_client_sdk::data::Client::default();
 
-    let tx_hash = ctf
-    
-        .redeemPositions(
-            USDC,
-            parent_collection_fb,
-            condition_fb,
-            index_sets,
-        )
-        .send()
-        .await?
-        .watch()
+    // Query BOTH addresses — tokens can be on either
+    let signer_address: Address = signer_addr.parse().expect("Invalid signer address");
+    let proxy_addr: Address = proxy_wallet.parse().expect("Invalid proxy wallet address");
+
+    let mut all_positions = Vec::new();
+
+    for (label, addr) in [("EOA signer", signer_address), ("Proxy wallet", proxy_addr)] {
+        let request = PositionsRequest::builder()
+            .user(addr)
+            .build();
+
+        match data_client.positions(&request).await {
+            Ok(positions) => {
+                println!("[{}] {} — found {} position(s)", label, addr, positions.len());
+                all_positions.extend(positions);
+            }
+            Err(e) => {
+                println!("[{}] {} — query failed: {}", label, addr, e);
+            }
+        }
+    }
+    println!();
+
+    if all_positions.is_empty() {
+        println!("No positions found on either address.");
+        return Ok(());
+    }
+
+    let redeemable: Vec<_> = all_positions.iter().filter(|p| p.redeemable).collect();
+    let winning: Vec<_> = redeemable.iter().filter(|p| p.current_value > dec!(0)).collect();
+    let losing: Vec<_> = redeemable.iter().filter(|p| p.current_value <= dec!(0)).collect();
+    let non_redeemable: Vec<_> = all_positions.iter().filter(|p| !p.redeemable).collect();
+
+    if !non_redeemable.is_empty() {
+        println!("Open positions (not yet resolved):");
+        for pos in &non_redeemable {
+            println!(
+                "  {} — {} x{} @ {} (current value: {})",
+                pos.title, pos.outcome, pos.size, pos.avg_price, pos.current_value
+            );
+        }
+        println!();
+    }
+
+    if !losing.is_empty() {
+        println!("Losing positions (resolved to $0, nothing to claim):");
+        for pos in &losing {
+            println!(
+                "  {} — {} x{} (lost ${:.2})",
+                pos.title, pos.outcome, pos.size,
+                pos.cash_pnl.abs()
+            );
+        }
+        println!();
+    }
+
+    if winning.is_empty() {
+        println!("No winning redeemable positions found.");
+        if !non_redeemable.is_empty() {
+            println!(
+                "You have {} open position(s) still waiting to resolve.",
+                non_redeemable.len()
+            );
+        }
+        return Ok(());
+    }
+
+    println!("WINNING positions to redeem:");
+    for pos in &winning {
+        println!(
+            "  {} — {} x{} → ${:.2} USDC",
+            pos.title, pos.outcome, pos.size, pos.current_value
+        );
+        println!(
+            "    Condition: {} (neg_risk: {})",
+            pos.condition_id, pos.negative_risk
+        );
+    }
+
+    println!("\nProceed with redemption? (y/N)");
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    if !input.trim().eq_ignore_ascii_case("y") {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    let provider = ProviderBuilder::new()
+        .wallet(signer.clone())
+        .connect(&rpc_url())
         .await?;
 
-    println!("Redeem tx: {:?}", tx_hash);
+    let parent: FixedBytes<32> = FixedBytes::from([0u8; 32]);
+
+    for pos in &winning {
+        let cond: FixedBytes<32> = pos.condition_id;
+
+        let cfg =
+            contract_config(POLYGON, pos.negative_risk).expect("contract_config");
+        let ctf = IConditionalTokens::new(cfg.conditional_tokens, provider.clone());
+
+        // outcome_index 0 (YES/UP) => bitmask 1, index 1 (NO/DOWN) => bitmask 2
+        let index_set = 1u64 << pos.outcome_index;
+        let index_sets = vec![U256::from(index_set)];
+
+        println!(
+            "Redeeming {} {} (index_set={})...",
+            pos.title, pos.outcome, index_set
+        );
+
+        match ctf
+            .redeemPositions(USDC, parent, cond, index_sets)
+            .send()
+            .await
+        {
+            Ok(pending) => match pending.watch().await {
+                Ok(tx_hash) => println!("  Success! Tx: {:?}", tx_hash),
+                Err(e) => println!("  Tx failed: {}", e),
+            },
+            Err(e) => println!("  Send failed: {}", e),
+        }
+    }
+
+    println!("\nDone! Check your USDC balance on Polygonscan.");
     Ok(())
 }

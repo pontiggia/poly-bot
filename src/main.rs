@@ -2,7 +2,8 @@
 //!
 //! High-frequency trading bot for Polymarket prediction markets.
 
-use polymarket_bot::api::MarketDiscovery;
+use polymarket_bot::api::{MarketDiscovery, MarketManager};
+use polymarket_bot::execution::PositionRedeemer;
 use polymarket_bot::strategy::MarketPair;
 use polymarket_bot::{Bot, Config, KillSwitch};
 use std::sync::Arc;
@@ -100,17 +101,8 @@ async fn main() -> anyhow::Result<()> {
         
         let mut pairs = Vec::new();
         let mut tokens = Vec::new();
-        
+
         for dm in &discovered {
-            info!(
-                "  Market: {} ({}/{})",
-                dm.condition_id, dm.first_outcome, dm.second_outcome
-            );
-            info!("    Question: {}", dm.question);
-            info!("    First token: {}", dm.first_token_id);
-            info!("    Second token: {}", dm.second_token_id);
-            info!("    Fee rate: {} bps", dm.fee_rate_bps);
-            
             pairs.push(dm.to_market_pair());
             tokens.push(dm.first_token_id.clone());
             tokens.push(dm.second_token_id.clone());
@@ -141,8 +133,32 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Registered {} market pair(s) with {} token(s)", market_pairs.len(), token_ids.len());
 
-    // Create and run the bot
+    // Create the bot
     let mut bot = Bot::new(config, kill_switch.clone(), token_ids, market_pairs).await;
+
+    // Spawn MarketManager for dynamic 60s discovery loop
+    let mut market_manager = MarketManager::new(
+        MarketDiscovery::new(),
+        bot.market_registry().clone(),
+        bot.order_book_state().clone(),
+        bot.ws_subscription_tx().clone(),
+        bot.kill_switch().clone(),
+    );
+    tokio::spawn(async move {
+        market_manager.run().await;
+    });
+
+    // Spawn PositionRedeemer for 5-minute resolution checks
+    let mut redeemer = PositionRedeemer::new(
+        bot.market_registry().clone(),
+        bot.ledger().clone(),
+        bot.kill_switch().clone(),
+    );
+    tokio::spawn(async move {
+        redeemer.run().await;
+    });
+
+    // Run the bot
     bot.run().await;
 
     // Graceful shutdown

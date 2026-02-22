@@ -10,6 +10,7 @@ use crate::ledger::Fill;
 use chrono::{TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -182,12 +183,31 @@ impl TradeNotification {
         };
         
         let fee = if is_maker {
-            // Makers pay no fees on 15-min crypto markets
+            // Makers pay no fees
             Decimal::ZERO
         } else {
-            // Takers pay fees based on rate
-            let fee_bps = self.fee_rate_bps.parse::<i64>().unwrap_or(0);
-            price * size * Decimal::new(fee_bps, 4)
+            // Takers pay parabolic fees based on market tier
+            // fee_rate_bps is a tier flag, NOT a linear rate:
+            //   1000 = crypto 5m/15m → feeRate=0.25, exponent=2
+            //   other > 0 = sports   → feeRate=0.0175, exponent=1
+            //   0 = no fees
+            let fee_bps = self.fee_rate_bps.parse::<u32>().unwrap_or(0);
+            if fee_bps == 0 {
+                Decimal::ZERO
+            } else {
+                let (fee_rate, exponent) = if fee_bps >= 1000 {
+                    (dec!(0.25), 2u32)
+                } else {
+                    (dec!(0.0175), 1u32)
+                };
+                // Per-leg parabolic: fee = C * p * feeRate * (p * (1-p))^exponent
+                let variance = price * (Decimal::ONE - price);
+                let mut curve = variance;
+                for _ in 1..exponent {
+                    curve *= variance;
+                }
+                size * price * fee_rate * curve
+            }
         };
 
         // Parse timestamp
@@ -265,17 +285,19 @@ impl UserWebSocket {
     }
 
     /// Start the WebSocket connection with automatic reconnection
+    ///
+    /// Never gives up — retries indefinitely with exponential backoff.
+    /// The bot MUST receive fill notifications to track positions accurately.
     pub async fn run(self: Arc<Self>) {
-        let mut reconnect_delay = Duration::from_secs(30); // Start with 30 second delay  
+        let mut reconnect_delay = Duration::from_secs(30);
         const MAX_BACKOFF: Duration = Duration::from_secs(300); // Max 5 minutes
         let mut consecutive_failures = 0u32;
-        const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
         loop {
             if consecutive_failures == 0 {
                 info!("Connecting to user WebSocket: {}", USER_WS_URL);
             } else {
-                debug!("Reconnecting to user WebSocket (attempt {}/{})", consecutive_failures + 1, MAX_CONSECUTIVE_FAILURES);
+                debug!("Reconnecting to user WebSocket (attempt {})", consecutive_failures + 1);
             }
 
             match self.connect_and_run().await {
@@ -286,30 +308,25 @@ impl UserWebSocket {
                 }
                 Err(e) => {
                     consecutive_failures += 1;
-                    
-                    // Only log as error for first failure
+
                     if consecutive_failures == 1 {
-                        warn!("User WebSocket error: {} (will retry in background)", e);
+                        warn!("User WebSocket error: {} (will retry)", e);
                     } else {
                         debug!("User WebSocket error (attempt {}): {}", consecutive_failures, e);
                     }
-                    
+
                     let _ = self.fill_tx.send(UserMessage::Reconnecting);
 
-                    // After too many failures, give up and stop retrying
-                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    // After extended failures, log periodic warnings but keep retrying
+                    if consecutive_failures % 10 == 0 {
                         warn!(
-                            "User WebSocket unavailable after {} attempts. Fill notifications disabled. Bot will continue without real-time fills.",
-                            consecutive_failures
+                            "User WebSocket still unavailable after {} attempts. Retrying in {:?}...",
+                            consecutive_failures, reconnect_delay
                         );
-                        // Stop trying - the bot works fine without this
-                        return;
-                    } else {
-                        // Exponential backoff
-                        debug!("Reconnecting in {:?}", reconnect_delay);
-                        tokio::time::sleep(reconnect_delay).await;
-                        reconnect_delay = (reconnect_delay * 2).min(MAX_BACKOFF);
                     }
+
+                    tokio::time::sleep(reconnect_delay).await;
+                    reconnect_delay = (reconnect_delay * 2).min(MAX_BACKOFF);
                 }
             }
         }
@@ -459,7 +476,8 @@ mod tests {
     use rust_decimal_macros::dec;
 
     #[test]
-    fn test_trade_notification_to_fill_taker() {
+    fn test_trade_notification_to_fill_taker_crypto() {
+        // Crypto market: fee_rate_bps=1000 → parabolic feeRate=0.25, exponent=2
         let trade = TradeNotification {
             id: "trade123".to_string(),
             taker_order_id: "order456".to_string(),
@@ -467,10 +485,10 @@ mod tests {
             asset_id: "token_abc".to_string(),
             side: "BUY".to_string(),
             size: "100".to_string(),
-            price: "0.55".to_string(),
-            fee_rate_bps: "50".to_string(), // 0.5%
+            price: "0.50".to_string(),
+            fee_rate_bps: "1000".to_string(), // crypto tier
             status: "MATCHED".to_string(),
-            timestamp: "1704067200000".to_string(), // 2024-01-01
+            timestamp: "1704067200000".to_string(),
             trader_side: "TAKER".to_string(),
             maker_orders: vec![],
         };
@@ -480,10 +498,32 @@ mod tests {
         assert_eq!(fill.order_id, "order456");
         assert_eq!(fill.token_id, "token_abc");
         assert_eq!(fill.side, Side::Buy);
-        assert_eq!(fill.price, dec!(0.55));
+        assert_eq!(fill.price, dec!(0.50));
         assert_eq!(fill.size, dec!(100));
-        // Fee = 0.55 * 100 * 0.005 = 0.275
-        assert_eq!(fill.fee, dec!(0.275));
+        // Parabolic: 100 * 0.50 * 0.25 * (0.50 * 0.50)^2 = 50 * 0.25 * 0.0625 = 0.78125
+        assert_eq!(fill.fee, dec!(0.78125));
+    }
+
+    #[test]
+    fn test_trade_notification_to_fill_taker_no_fees() {
+        // Standard market: fee_rate_bps=0 → no fees
+        let trade = TradeNotification {
+            id: "trade_free".to_string(),
+            taker_order_id: "order_free".to_string(),
+            market: "market_std".to_string(),
+            asset_id: "token_std".to_string(),
+            side: "BUY".to_string(),
+            size: "100".to_string(),
+            price: "0.55".to_string(),
+            fee_rate_bps: "0".to_string(),
+            status: "MATCHED".to_string(),
+            timestamp: "1704067200000".to_string(),
+            trader_side: "TAKER".to_string(),
+            maker_orders: vec![],
+        };
+
+        let fill = trade.to_fill().unwrap();
+        assert_eq!(fill.fee, dec!(0));
     }
 
     #[test]

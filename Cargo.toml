@@ -14,7 +14,7 @@ tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 futures-util = "0.3"
 
 # HTTP client (optimized)
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "gzip"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "gzip", "http2"] }
 
 # JSON parsing (SIMD-optimized)
 simd-json = "0.13"
@@ -55,7 +55,7 @@ base64 = "0.21"
 hex = "0.4"
 
 # Polymarket Official SDK
-polymarket-client-sdk = "0.3"
+polymarket-client-sdk = { version = "0.4", features = ["clob", "data"] }
 
 # Async trait for Exchange abstraction
 async-trait = "0.1"

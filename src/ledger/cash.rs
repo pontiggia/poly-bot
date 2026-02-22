@@ -93,28 +93,29 @@ impl CashBalance {
         actual_release
     }
 
-    /// Transfer from reserved to realized (called on fill)
+    /// Settle a buy fill — deduct cash spent on the purchase
     ///
-    /// This removes the cash from reserved but doesn't add it back to available
-    /// (because it was spent on the fill)
-    ///
-    /// For a BUY fill: the reserved amount is spent
-    /// For a SELL fill: we receive USDC, so available increases
+    /// Deducts from reserved first (GTC orders that were pre-reserved),
+    /// then from available for any remainder (FAK/FOK fills that weren't pre-reserved).
     pub fn settle_buy(&self, amount: Decimal) -> Result<Decimal> {
         if amount <= Decimal::ZERO {
             return Err(BotError::Order("Cannot settle zero or negative amount".into()));
         }
 
+        let mut available = self.available.write().unwrap();
         let mut reserved = self.reserved.write().unwrap();
 
-        if *reserved < amount {
-            // Partial reservation - shouldn't happen but handle gracefully
-            let actual = *reserved;
+        if *reserved >= amount {
+            // Fully reserved (GTC order path)
+            *reserved -= amount;
+        } else {
+            // Partially or not reserved (FAK/FOK path)
+            // Deduct what was reserved, then take remainder from available
+            let from_available = amount - *reserved;
             *reserved = Decimal::ZERO;
-            return Ok(actual);
+            *available -= from_available;
         }
 
-        *reserved -= amount;
         Ok(amount)
     }
 
@@ -309,5 +310,33 @@ mod tests {
         assert_eq!(snap.available, dec!(700));
         assert_eq!(snap.reserved, dec!(300));
         assert_eq!(snap.total, dec!(1000));
+    }
+
+    #[test]
+    fn test_settle_buy_without_reservation() {
+        // FAK/FOK orders fill without prior reservation
+        let cash = CashBalance::new(dec!(100));
+        assert_eq!(cash.reserved(), dec!(0));
+
+        // Fill arrives with no reservation — should deduct from available
+        cash.settle_buy(dec!(40)).unwrap();
+        assert_eq!(cash.available(), dec!(60));
+        assert_eq!(cash.reserved(), dec!(0));
+        assert_eq!(cash.total(), dec!(60));
+    }
+
+    #[test]
+    fn test_settle_buy_partial_reservation() {
+        // Order partially reserved then fills for more
+        let cash = CashBalance::new(dec!(100));
+        cash.reserve(dec!(20)).unwrap();
+        assert_eq!(cash.available(), dec!(80));
+        assert_eq!(cash.reserved(), dec!(20));
+
+        // Fill for 50 — 20 from reserved, 30 from available
+        cash.settle_buy(dec!(50)).unwrap();
+        assert_eq!(cash.available(), dec!(50)); // 80 - 30
+        assert_eq!(cash.reserved(), dec!(0));
+        assert_eq!(cash.total(), dec!(50)); // 100 - 50
     }
 }

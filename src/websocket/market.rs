@@ -12,14 +12,17 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 /// Market WebSocket connection
 pub struct MarketWebSocket {
-    /// Token IDs to subscribe to
-    token_ids: Vec<TokenId>,
     /// Channel to send parsed messages
     message_tx: mpsc::UnboundedSender<MarketMessage>,
+    /// Receiver for dynamic subscription requests
+    subscription_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Vec<TokenId>>>,
+    /// All subscribed tokens (initial + dynamic), used on reconnect
+    all_subscribed: tokio::sync::Mutex<Vec<TokenId>>,
 }
 
 /// Message types from market WebSocket
@@ -76,6 +79,73 @@ pub struct LevelUpdateMessage {
     pub hash: Option<String>,
 }
 
+/// Deserialize a timestamp that may be a JSON string or number into Option<i64>
+fn deserialize_string_or_i64<'de, D>(deserializer: D) -> std::result::Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct StringOrI64Visitor;
+    impl<'de> de::Visitor<'de> for StringOrI64Visitor {
+        type Value = Option<i64>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string or integer timestamp")
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+            Ok(Some(v as i64))
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+            v.parse::<i64>().map(Some).map_err(de::Error::custom)
+        }
+        fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrI64Visitor)
+}
+
+/// Single price change entry within a price_change event
+#[derive(Debug, Deserialize)]
+struct WsPriceChange {
+    asset_id: Option<String>,
+    price: Option<String>,
+    size: Option<String>,
+    side: Option<String>,
+    #[serde(default)]
+    hash: Option<String>,
+}
+
+/// Unified envelope for all WS messages.
+///
+/// Polymarket sends either bare objects `{...}` or arrays `[{...}]`.
+/// Book snapshots have no event_type — detected by presence of bids/asks.
+/// Price changes have price_changes array.
+#[derive(Debug, Deserialize)]
+struct WsEnvelope {
+    // book snapshot fields
+    asset_id: Option<String>,
+    market: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_i64")]
+    timestamp: Option<i64>,
+    #[serde(default)]
+    hash: Option<String>,
+    #[serde(default)]
+    bids: Vec<PriceLevel>,
+    #[serde(default)]
+    asks: Vec<PriceLevel>,
+    // price_change fields
+    #[serde(default)]
+    price_changes: Vec<WsPriceChange>,
+}
+
 /// Subscription request message
 #[derive(Debug, Serialize)]
 struct SubscribeRequest {
@@ -87,15 +157,21 @@ struct SubscribeRequest {
 }
 
 impl MarketWebSocket {
-    /// Create a new market WebSocket connection
+    /// Create a new market WebSocket connection with dynamic subscription support
+    ///
+    /// Returns `(Arc<MarketWebSocket>, mpsc::UnboundedSender<Vec<TokenId>>)`
+    /// The sender can be used to dynamically subscribe to new tokens at runtime.
     pub fn new(
         token_ids: Vec<TokenId>,
         message_tx: mpsc::UnboundedSender<MarketMessage>,
-    ) -> Self {
-        Self {
-            token_ids,
+    ) -> (Arc<Self>, mpsc::UnboundedSender<Vec<TokenId>>) {
+        let (sub_tx, sub_rx) = mpsc::unbounded_channel();
+        let ws = Arc::new(Self {
+            all_subscribed: tokio::sync::Mutex::new(token_ids),
             message_tx,
-        }
+            subscription_rx: tokio::sync::Mutex::new(sub_rx),
+        });
+        (ws, sub_tx)
     }
 
     /// Start the WebSocket connection with automatic reconnection
@@ -136,10 +212,12 @@ impl MarketWebSocket {
 
         let (mut write, mut read) = ws_stream.split();
 
-        // Send subscription message
+        // On reconnect, subscribe to ALL known tokens (initial + dynamically added)
+        let all_tokens = self.all_subscribed.lock().await.clone();
+
         let subscribe_msg = SubscribeRequest {
             msg_type: "market".to_string(),
-            assets_ids: self.token_ids.clone(),
+            assets_ids: all_tokens.clone(),
         };
 
         let subscribe_json = serde_json::to_string(&subscribe_msg)
@@ -150,14 +228,11 @@ impl MarketWebSocket {
             .await
             .map_err(|e| BotError::WebSocket(format!("Failed to subscribe: {}", e)))?;
 
-        info!(
-            "Subscribed to {} tokens: {:?}",
-            self.token_ids.len(),
-            self.token_ids
-        );
+        info!("Subscribed to {} tokens", all_tokens.len());
 
         // Keepalive ping interval (5 seconds)
         let mut ping_interval = interval(Duration::from_secs(WEBSOCKET_PING_INTERVAL_SEC));
+        let mut sub_rx = self.subscription_rx.lock().await;
 
         loop {
             tokio::select! {
@@ -172,6 +247,32 @@ impl MarketWebSocket {
                         Err(e) => {
                             return Err(BotError::WebSocket(format!("Read error: {}", e)));
                         }
+                    }
+                }
+
+                // Dynamic subscription requests
+                Some(new_tokens) = sub_rx.recv() => {
+                    if new_tokens.is_empty() {
+                        continue;
+                    }
+
+                    // Track for reconnects
+                    self.all_subscribed.lock().await.extend(new_tokens.clone());
+
+                    let sub_msg = SubscribeRequest {
+                        msg_type: "market".to_string(),
+                        assets_ids: new_tokens.clone(),
+                    };
+
+                    match serde_json::to_string(&sub_msg) {
+                        Ok(json) => {
+                            if let Err(e) = write.send(Message::Text(json)).await {
+                                warn!("Failed to send dynamic subscription: {}", e);
+                            } else {
+                                info!("Dynamically subscribed to {} new token(s)", new_tokens.len());
+                            }
+                        }
+                        Err(e) => warn!("Failed to serialize subscription: {}", e),
                     }
                 }
 
@@ -191,38 +292,65 @@ impl MarketWebSocket {
     }
 
     /// Handle incoming WebSocket message
+    ///
+    /// Polymarket sends arrays of event objects: `[{"event_type":"book",...}, ...]`.
+    /// We parse the whole array in one simd-json pass, then dispatch each item.
     async fn handle_message(&self, msg: Message) -> Result<()> {
         match msg {
             Message::Text(text) => {
-                // Log raw messages for debugging (truncated)
+                if text.len() < 3 {
+                    return Ok(());
+                }
+
+                let parse_start = Instant::now();
                 debug!("Raw WS message: {}", &text[..text.len().min(200)]);
 
-                // Parse as generic JSON to see what we have
-                let json_value: serde_json::Value = serde_json::from_str(&text)
-                    .map_err(|e| BotError::Json(format!("Invalid JSON: {}", e)))?;
+                // Single-pass parsing into typed structs using serde_json.
+                // The key perf win is eliminating the old double-parse pattern
+                // (Value → clone → from_value). simd-json requires SIMD padding
+                // on the buffer which is fragile, so we use serde_json directly.
 
-                // Polymarket book messages have this structure:
-                // { "event_type": "book", "asset_id": "...", "market": "...", "timestamp": ..., "hash": "...", "bids": [...], "asks": [...] }
-                // OR sometimes: { "asset_id": "...", ...other fields... }
-                // Also: "price_change" events for individual level updates
+                // Polymarket sends either a bare object `{...}` or an array `[{...}]`.
+                // Peek at first non-whitespace byte to decide. Ignore non-JSON messages
+                // (e.g. subscription acks, keepalives).
+                let first_byte = text.as_bytes().iter().find(|&&b| b != b' ' && b != b'\n' && b != b'\r').copied();
+                if first_byte != Some(b'{') && first_byte != Some(b'[') {
+                    debug!("Ignoring non-JSON WS message: {}", &text[..text.len().min(100)]);
+                    return Ok(());
+                }
+                let envelopes: Vec<WsEnvelope> =
+                    if first_byte == Some(b'[') {
+                        match serde_json::from_str::<Vec<WsEnvelope>>(&text) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                warn!("Failed to parse WS array message: {}", e);
+                                vec![]
+                            }
+                        }
+                    } else {
+                        match serde_json::from_str::<WsEnvelope>(&text) {
+                            Ok(env) => vec![env],
+                            Err(e) => {
+                                warn!("Failed to parse WS object message: {}", e);
+                                vec![]
+                            }
+                        }
+                    };
 
-                if let Some(event_type) = json_value.get("event_type").and_then(|v| v.as_str()) {
-                    match event_type {
-                        "book" => {
-                            // Full book snapshot
-                            self.handle_book_event(&json_value)?;
-                        }
-                        "price_change" => {
-                            // Price level update - also contains best bid/ask
-                            self.handle_price_change_event(&json_value)?;
-                        }
-                        other => {
-                            debug!("Unknown event type: {}", other);
-                        }
+                let parse_us = parse_start.elapsed().as_micros();
+                if parse_us > 500 {
+                    debug!(parse_us = parse_us, "[PERF] WS parse slow");
+                }
+
+                for envelope in envelopes {
+                    // Dispatch: no event_type on book snapshots — detect by presence of bids/asks
+                    if !envelope.bids.is_empty() || !envelope.asks.is_empty() {
+                        self.handle_envelope_book(envelope)?;
+                    } else if !envelope.price_changes.is_empty() {
+                        self.handle_envelope_price_change(envelope)?;
+                    } else {
+                        debug!("Unknown WS envelope (no bids/asks/price_changes)");
                     }
-                } else {
-                    // If no event_type, log it for debugging
-                    debug!("Unknown message format: {}", &text[..text.len().min(200)]);
                 }
             }
             Message::Pong(_) => {
@@ -240,73 +368,45 @@ impl MarketWebSocket {
         Ok(())
     }
 
-    /// Handle a full book snapshot event
-    fn handle_book_event(&self, json_value: &serde_json::Value) -> Result<()> {
-        if let (Some(asset_id), Some(market), Some(bids_val), Some(asks_val)) = (
-            json_value.get("asset_id").and_then(|v| v.as_str()),
-            json_value.get("market").and_then(|v| v.as_str()),
-            json_value.get("bids"),
-            json_value.get("asks"),
-        ) {
-            let bids: Vec<PriceLevel> = serde_json::from_value(bids_val.clone())
-                .unwrap_or_default();
-            let asks: Vec<PriceLevel> = serde_json::from_value(asks_val.clone())
-                .unwrap_or_default();
-
-            let timestamp = json_value.get("timestamp").and_then(|v| v.as_i64());
-            let hash = json_value.get("hash").and_then(|v| v.as_str()).map(String::from);
-
-            let book_update = BookUpdateMessage {
-                token_id: asset_id.to_string(),
-                market: market.to_string(),
-                asset: asset_id.to_string(),
-                timestamp,
-                hash,
-                bids,
-                asks,
-            };
-
+    /// Handle a book snapshot envelope
+    fn handle_envelope_book(&self, env: WsEnvelope) -> Result<()> {
+        if let (Some(asset_id), Some(market)) = (env.asset_id, env.market) {
             debug!(
                 "Book snapshot: {} levels bid, {} levels ask",
-                book_update.bids.len(),
-                book_update.asks.len()
+                env.bids.len(),
+                env.asks.len()
             );
-
+            let book_update = BookUpdateMessage {
+                token_id: asset_id.clone(),
+                market,
+                asset: asset_id,
+                timestamp: env.timestamp,
+                hash: env.hash,
+                bids: env.bids,
+                asks: env.asks,
+            };
             let _ = self.message_tx.send(MarketMessage::BookSnapshot(book_update));
         }
         Ok(())
     }
 
-    /// Handle a price_change event (incremental update)
-    fn handle_price_change_event(&self, json_value: &serde_json::Value) -> Result<()> {
-        // price_change events contain a list of individual level updates
-        // Each update is for a single price level on one side
-
-        if let Some(market) = json_value.get("market").and_then(|v| v.as_str()) {
-            let timestamp = json_value.get("timestamp").and_then(|v| v.as_i64());
-
-            if let Some(price_changes) = json_value.get("price_changes").and_then(|v| v.as_array()) {
-                for change in price_changes {
-                    if let (Some(asset_id), Some(price), Some(size), Some(side)) = (
-                        change.get("asset_id").and_then(|v| v.as_str()),
-                        change.get("price").and_then(|v| v.as_str()),
-                        change.get("size").and_then(|v| v.as_str()),
-                        change.get("side").and_then(|v| v.as_str()),
-                    ) {
-                        let hash = change.get("hash").and_then(|v| v.as_str()).map(String::from);
-
-                        let level_update = LevelUpdateMessage {
-                            token_id: asset_id.to_string(),
-                            market: market.to_string(),
-                            side: side.to_uppercase(),
-                            price: price.to_string(),
-                            size: size.to_string(),
-                            timestamp,
-                            hash,
-                        };
-
-                        let _ = self.message_tx.send(MarketMessage::LevelUpdate(level_update));
-                    }
+    /// Handle a price_change envelope
+    fn handle_envelope_price_change(&self, env: WsEnvelope) -> Result<()> {
+        if let Some(market) = env.market {
+            for change in env.price_changes {
+                if let (Some(asset_id), Some(price), Some(size), Some(side)) =
+                    (change.asset_id, change.price, change.size, change.side)
+                {
+                    let level_update = LevelUpdateMessage {
+                        token_id: asset_id,
+                        market: market.clone(),
+                        side: side.to_uppercase(),
+                        price,
+                        size,
+                        timestamp: env.timestamp,
+                        hash: change.hash,
+                    };
+                    let _ = self.message_tx.send(MarketMessage::LevelUpdate(level_update));
                 }
             }
         }

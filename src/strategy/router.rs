@@ -16,8 +16,6 @@ struct RegisteredStrategy {
     strategy: Arc<dyn Strategy>,
     /// Is this strategy currently enabled?
     enabled: bool,
-    /// Markets this strategy is subscribed to (empty = all)
-    subscribed_markets: HashSet<ConditionId>,
 }
 
 /// Routes market events to subscribed strategies
@@ -46,10 +44,7 @@ impl StrategyRouter {
     /// Returns error if a strategy with the same name already exists.
     pub fn register(&self, strategy: Arc<dyn Strategy>) -> Result<(), RouterError> {
         let name = strategy.name().to_string();
-        let subscribed = strategy
-            .subscribed_markets()
-            .into_iter()
-            .collect::<HashSet<_>>();
+        let subscriptions = strategy.subscribed_markets().len();
 
         let mut strategies = self.strategies.write().unwrap();
 
@@ -57,9 +52,11 @@ impl StrategyRouter {
             return Err(RouterError::StrategyAlreadyRegistered(name));
         }
 
+        let mode = if subscriptions == 0 { "all markets (tick-driven)" } else { "subscription-based" };
         info!(
             strategy = %name,
-            subscriptions = subscribed.len(),
+            subscriptions,
+            mode,
             "Registered strategy"
         );
 
@@ -68,7 +65,6 @@ impl StrategyRouter {
             RegisteredStrategy {
                 strategy,
                 enabled: true,
-                subscribed_markets: subscribed,
             },
         );
 
@@ -146,9 +142,10 @@ impl StrategyRouter {
             }
 
             // Skip if not subscribed to this market
-            if !reg.subscribed_markets.is_empty()
-                && !reg.subscribed_markets.contains(market_id)
-            {
+            // Query the strategy's live subscribed_markets() to pick up
+            // dynamically-registered markets (not just those cached at registration)
+            let live_subs = reg.strategy.subscribed_markets();
+            if !live_subs.is_empty() && !live_subs.contains(market_id) {
                 continue;
             }
 

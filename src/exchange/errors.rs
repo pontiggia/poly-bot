@@ -40,6 +40,10 @@ pub enum ExchangeError {
     #[error("Order not found: {0}")]
     OrderNotFound(String),
 
+    /// FAK/FOK order killed (no matching liquidity) — not a real error
+    #[error("FAK order killed: {0}")]
+    FakKilled(String),
+
     /// Market is closed or not accepting orders
     #[error("Market closed: {0}")]
     MarketClosed(String),

@@ -29,6 +29,15 @@ pub struct BookSnapshot {
     pub last_update: Option<i64>,
     /// Hash of book state (from WebSocket)
     pub hash: Option<String>,
+    // Pre-parsed top-of-book values (populated on update, avoids repeated .parse())
+    /// Best bid price as Decimal
+    pub best_bid_dec: Option<Decimal>,
+    /// Best bid size as Decimal
+    pub best_bid_size_dec: Option<Decimal>,
+    /// Best ask price as Decimal
+    pub best_ask_dec: Option<Decimal>,
+    /// Best ask size as Decimal
+    pub best_ask_size_dec: Option<Decimal>,
 }
 
 impl OrderBookState {
@@ -63,6 +72,12 @@ impl OrderBookState {
             price_a.cmp(&price_b) // Ascending
         });
 
+        // Pre-parse top-of-book after sorting
+        let best_bid_dec = bids.first().and_then(|l| l.price.parse::<Decimal>().ok());
+        let best_bid_size_dec = bids.first().and_then(|l| l.size.parse::<Decimal>().ok());
+        let best_ask_dec = asks.first().and_then(|l| l.price.parse::<Decimal>().ok());
+        let best_ask_size_dec = asks.first().and_then(|l| l.size.parse::<Decimal>().ok());
+
         let snapshot = BookSnapshot {
             token_id: token_id.clone(),
             market,
@@ -70,6 +85,10 @@ impl OrderBookState {
             asks,
             last_update: timestamp,
             hash,
+            best_bid_dec,
+            best_bid_size_dec,
+            best_ask_dec,
+            best_ask_size_dec,
         };
 
         self.books.insert(token_id, snapshot);
@@ -98,6 +117,10 @@ impl OrderBookState {
                 asks: Vec::new(),
                 last_update: timestamp,
                 hash: None,
+                best_bid_dec: None,
+                best_bid_size_dec: None,
+                best_ask_dec: None,
+                best_ask_size_dec: None,
             }
         });
 
@@ -155,6 +178,12 @@ impl OrderBookState {
                 levels.insert(insert_idx, new_level);
             }
         }
+
+        // Refresh cached top-of-book values
+        book.best_bid_dec = book.bids.first().and_then(|l| l.price.parse::<Decimal>().ok());
+        book.best_bid_size_dec = book.bids.first().and_then(|l| l.size.parse::<Decimal>().ok());
+        book.best_ask_dec = book.asks.first().and_then(|l| l.price.parse::<Decimal>().ok());
+        book.best_ask_size_dec = book.asks.first().and_then(|l| l.size.parse::<Decimal>().ok());
     }
 
     /// Get current book snapshot for a token
@@ -162,20 +191,18 @@ impl OrderBookState {
         self.books.get(token_id).map(|entry| entry.value().clone())
     }
 
-    /// Get best bid (highest buy price)
+    /// Get best bid (highest buy price) — uses pre-parsed cache
     pub fn best_bid(&self, token_id: &TokenId) -> Option<Decimal> {
         self.books
             .get(token_id)
-            .and_then(|book| book.bids.first().map(|level| level.price.clone()))
-            .and_then(|price| price.parse::<Decimal>().ok())
+            .and_then(|book| book.best_bid_dec)
     }
 
-    /// Get best ask (lowest sell price)
+    /// Get best ask (lowest sell price) — uses pre-parsed cache
     pub fn best_ask(&self, token_id: &TokenId) -> Option<Decimal> {
         self.books
             .get(token_id)
-            .and_then(|book| book.asks.first().map(|level| level.price.clone()))
-            .and_then(|price| price.parse::<Decimal>().ok())
+            .and_then(|book| book.best_ask_dec)
     }
 
     /// Get mid price (average of best bid and ask)
@@ -210,20 +237,18 @@ impl OrderBookState {
             .unwrap_or(false)
     }
 
-    /// Get total bid depth (size) at top level
+    /// Get total bid depth (size) at top level — uses pre-parsed cache
     pub fn bid_depth(&self, token_id: &TokenId) -> Option<Decimal> {
         self.books
             .get(token_id)
-            .and_then(|book| book.bids.first().map(|level| level.size.clone()))
-            .and_then(|size| size.parse::<Decimal>().ok())
+            .and_then(|book| book.best_bid_size_dec)
     }
 
-    /// Get total ask depth (size) at top level
+    /// Get total ask depth (size) at top level — uses pre-parsed cache
     pub fn ask_depth(&self, token_id: &TokenId) -> Option<Decimal> {
         self.books
             .get(token_id)
-            .and_then(|book| book.asks.first().map(|level| level.size.clone()))
-            .and_then(|size| size.parse::<Decimal>().ok())
+            .and_then(|book| book.best_ask_size_dec)
     }
 
     /// Get number of tracked token IDs
@@ -254,18 +279,14 @@ impl Default for OrderBookState {
 }
 
 impl BookSnapshot {
-    /// Get best bid price
+    /// Get best bid price — uses pre-parsed cache
     pub fn best_bid(&self) -> Option<Decimal> {
-        self.bids
-            .first()
-            .and_then(|level| level.price.parse::<Decimal>().ok())
+        self.best_bid_dec
     }
 
-    /// Get best ask price
+    /// Get best ask price — uses pre-parsed cache
     pub fn best_ask(&self) -> Option<Decimal> {
-        self.asks
-            .first()
-            .and_then(|level| level.price.parse::<Decimal>().ok())
+        self.best_ask_dec
     }
 
     /// Get mid price
@@ -294,6 +315,29 @@ impl BookSnapshot {
     /// Check if book has both sides
     pub fn is_two_sided(&self) -> bool {
         !self.bids.is_empty() && !self.asks.is_empty()
+    }
+
+    /// Total ask depth (shares) within `price_range` of the best ask
+    ///
+    /// E.g., if best ask is 0.48 and price_range is 0.02, sums all ask
+    /// levels from 0.48 to 0.50 inclusive.
+    pub fn ask_depth_within(&self, price_range: Decimal) -> Decimal {
+        let best = match self.best_ask_dec {
+            Some(p) => p,
+            None => return Decimal::ZERO,
+        };
+        let ceiling = best + price_range;
+        self.asks
+            .iter()
+            .filter_map(|l| {
+                let price = l.price.parse::<Decimal>().ok()?;
+                if price <= ceiling {
+                    l.size.parse::<Decimal>().ok()
+                } else {
+                    None
+                }
+            })
+            .sum()
     }
 }
 
@@ -348,6 +392,10 @@ mod tests {
             }],
             last_update: None,
             hash: None,
+            best_bid_dec: Some(Decimal::new(60, 2)),
+            best_bid_size_dec: Some(Decimal::from(100)),
+            best_ask_dec: Some(Decimal::new(55, 2)),
+            best_ask_size_dec: Some(Decimal::from(100)),
         };
 
         assert!(snapshot.is_crossed());

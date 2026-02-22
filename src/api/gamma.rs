@@ -8,6 +8,7 @@
 //! which are NOT accessible via the CLOB `/market/{id}` endpoint.
 
 use reqwest::Client;
+use std::time::Duration;
 use serde::{Deserialize, Deserializer};
 use tracing::{debug, warn};
 
@@ -264,16 +265,31 @@ pub struct GammaClient {
 impl GammaClient {
     /// Create a new Gamma API client with default base URL
     pub fn new() -> Self {
+        let client = Client::builder()
+            .tcp_nodelay(true)
+            .pool_max_idle_per_host(50)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(30))
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(3))
+            .build()
+            .expect("Failed to build Gamma HTTP client");
+
         Self {
-            client: Client::new(),
+            client,
             base_url: GAMMA_API_URL.to_string(),
         }
     }
     
     /// Create a Gamma client with custom base URL (for testing)
     pub fn with_base_url(base_url: &str) -> Self {
+        let client = Client::builder()
+            .tcp_nodelay(true)
+            .build()
+            .expect("Failed to build Gamma HTTP client");
+
         Self {
-            client: Client::new(),
+            client,
             base_url: base_url.to_string(),
         }
     }
@@ -522,9 +538,71 @@ impl GammaClient {
         Ok(all_events)
     }
 
-    /// Discover all crypto markets (15-min, hourly, daily)
+    /// Discover 5-minute crypto markets by slug pattern
+    ///
+    /// 5-min crypto markets use slug format: `{asset}-updown-5m-{timestamp}`
+    /// where timestamp is a Unix epoch rounded to 5-minute (300s) intervals.
+    pub async fn discover_crypto_5min_markets(&self) -> Result<Vec<GammaEvent>> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| BotError::Config(format!("System time error: {}", e)))?
+            .as_secs();
+
+        let interval = 300u64; // 5 minutes
+        let current_interval = (now / interval) * interval;
+
+        let intervals = [
+            current_interval,
+            current_interval + interval,
+            current_interval + 2 * interval,
+        ];
+
+        let mut all_events = Vec::new();
+
+        for asset in Self::CRYPTO_ASSETS {
+            for &ts in &intervals {
+                let slug = format!("{}-updown-5m-{}", asset, ts);
+                match self.get_event_by_slug(&slug).await {
+                    Ok(Some(event)) => {
+                        let has_tradeable = event.markets.iter().any(|m| {
+                            m.is_crypto_15min() && m.is_tradeable()
+                        });
+
+                        if has_tradeable {
+                            debug!(
+                                slug = %slug,
+                                asset = %asset,
+                                markets = event.markets.len(),
+                                "Found 5-min crypto event"
+                            );
+                            all_events.push(event);
+                        }
+                    }
+                    Ok(None) => {
+                        debug!(slug = %slug, "No event found for 5-min slug");
+                    }
+                    Err(e) => {
+                        warn!(slug = %slug, error = %e, "Error fetching 5-min event");
+                    }
+                }
+            }
+        }
+
+        debug!(count = all_events.len(), "Discovered 5-min crypto events");
+        Ok(all_events)
+    }
+
+    /// Discover all crypto markets (5-min, 15-min, hourly, daily)
     pub async fn discover_all_crypto_markets(&self) -> Result<Vec<GammaEvent>> {
         let mut all_events = Vec::new();
+
+        // Discover 5-min markets
+        if let Ok(events) = self.discover_crypto_5min_markets().await {
+            debug!(count = events.len(), "Found 5-min markets");
+            all_events.extend(events);
+        }
 
         // Discover 15-min markets
         if let Ok(events) = self.discover_crypto_15min_markets().await {

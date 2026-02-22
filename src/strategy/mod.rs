@@ -19,6 +19,7 @@
 pub mod arbitrage;
 pub mod edge_calculator;
 pub mod market_pair;
+pub mod momentum;
 pub mod router;
 pub mod traits;
 
@@ -30,3 +31,4 @@ pub use traits::{OrderIntent, Strategy, StrategyContext, StrategyError, Strategy
 pub use arbitrage::{MathArbConfig, MathArbStrategy};
 pub use edge_calculator::{EdgeCalculation, EdgeCalculator, EdgeConfig};
 pub use market_pair::{MarketPair, MarketPairRegistry};
+pub use momentum::{MomentumConfig, MomentumStrategy};

@@ -192,6 +192,36 @@ pub trait Exchange: Send + Sync {
     /// * `token_id` - Token ID to query
     async fn get_minimum_tick_size(&self, token_id: &str) -> ExchangeResult<Decimal>;
 
+    /// Get cached tick size without network call. Returns 0.01 default if not cached.
+    /// Use after warm_caches() has been called.
+    fn get_minimum_tick_size_cached(&self, _token_id: &str) -> Decimal {
+        Decimal::new(1, 2) // 0.01 default
+    }
+
+    /// Get current USDC balance from exchange
+    ///
+    /// Returns the available USDC balance for trading.
+    async fn get_balance(&self) -> ExchangeResult<Decimal>;
+
+    /// Place multiple orders in a single API call (batch endpoint).
+    /// Both legs are built+signed concurrently, then submitted in one HTTP request.
+    /// Default: falls back to sequential place_order calls.
+    async fn place_orders_batch(
+        &self,
+        params_list: Vec<ExchangeOrderParams>,
+    ) -> ExchangeResult<Vec<ExchangeResult<DomainOrder>>> {
+        let mut results = Vec::with_capacity(params_list.len());
+        for params in params_list {
+            results.push(self.place_order(params).await);
+        }
+        Ok(results)
+    }
+
+    /// Pre-warm internal caches for all known tokens.
+    /// Eliminates HTTP calls during first order build/sign per token.
+    /// Default: no-op.
+    async fn warm_caches(&self, _token_ids: &[String]) {}
+
     /// Check if the exchange connection is healthy
     fn is_healthy(&self) -> bool;
 
