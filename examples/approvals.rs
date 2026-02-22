@@ -49,7 +49,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
-const RPC_URL: &str = "https://polygon-rpc.com";
+const DEFAULT_RPC_URL: &str = "https://polygon-rpc.com";
 
 const USDC_ADDRESS: Address = address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
 const TOKEN_TO_APPROVE: Address = USDC_ADDRESS;
@@ -116,9 +116,12 @@ async fn main() -> anyhow::Result<()> {
     let private_key = env::var(PRIVATE_KEY_VAR).expect("Need a private key");
     let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(chain));
 
+    let rpc_url = env::var("POLYGON_RPC_URL").unwrap_or_else(|_| DEFAULT_RPC_URL.to_string());
+    info!(rpc = %rpc_url, "connecting to Polygon RPC");
+
     let provider = ProviderBuilder::new()
         .wallet(signer.clone())
-        .connect(RPC_URL)
+        .connect(&rpc_url)
         .await?;
 
     let owner = signer.address();
