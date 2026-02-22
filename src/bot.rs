@@ -466,13 +466,31 @@ impl Bot {
                 // which differs from the CLOB token ID we track. Remap to CLOB token ID
                 // so strategies can match fills to their tracked positions.
                 if let Some(tracked) = self.order_tracker.get(&order_id) {
-                    if fill.token_id != tracked.token_id {
+                    let is_cross_token = fill.token_id != tracked.token_id;
+                    if is_cross_token {
                         debug!(
-                            "Remapping fill token_id: {} → {} (neg-risk)",
+                            "Remapping fill token_id: {} → {} (neg-risk cross-token)",
                             &fill.token_id[..fill.token_id.len().min(12)],
                             &tracked.token_id[..tracked.token_id.len().min(12)]
                         );
                         fill.token_id = tracked.token_id.clone();
+
+                        // CRITICAL: In neg-risk markets, cross-token fills happen when both
+                        // parties are BUYING different tokens via conditional token minting.
+                        // E.g., taker buys DOWN @ 0.81, maker buys UP @ 0.26 (sum > 1.0).
+                        // The WS reports taker_side=BUY, and our BUG-K flip converts that to
+                        // SELL for us — but we actually BOUGHT. In cross-token fills, both
+                        // sides are buying, so the side flip is wrong.
+                        // Use the tracked order's intended side instead.
+                        if fill.side != tracked.side {
+                            debug!(
+                                "Neg-risk cross-token side correction: {} → {} (order intended {:?})",
+                                format!("{:?}", fill.side),
+                                format!("{:?}", tracked.side),
+                                tracked.side
+                            );
+                            fill.side = tracked.side;
+                        }
                     }
                 }
 

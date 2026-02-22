@@ -1329,6 +1329,32 @@ impl Strategy for MomentumStrategy {
                         ms.state = SniperState::InventoryHeld;
                     }
                 }
+                SniperState::InventoryHeld => {
+                    // Additional fill while already holding (e.g., both maker and taker filled
+                    // in a neg-risk race condition). Accumulate into existing position.
+                    if fill.side == Side::Buy {
+                        let old_size = ms.entry_size.unwrap_or(Decimal::ZERO);
+                        let old_price = ms.entry_price.unwrap_or(Decimal::ZERO);
+                        let new_size = old_size + fill.size;
+                        // Weighted average entry price
+                        let new_price = if new_size > Decimal::ZERO {
+                            (old_price * old_size + fill.price * fill.size) / new_size
+                        } else {
+                            fill.price
+                        };
+                        info!(
+                            "MomentumSniper: {} {} additional fill while InventoryHeld: +{} @ {} → total {} @ {:.4}",
+                            ms.asset,
+                            ms.timeframe.label(),
+                            fill.size,
+                            fill.price,
+                            new_size,
+                            new_price,
+                        );
+                        ms.entry_size = Some(new_size);
+                        ms.entry_price = Some(new_price);
+                    }
+                }
                 SniperState::TPPosted | SniperState::StopLoss => {
                     if fill.side == Side::Sell {
                         let entry_price = ms.entry_price.unwrap_or(Decimal::ZERO);
