@@ -5,7 +5,7 @@
 
 use crate::api::types::{ConditionId, TokenId};
 use crate::ledger::Fill;
-use crate::strategy::traits::{OrderIntent, Strategy, StrategyContext};
+use crate::strategy::traits::{OrderAction, OrderIntent, Strategy, StrategyContext};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tracing::{debug, info};
@@ -208,6 +208,19 @@ impl StrategyRouter {
         }
 
         self.resolve_conflicts(all_intents)
+    }
+
+    /// Route order management tick to all enabled strategies
+    pub fn on_order_management(&self, ctx: &StrategyContext) -> Vec<OrderAction> {
+        let strategies = self.strategies.read().unwrap();
+        let mut actions = Vec::new();
+        for (_name, reg) in strategies.iter() {
+            if !reg.enabled || !reg.strategy.is_enabled() {
+                continue;
+            }
+            actions.extend(reg.strategy.on_order_management(ctx));
+        }
+        actions
     }
 
     /// Route shutdown event to all strategies

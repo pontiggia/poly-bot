@@ -261,6 +261,7 @@ impl OrderExecutor {
     /// Uses the batch POST /orders endpoint to submit all legs in a single HTTP call.
     /// Both orders are built+signed concurrently, then submitted atomically.
     /// If one leg fails after submission, attempts to unwind the filled leg.
+    #[cfg(feature = "arb")]
     pub async fn execute_grouped(&self, intents: &[OrderIntent]) -> Vec<ExecutionResult> {
         // For non-grouped or single orders, use individual execution
         if intents.len() != 2 {

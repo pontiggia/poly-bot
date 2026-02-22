@@ -13,11 +13,8 @@
 //! - `StrategyContext`: Read-only view of system state
 //! - `StrategyRouter`: Dispatches events to subscribed strategies
 //! - `MarketPairRegistry`: Tracks YES/NO token pairs for binary markets
-//! - `EdgeCalculator`: Dynamic edge calculation for arb strategies
-//! - `MathArbStrategy`: Mathematical arbitrage (YES + NO < $1)
+//! - `MomentumStrategy`: Single-leg momentum sniper for 5m/15m crypto markets
 
-pub mod arbitrage;
-pub mod edge_calculator;
 pub mod market_pair;
 pub mod momentum;
 pub mod router;
@@ -25,10 +22,8 @@ pub mod traits;
 
 // Re-export main types
 pub use router::StrategyRouter;
-pub use traits::{OrderIntent, Strategy, StrategyContext, StrategyError, StrategyResult, Urgency};
+pub use traits::{OrderAction, OrderIntent, Strategy, StrategyContext, StrategyError, StrategyResult, Urgency};
 
 // Re-export strategy implementations
-pub use arbitrage::{MathArbConfig, MathArbStrategy};
-pub use edge_calculator::{EdgeCalculation, EdgeCalculator, EdgeConfig};
 pub use market_pair::{MarketPair, MarketPairRegistry};
 pub use momentum::{MomentumConfig, MomentumStrategy};

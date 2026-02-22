@@ -25,7 +25,7 @@
 
 use crate::api::types::{ConditionId, Side, TokenId};
 use crate::ledger::Fill;
-use crate::strategy::edge_calculator::{EdgeCalculator, EdgeConfig};
+use crate::legacy::edge_calculator::{EdgeCalculator, EdgeConfig};
 use crate::strategy::market_pair::{MarketPair, MarketPairRegistry};
 use crate::strategy::traits::{OrderIntent, Strategy, StrategyContext, Urgency};
 use rust_decimal::Decimal;

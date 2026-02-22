@@ -141,6 +141,97 @@ impl PriceHistory {
         Some((latest_price - old_price) / old_price)
     }
 
+    /// Rolling standard deviation of returns over a window (for volatility)
+    ///
+    /// Returns the standard deviation of price returns within the window.
+    /// Returns None if insufficient data (need at least 3 observations).
+    pub fn volatility(&self, asset: &str, window_ms: i64) -> Option<Decimal> {
+        let entry = self.histories.get(asset)?;
+        let buf = entry.read().unwrap();
+
+        if buf.len() < 3 {
+            return None;
+        }
+
+        let (latest_ts, _) = *buf.back()?;
+        let cutoff = latest_ts - window_ms;
+
+        // Collect prices within window
+        let prices: Vec<Decimal> = buf.iter()
+            .filter(|(ts, _)| *ts >= cutoff)
+            .map(|(_, p)| *p)
+            .collect();
+
+        if prices.len() < 3 {
+            return None;
+        }
+
+        // Compute returns
+        let returns: Vec<Decimal> = prices.windows(2)
+            .filter_map(|w| {
+                if w[0].is_zero() { None }
+                else { Some((w[1] - w[0]) / w[0]) }
+            })
+            .collect();
+
+        if returns.is_empty() {
+            return None;
+        }
+
+        // Mean
+        let n = Decimal::from(returns.len() as u64);
+        let mean: Decimal = returns.iter().sum::<Decimal>() / n;
+
+        // Variance
+        let variance: Decimal = returns.iter()
+            .map(|r| {
+                let diff = *r - mean;
+                diff * diff
+            })
+            .sum::<Decimal>() / n;
+
+        // Standard deviation (approximate sqrt via Newton's method)
+        Some(decimal_sqrt(variance))
+    }
+
+    /// Get the raw price N milliseconds ago (for precise delta computation)
+    ///
+    /// Finds the closest observation to the target time.
+    pub fn price_at(&self, asset: &str, ms_ago: i64) -> Option<Decimal> {
+        let entry = self.histories.get(asset)?;
+        let buf = entry.read().unwrap();
+
+        if buf.is_empty() {
+            return None;
+        }
+
+        let (latest_ts, _) = *buf.back()?;
+        let target_ts = latest_ts - ms_ago;
+
+        // Find the observation closest to target_ts
+        buf.iter()
+            .min_by_key(|(ts, _)| (*ts - target_ts).unsigned_abs())
+            .map(|(_, p)| *p)
+    }
+
+    /// Number of observations in the last N milliseconds (data quality check)
+    pub fn observation_count(&self, asset: &str, window_ms: i64) -> usize {
+        let Some(entry) = self.histories.get(asset) else { return 0 };
+        let buf = entry.read().unwrap();
+
+        if buf.is_empty() {
+            return 0;
+        }
+
+        let (latest_ts, _) = match buf.back() {
+            Some(v) => *v,
+            None => return 0,
+        };
+        let cutoff = latest_ts - window_ms;
+
+        buf.iter().filter(|(ts, _)| *ts >= cutoff).count()
+    }
+
     /// Number of tracked assets
     pub fn len(&self) -> usize {
         self.histories.len()
@@ -150,6 +241,29 @@ impl PriceHistory {
     pub fn is_empty(&self) -> bool {
         self.histories.is_empty()
     }
+}
+
+/// Approximate square root for Decimal using Newton's method
+fn decimal_sqrt(x: Decimal) -> Decimal {
+    if x.is_zero() || x < Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+
+    let mut guess = x / Decimal::from(2);
+    if guess.is_zero() {
+        guess = Decimal::new(1, 10); // very small positive
+    }
+
+    // 20 iterations of Newton's method is plenty for our precision needs
+    for _ in 0..20 {
+        let new_guess = (guess + x / guess) / Decimal::from(2);
+        if (new_guess - guess).abs() < Decimal::new(1, 18) {
+            break;
+        }
+        guess = new_guess;
+    }
+
+    guess
 }
 
 impl Default for PriceHistory {

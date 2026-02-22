@@ -22,6 +22,8 @@ pub mod exchange;
 pub mod execution;
 pub mod kill_switch;
 pub mod ledger;
+#[cfg(feature = "arb")]
+pub mod legacy;
 pub mod risk;
 pub mod state;
 pub mod strategy;

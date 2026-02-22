@@ -241,6 +241,16 @@ impl<'a> StrategyContext<'a> {
     pub fn open_orders_count(&self) -> u32 {
         self.ledger.open_orders_count()
     }
+
+    /// Get total exposure across all positions (sum of abs(shares * avg_cost))
+    pub fn total_exposure(&self) -> Decimal {
+        self.ledger.total_exposure()
+    }
+
+    /// Check if we hold any shares of a specific token
+    pub fn holds_position(&self, token_id: &TokenId) -> bool {
+        !self.ledger.get_position(token_id).is_flat()
+    }
 }
 
 // ============================================================================
@@ -302,6 +312,14 @@ pub trait Strategy: Send + Sync {
         Vec::new()
     }
 
+    /// Called every tick for active order lifecycle management.
+    /// Returns low-latency order actions (cancel, replace) that bypass
+    /// the normal intent → policy → executor pipeline.
+    fn on_order_management(&self, ctx: &StrategyContext) -> Vec<OrderAction> {
+        let _ = ctx;
+        Vec::new()
+    }
+
     /// Called on graceful shutdown
     ///
     /// Return intents to close positions, cancel orders, etc.
@@ -320,6 +338,25 @@ pub trait Strategy: Send + Sync {
     fn is_enabled(&self) -> bool {
         true
     }
+}
+
+// ============================================================================
+// ORDER ACTION - Low-latency order management
+// ============================================================================
+
+/// Low-latency order management action.
+/// Processed directly by the executor, not through the policy pipeline.
+#[derive(Debug, Clone)]
+pub enum OrderAction {
+    /// Cancel an outstanding order
+    Cancel { order_id: String },
+    /// Cancel and replace with a new order (atomic cancel+post)
+    Replace {
+        old_order_id: String,
+        new_intent: OrderIntent,
+    },
+    /// Post a taker fallback order (bypass maker pipeline)
+    PostTakerFallback { intent: OrderIntent },
 }
 
 // ============================================================================

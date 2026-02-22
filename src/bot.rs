@@ -23,7 +23,7 @@ use crate::ledger::Ledger;
 use crate::risk::CircuitBreaker;
 use crate::state::{OrderBookState, PriceHistory, SpotPriceState};
 use crate::strategy::{
-    MarketPair, MarketPairRegistry, MathArbStrategy, MomentumStrategy, OrderIntent,
+    MarketPair, MarketPairRegistry, OrderAction, OrderIntent,
     StrategyContext, StrategyRouter,
 };
 use crate::websocket::{BinanceWebSocket, MarketMessage, MarketWebSocket, UserMessage, UserWebSocket};
@@ -113,32 +113,22 @@ impl Bot {
         // Set up strategy router
         let strategy_router = Arc::new(StrategyRouter::new());
 
-        // Register MathArbStrategy with appropriate config
-        let arb_config = if config.use_live_test_mode {
-            info!("🧪 Using LIVE TEST mode for arb strategy (0.3% min edge, $2-3 positions, maker mode)");
-            crate::strategy::MathArbConfig::live_test()
-        } else if config.use_maker_mode {
-            info!("Using MAKER mode for arb strategy (1% min edge, GTC orders, 0% fees)");
-            crate::strategy::MathArbConfig::maker()
-        } else {
-            info!("Using TAKER mode for arb strategy (3% min edge, FOK orders)");
-            crate::strategy::MathArbConfig::taker()
-        };
-        let math_arb = Arc::new(MathArbStrategy::with_config(market_registry.clone(), arb_config));
-        if let Err(e) = strategy_router.register(math_arb) {
-            warn!("Failed to register MathArbStrategy: {}", e);
+        // Register MomentumSniper strategy (5m + 15m markets)
+        let momentum_config = crate::strategy::MomentumConfig::default_live_test();
+        info!(
+            "Registering MomentumSniper: conviction>={}, maker_buy={}, TP={}, max_exposure=${}",
+            momentum_config.min_conviction,
+            momentum_config.maker_buy_price,
+            momentum_config.take_profit_price,
+            momentum_config.max_total_exposure,
+        );
+        let momentum = Arc::new(crate::strategy::MomentumStrategy::new(
+            market_registry.clone(),
+            momentum_config,
+        ));
+        if let Err(e) = strategy_router.register(momentum.clone()) {
+            warn!("Failed to register MomentumStrategy: {}", e);
         }
-
-        // MomentumSniper disabled — risk/reward unfavorable at current config
-        // (need 93% accuracy at buy_price=0.93, signal only ~55-65%)
-        // TODO: re-enable with lower buy_price and stronger signal threshold
-        // let momentum = Arc::new(MomentumStrategy::new(
-        //     market_registry.clone(),
-        //     crate::strategy::MomentumConfig::default_test(),
-        // ));
-        // if let Err(e) = strategy_router.register(momentum) {
-        //     warn!("Failed to register MomentumStrategy: {}", e);
-        // }
 
         // Set up circuit breaker for risk management
         let circuit_breaker = Arc::new(CircuitBreaker::new());
@@ -244,7 +234,7 @@ impl Bot {
 
         // Set up Binance WebSocket for spot prices
         let spot_prices = Arc::new(SpotPriceState::new());
-        let price_history = Arc::new(PriceHistory::new(600)); // 10 min at ~1/sec
+        let price_history = Arc::new(PriceHistory::new(1800)); // 30 min at ~1/sec (supports 15m lookback)
         let binance_ws = Arc::new(BinanceWebSocket::new(
             spot_prices.clone(),
             price_history.clone(),
@@ -312,6 +302,9 @@ impl Bot {
         // Balance reconciliation (60s)
         let mut balance_reconcile_interval = interval(Duration::from_secs(60));
 
+        // Order management tick (100ms) — cancel/replace loop for maker orders
+        let mut order_mgmt_interval = interval(Duration::from_millis(100));
+
         loop {
             tokio::select! {
                 // Bias toward market data - process first if multiple ready
@@ -330,6 +323,11 @@ impl Bot {
                 // Strategy tick - 100ms periodic
                 _ = tick_interval.tick() => {
                     self.handle_tick().await;
+                }
+
+                // Order management tick — cancel/replace loop for maker orders
+                _ = order_mgmt_interval.tick() => {
+                    self.handle_order_management().await;
                 }
 
                 // Stale order cleanup - 30s periodic
@@ -484,6 +482,14 @@ impl Bot {
                 // Record fill in ledger
                 self.ledger.process_fill(fill.clone());
 
+                // Notify strategies of fill (may trigger sell orders)
+                let fill_ctx = StrategyContext::new(&self.order_book_state, &self.ledger)
+                    .with_spot(&self.spot_prices, &self.price_history);
+                let fill_intents = self.strategy_router.on_fill(&fill, &fill_ctx);
+                if !fill_intents.is_empty() {
+                    self.process_intents(fill_intents);
+                }
+
                 // Update order tracker
                 if let Some(remaining) = self.order_tracker.on_fill(&fill.order_id, fill.size) {
                     if remaining.is_zero() {
@@ -535,6 +541,50 @@ impl Bot {
         // Process any generated intents
         if !intents.is_empty() {
             self.process_intents(intents);
+        }
+    }
+
+    /// Handle order management tick (100ms) — cancel/replace loop for maker orders
+    async fn handle_order_management(&mut self) {
+        let ctx = StrategyContext::new(&self.order_book_state, &self.ledger)
+            .with_spot(&self.spot_prices, &self.price_history);
+
+        let actions = self.strategy_router.on_order_management(&ctx);
+
+        if actions.is_empty() {
+            return;
+        }
+
+        // Process actions directly through executor (low-latency path)
+        let executor = self.executor.clone();
+        let circuit_breaker = self.circuit_breaker.clone();
+        let order_tracker = self.order_tracker.clone();
+
+        for action in actions {
+            match action {
+                OrderAction::Cancel { order_id } => {
+                    let _ = executor.cancel_order(&order_id).await;
+                    order_tracker.remove(&order_id);
+                }
+                OrderAction::Replace { old_order_id, new_intent } => {
+                    // Cancel old
+                    let _ = executor.cancel_order(&old_order_id).await;
+                    order_tracker.remove(&old_order_id);
+                    // Submit new directly
+                    let result = executor.execute(&new_intent).await;
+                    Self::handle_execution_result(
+                        &new_intent, &result, &circuit_breaker, &order_tracker,
+                    );
+                    self.total_executions += 1;
+                }
+                OrderAction::PostTakerFallback { intent } => {
+                    let result = executor.execute(&intent).await;
+                    Self::handle_execution_result(
+                        &intent, &result, &circuit_breaker, &order_tracker,
+                    );
+                    self.total_executions += 1;
+                }
+            }
         }
     }
 
@@ -729,20 +779,12 @@ impl Bot {
             total_cost
         );
 
-        // Check if intents are grouped (arb legs)
-        let has_group = intents.first().and_then(|i| i.group_id.as_ref()).is_some();
-
-        let results = if has_group {
-            executor.execute_grouped(&intents).await
-        } else {
-            executor.execute_batch(&intents).await
-        };
+        let results = executor.execute_batch(&intents).await;
 
         let exec_ms = exec_start.elapsed().as_millis();
         info!(
             exec_total_ms = exec_ms,
             orders = results.len(),
-            grouped = has_group,
             "[PERF] Order execution complete"
         );
 
