@@ -299,8 +299,8 @@ impl MomentumConfig {
             take_profit_price: dec!(0.98),
             aggressive_tp_price: dec!(0.99),
             stop_loss_reversal_pct: dec!(-0.003),
-            max_size_per_trade: dec!(50),
-            max_total_exposure: dec!(50),
+            max_size_per_trade: dec!(15),
+            max_total_exposure: dec!(40),
             assets: vec![
                 "btc".to_string(),
                 "eth".to_string(),
@@ -334,8 +334,8 @@ impl MomentumConfig {
             take_profit_price: dec!(0.97),
             aggressive_tp_price: dec!(0.98),
             stop_loss_reversal_pct: dec!(-0.005),
-            max_size_per_trade: dec!(50),
-            max_total_exposure: dec!(50),
+            max_size_per_trade: dec!(15),
+            max_total_exposure: dec!(40),
             assets: vec![
                 "btc".to_string(),
                 "eth".to_string(),
@@ -380,6 +380,10 @@ impl MomentumConfig {
         if let Ok(v) = std::env::var("MOMENTUM_MAX_EXPOSURE") {
             if let Ok(d) = v.parse::<Decimal>() {
                 config.max_total_exposure = d;
+            }
+        }
+        if let Ok(v) = std::env::var("MOMENTUM_MAX_SIZE_PER_TRADE") {
+            if let Ok(d) = v.parse::<Decimal>() {
                 config.max_size_per_trade = d;
             }
         }
