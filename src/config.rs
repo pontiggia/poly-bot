@@ -118,7 +118,7 @@ impl Config {
         let use_maker_mode = std::env::var("USE_MAKER_MODE")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
-        let maker_price_offset = env_decimal("MAKER_PRICE_OFFSET", Decimal::new(5, 1)); // 0.5 cents default
+        let maker_price_offset = env_decimal("MAKER_PRICE_OFFSET", Decimal::ZERO); // 0 cents — momentum computes exact price
         let maker_order_ttl_secs = std::env::var("MAKER_ORDER_TTL")
             .ok()
             .and_then(|v| v.parse().ok())

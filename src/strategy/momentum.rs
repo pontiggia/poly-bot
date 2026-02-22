@@ -272,8 +272,8 @@ pub struct MomentumConfig {
     pub cancel_replace_interval_ms: u64,
 
     // === Taker Fallback ===
-    /// Maximum price willing to pay as taker (after fees)
-    pub max_taker_price: Decimal,
+    /// Maximum entry price — skip markets where best_bid exceeds this (market already decided, no alpha)
+    pub max_entry_price: Decimal,
 
     // === Inventory Exit ===
     /// Take-profit spread above entry price (e.g., 0.04 = 4 cents above entry)
@@ -308,12 +308,12 @@ impl MomentumConfig {
             min_entry_price: dec!(0.10),
             maker_fill_timeout_ms: 2000,
             cancel_replace_interval_ms: 150,
-            max_taker_price: dec!(0.96),
+            max_entry_price: dec!(0.93),
             tp_spread: dec!(0.04),
             aggressive_tp_spread: dec!(0.06),
             stop_loss_reversal_pct: dec!(-0.003),
             book_stop_loss_spread: dec!(0.03),
-            max_hold_before_close_secs: 30,
+            max_hold_before_close_secs: 5,
             max_size_per_trade: dec!(15),
             max_total_exposure: dec!(40),
             assets: vec![
@@ -334,7 +334,7 @@ impl MomentumConfig {
     /// - Tighter TP spread (0.03) — more realistic fill probability before resolution
     /// - Wider stop-loss (-0.5%) — avoids noise-triggered dumps on longer timeframe
     /// - Wider book SL (0.04) — same reasoning
-    /// - Longer hold before close (45s) — more time to exit
+    /// - Emergency exit at 8s before close (must be < trigger_fire_secs - maker_timeout)
     pub fn preset_15m() -> Self {
         Self {
             trigger_window_secs: 30,
@@ -346,12 +346,12 @@ impl MomentumConfig {
             min_entry_price: dec!(0.10),
             maker_fill_timeout_ms: 3000,
             cancel_replace_interval_ms: 150,
-            max_taker_price: dec!(0.96),
+            max_entry_price: dec!(0.93),
             tp_spread: dec!(0.03),
             aggressive_tp_spread: dec!(0.05),
             stop_loss_reversal_pct: dec!(-0.005),
             book_stop_loss_spread: dec!(0.04),
-            max_hold_before_close_secs: 45,
+            max_hold_before_close_secs: 8,
             max_size_per_trade: dec!(15),
             max_total_exposure: dec!(40),
             assets: vec![
@@ -408,6 +408,11 @@ impl MomentumConfig {
         if let Ok(v) = std::env::var("MOMENTUM_MAX_SIZE_PER_TRADE") {
             if let Ok(d) = v.parse::<Decimal>() {
                 config.max_size_per_trade = d;
+            }
+        }
+        if let Ok(v) = std::env::var("MOMENTUM_MAX_ENTRY_PRICE") {
+            if let Ok(d) = v.parse::<Decimal>() {
+                config.max_entry_price = d;
             }
         }
         config
@@ -495,7 +500,7 @@ impl MomentumStrategy {
                 c.aggressive_tp_spread = preset.aggressive_tp_spread;     // 0.05
                 c.stop_loss_reversal_pct = preset.stop_loss_reversal_pct; // -0.5% (wider to avoid noise)
                 c.book_stop_loss_spread = preset.book_stop_loss_spread;   // 0.04 (wider for 15m)
-                c.max_hold_before_close_secs = preset.max_hold_before_close_secs; // 45s
+                c.max_hold_before_close_secs = preset.max_hold_before_close_secs; // 8s (must be < trigger_fire_secs - maker_timeout)
                 c
             }
         }
@@ -618,7 +623,16 @@ impl MomentumStrategy {
             }
         };
 
-        // Sanity: don't buy below min entry price or above max taker price
+        // Sanity: skip if market already decided (no alpha left) or price too low
+        if let Some(bid) = best_bid {
+            if bid > tf_config.max_entry_price {
+                debug!(
+                    "MomentumSniper: {} market already decided (bid={} > max_entry={}), skipping",
+                    ms.asset, bid, tf_config.max_entry_price
+                );
+                return Vec::new();
+            }
+        }
         if maker_price < tf_config.min_entry_price {
             debug!(
                 "MomentumSniper: {} price {} below min_entry_price {}, skipping",
@@ -626,7 +640,6 @@ impl MomentumStrategy {
             );
             return Vec::new();
         }
-        let maker_price = maker_price.min(tf_config.max_taker_price);
 
         // Sizing
         let max_affordable = (ctx.available_cash() / maker_price).floor();
@@ -1033,14 +1046,14 @@ impl Strategy for MomentumStrategy {
                                 }
                             };
 
-                            // Check best ask is within our taker limit
+                            // Check best ask is within our entry limit
                             let best_ask = ctx.best_ask(&ms.target_token_id);
                             let taker_price = match best_ask {
-                                Some(ask) if ask <= self.config.max_taker_price => ask,
+                                Some(ask) if ask <= self.config.max_entry_price => ask,
                                 Some(ask) => {
                                     info!(
-                                        "MomentumSniper: {} best ask {} > max taker {}, abandoning",
-                                        ms.asset, ask, self.config.max_taker_price
+                                        "MomentumSniper: {} best ask {} > max entry {}, abandoning",
+                                        ms.asset, ask, self.config.max_entry_price
                                     );
                                     ms.state = SniperState::Completed;
                                     continue;
