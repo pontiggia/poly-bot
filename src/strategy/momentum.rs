@@ -117,6 +117,8 @@ pub struct MarketState {
     pub pending_cancel: bool,
     /// Market close time (unix timestamp)
     pub close_time: Option<i64>,
+    /// Number of TP sell retry attempts (to prevent infinite loops)
+    pub tp_sell_retries: u32,
 }
 
 impl MarketState {
@@ -140,6 +142,7 @@ impl MarketState {
             posted_price: None,
             pending_cancel: false,
             close_time: None,
+            tp_sell_retries: 0,
         }
     }
 }
@@ -221,12 +224,21 @@ impl ConvictionEngine {
             _ => dec!(1.0), // No vol data, no penalty
         };
 
-        // Raw score
+        // Minimum weighted delta gate — reject noise-level moves.
+        // Crypto routinely moves 0.05% in 5 min from noise alone.
         let abs_delta = weighted_delta.abs();
+        let min_delta = dec!(0.0005); // 0.05% minimum movement required
+        if abs_delta < min_delta {
+            return (Decimal::ZERO, Direction::Neutral);
+        }
+
+        // Raw score
         let raw_score = abs_delta * consistency_multiplier / vol_penalty;
 
-        // Calibration: 0.001 (0.1% move) maps to ~0.7 conviction
-        let calibration = dec!(0.0014);
+        // Calibration: 0.4% move maps to ~1.0 conviction.
+        // Previous 0.0014 was too loose — 0.08% noise gave conv=1.0.
+        // New: 0.1% → ~0.25, 0.2% → ~0.50, 0.3% → ~0.75, 0.4%+ → ~1.0
+        let calibration = dec!(0.004);
         let conviction = (raw_score / calibration).min(dec!(1.0));
 
         let direction = if weighted_delta > Decimal::ZERO {
@@ -301,11 +313,11 @@ impl MomentumConfig {
         Self {
             trigger_window_secs: 15,
             trigger_fire_secs: 10,
-            min_conviction: dec!(0.65),
-            overwhelming_conviction: dec!(0.85),
+            min_conviction: dec!(0.75),
+            overwhelming_conviction: dec!(0.90),
             lookback_windows_ms: vec![60_000, 180_000, 300_000],
             lookback_weights: vec![dec!(0.5), dec!(0.3), dec!(0.2)],
-            min_entry_price: dec!(0.10),
+            min_entry_price: dec!(0.25),
             maker_fill_timeout_ms: 2000,
             cancel_replace_interval_ms: 150,
             max_entry_price: dec!(0.93),
@@ -339,11 +351,11 @@ impl MomentumConfig {
         Self {
             trigger_window_secs: 30,
             trigger_fire_secs: 15,
-            min_conviction: dec!(0.65),
-            overwhelming_conviction: dec!(0.85),
+            min_conviction: dec!(0.70),
+            overwhelming_conviction: dec!(0.90),
             lookback_windows_ms: vec![180_000, 600_000, 900_000],
             lookback_weights: vec![dec!(0.5), dec!(0.3), dec!(0.2)],
-            min_entry_price: dec!(0.10),
+            min_entry_price: dec!(0.20),
             maker_fill_timeout_ms: 3000,
             cancel_replace_interval_ms: 150,
             max_entry_price: dec!(0.93),
@@ -413,6 +425,11 @@ impl MomentumConfig {
         if let Ok(v) = std::env::var("MOMENTUM_MAX_ENTRY_PRICE") {
             if let Ok(d) = v.parse::<Decimal>() {
                 config.max_entry_price = d;
+            }
+        }
+        if let Ok(v) = std::env::var("MOMENTUM_OVERWHELMING_CONVICTION") {
+            if let Ok(d) = v.parse::<Decimal>() {
+                config.overwhelming_conviction = d;
             }
         }
         config
@@ -641,6 +658,30 @@ impl MomentumStrategy {
             return Vec::new();
         }
 
+        // Price-conviction agreement filter:
+        // If the market disagrees with us (low bid), require stronger conviction.
+        // Rationale: bid=0.37 means market says 37% chance UP. Our spot oracle saying
+        // "UP" with conv=0.75 isn't enough to overcome the market's view.
+        // Scale: bid < 0.35 → need conv ≥ 0.95
+        //        bid 0.35-0.45 → need conv ≥ 0.85
+        //        bid ≥ 0.45 → normal threshold applies
+        if let Some(bid) = best_bid {
+            let required_conviction = if bid < dec!(0.35) {
+                dec!(0.95)
+            } else if bid < dec!(0.45) {
+                dec!(0.85)
+            } else {
+                tf_config.min_conviction
+            };
+            if conviction < required_conviction {
+                debug!(
+                    "MomentumSniper: {} bid={} disagrees with direction, conv {:.3} < required {:.3}, skipping",
+                    ms.asset, bid, conviction, required_conviction
+                );
+                return Vec::new();
+            }
+        }
+
         // Sizing
         let max_affordable = (ctx.available_cash() / maker_price).floor();
         let remaining_exposure = tf_config.max_total_exposure - ctx.total_exposure();
@@ -723,6 +764,28 @@ impl MomentumStrategy {
         let entry_size = ms.entry_size.unwrap_or(Decimal::ZERO);
         if entry_price <= Decimal::ZERO || entry_size <= Decimal::ZERO {
             return Vec::new();
+        }
+
+        // === SETTLEMENT COOLDOWN: Wait for neg-risk token settlement before selling ===
+        // The CLOB reports fills instantly, but on-chain token settlement on Polygon
+        // takes 2-5 seconds. Posting a sell before settlement → "not enough balance".
+        const SETTLEMENT_COOLDOWN_SECS: u64 = 5;
+        let entry_elapsed_secs = ms.entry_instant
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        if entry_elapsed_secs < SETTLEMENT_COOLDOWN_SECS {
+            // Still waiting for settlement — but allow emergency exit through
+            // (emergency exit will also likely fail, but better to try than hold through close)
+            if let Some(close_time) = ms.close_time {
+                let secs_until_close = close_time - ctx.utc_now.timestamp();
+                if secs_until_close >= tf_config.max_hold_before_close_secs as i64 {
+                    // Not emergency — wait for settlement
+                    return Vec::new();
+                }
+                // Emergency — fall through to exit logic below
+            } else {
+                return Vec::new();
+            }
         }
 
         // === EMERGENCY EXIT: Time-based (force exit before market close) ===
@@ -994,8 +1057,30 @@ impl Strategy for MomentumStrategy {
                     // Handled in on_order_management
                 }
                 SniperState::TPPosted => {
-                    // TP order is out, wait for fill or expiry
-                    // If market closed, let PositionRedeemer handle it
+                    // If tp_order_id is None, the TP sell was rejected (e.g., settlement delay).
+                    // Retry by transitioning back to InventoryHeld after settlement cooldown.
+                    const MAX_TP_RETRIES: u32 = 3;
+                    if ms.tp_order_id.is_none() {
+                        let entry_elapsed = ms.entry_instant
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        if ms.tp_sell_retries >= MAX_TP_RETRIES {
+                            warn!(
+                                "MomentumSniper: {} {} TP sell failed {} times, giving up (will redeem on resolution)",
+                                ms.asset, ms.timeframe.label(), ms.tp_sell_retries
+                            );
+                            // Don't retry — let PositionRedeemer handle it on market resolution
+                        } else if entry_elapsed >= 5 {
+                            ms.tp_sell_retries += 1;
+                            warn!(
+                                "MomentumSniper: {} {} TP sell was rejected, retry #{} ({}s since entry)",
+                                ms.asset, ms.timeframe.label(), ms.tp_sell_retries, entry_elapsed
+                            );
+                            ms.state = SniperState::InventoryHeld;
+                        }
+                    }
+                    // Otherwise: TP order is out, wait for fill or expiry.
+                    // If market closed, let PositionRedeemer handle it.
                 }
             }
         }
@@ -1024,15 +1109,12 @@ impl Strategy for MomentumStrategy {
 
                     // Timeout check
                     if elapsed_ms > self.config.maker_fill_timeout_ms {
-                        // Cancel the maker order
-                        if let Some(ref order_id) = ms.maker_order_id {
-                            actions.push(OrderAction::Cancel {
-                                order_id: order_id.clone(),
-                            });
-                        }
+                        // Capture maker order ID for cancellation
+                        let maker_oid = ms.maker_order_id.clone();
 
                         if ms.conviction >= self.config.overwhelming_conviction {
-                            // Taker fallback
+                            // Taker fallback — cancel is embedded in PostTakerFallback
+                            // to ensure collateral is freed before new order posts
                             info!(
                                 "MomentumSniper: {} maker timeout ({}ms), conviction {:.3} → TAKER FALLBACK",
                                 ms.asset, elapsed_ms, ms.conviction
@@ -1107,8 +1189,17 @@ impl Strategy for MomentumStrategy {
                             .with_fee_rate(pair.fee_rate_bps)
                             .with_priority(65);
 
-                            actions.push(OrderAction::PostTakerFallback { intent });
+                            actions.push(OrderAction::PostTakerFallback {
+                                cancel_order_id: maker_oid.clone(),
+                                intent,
+                            });
                         } else {
+                            // Conviction too low for taker — just cancel the maker and abandon
+                            if let Some(ref oid) = maker_oid {
+                                actions.push(OrderAction::Cancel {
+                                    order_id: oid.clone(),
+                                });
+                            }
                             info!(
                                 "MomentumSniper: {} maker timeout ({}ms), conviction {:.3} too low for taker fallback, abandoning",
                                 ms.asset, elapsed_ms, ms.conviction
@@ -1197,18 +1288,28 @@ impl Strategy for MomentumStrategy {
             match ms.state {
                 SniperState::MakerPosted | SniperState::TakerFallback => {
                     if fill.side == Side::Buy {
-                        info!(
-                            "MomentumSniper: {} {} FILLED {} @ {} → InventoryHeld",
-                            ms.asset,
-                            ms.timeframe.label(),
-                            fill.size,
-                            fill.price,
-                        );
-                        ms.entry_price = Some(fill.price);
-                        ms.entry_size = Some(fill.size);
-                        ms.entry_instant = Some(Instant::now());
-                        ms.entry_timestamp_ms = Some(chrono::Utc::now().timestamp_millis());
-                        ms.state = SniperState::InventoryHeld;
+                        // Minimum fill size guard: tiny fills aren't worth TP effort
+                        const MIN_PROFITABLE_SHARES: Decimal = dec!(5);
+                        if fill.size < MIN_PROFITABLE_SHARES {
+                            info!(
+                                "MomentumSniper: {} {} fill too small ({} < {} shares), skipping TP",
+                                ms.asset, ms.timeframe.label(), fill.size, MIN_PROFITABLE_SHARES
+                            );
+                            ms.state = SniperState::Completed;
+                        } else {
+                            info!(
+                                "MomentumSniper: {} {} FILLED {} @ {} → InventoryHeld",
+                                ms.asset,
+                                ms.timeframe.label(),
+                                fill.size,
+                                fill.price,
+                            );
+                            ms.entry_price = Some(fill.price);
+                            ms.entry_size = Some(fill.size);
+                            ms.entry_instant = Some(Instant::now());
+                            ms.entry_timestamp_ms = Some(chrono::Utc::now().timestamp_millis());
+                            ms.state = SniperState::InventoryHeld;
+                        }
                     }
                 }
                 SniperState::Completed => {
@@ -1502,11 +1603,12 @@ mod tests {
                 conviction: dec!(0.80),
                 direction: Direction::Up,
                 tp_order_id: None,
-                entry_instant: Some(Instant::now()),
+                entry_instant: Some(Instant::now() - std::time::Duration::from_secs(6)),
                 entry_timestamp_ms: Some(now_ms - 5000), // Entered 5s ago
                 posted_price: None,
                 pending_cancel: false,
                 close_time: None,
+                tp_sell_retries: 0,
             },
         );
 

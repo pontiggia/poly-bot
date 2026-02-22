@@ -135,13 +135,26 @@ impl TradeNotification {
     /// Convert to Fill struct for a specific order ID
     /// This correctly uses matched_amount for maker fills instead of total trade size
     pub fn to_fill_for_order(&self, our_order_id: &str) -> Result<Fill> {
-        let side = match self.side.to_uppercase().as_str() {
+        let taker_side = match self.side.to_uppercase().as_str() {
             "BUY" => Side::Buy,
             "SELL" => Side::Sell,
             _ => return Err(BotError::Json(format!("Unknown side: {}", self.side))),
         };
 
         let is_maker = self.trader_side.to_uppercase() == "MAKER";
+
+        // CRITICAL: The WS `side` field is the TAKER's side.
+        // When we are MAKER, our side is the OPPOSITE of the taker's side.
+        // Taker BUY = they bought from us = we SOLD.
+        // Taker SELL = they sold to us = we BOUGHT.
+        let our_side = if is_maker {
+            match taker_side {
+                Side::Buy => Side::Sell,
+                Side::Sell => Side::Buy,
+            }
+        } else {
+            taker_side // When we're taker, the side is already ours
+        };
         
         // ✅ FIX: For maker fills, use matched_amount from our specific maker order
         // The trade.size is the TOTAL trade size, which could include many makers
@@ -228,7 +241,7 @@ impl TradeNotification {
             fill_id: self.id.clone(),
             order_id: our_order_id.to_string(),
             token_id: self.asset_id.clone(),
-            side,
+            side: our_side,
             price,
             size,
             fee,
@@ -553,7 +566,8 @@ mod tests {
         
         let fill = trade.to_fill().unwrap();
         assert_eq!(fill.order_id, "my_maker_order_id");
-        assert_eq!(fill.side, Side::Sell);
+        // We are MAKER, taker side is SELL, so our side is BUY (flipped)
+        assert_eq!(fill.side, Side::Buy);
         assert_eq!(fill.size, dec!(50));
         assert_eq!(fill.price, dec!(0.80));
         // Maker pays no fees
@@ -582,7 +596,8 @@ mod tests {
         };
 
         let fill = trade.to_fill().unwrap();
-        assert_eq!(fill.side, Side::Sell);
+        // We are MAKER, taker side is SELL, so our side is BUY (flipped)
+        assert_eq!(fill.side, Side::Buy);
         assert_eq!(fill.size, dec!(50));
         assert_eq!(fill.price, dec!(0.80));
         assert_eq!(fill.fee, dec!(0));

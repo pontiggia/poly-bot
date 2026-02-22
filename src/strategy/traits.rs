@@ -356,7 +356,11 @@ pub enum OrderAction {
         new_intent: OrderIntent,
     },
     /// Post a taker fallback order (bypass maker pipeline)
-    PostTakerFallback { intent: OrderIntent },
+    /// If cancel_order_id is set, cancel that order first and wait for collateral release.
+    PostTakerFallback {
+        cancel_order_id: Option<String>,
+        intent: OrderIntent,
+    },
 }
 
 // ============================================================================

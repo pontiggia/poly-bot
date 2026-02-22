@@ -416,25 +416,23 @@ impl Bot {
         }
         
         // Check if ANY of these order IDs are ones we're tracking
-        // CRITICAL: Also verify the token_id matches to prevent cross-token fill misattribution
+        // NOTE: For neg-risk markets, the User WS reports on-chain token IDs which differ
+        // from the CLOB token IDs we store. Match on order_id only (globally unique).
         let matched_order_id = our_order_ids
             .iter()
             .find(|id| {
                 let order_id_str = id.to_string();
                 if let Some(tracked) = self.order_tracker.get(&order_id_str) {
-                    // Must match BOTH order_id AND token_id
-                    if tracked.token_id == trade.asset_id {
-                        true
-                    } else {
-                        // Order ID matches but token doesn't - this is a critical mismatch!
-                        warn!(
-                            "⚠️ TOKEN MISMATCH: Fill for token {}... claims order {}... which tracks token {}...",
+                    if tracked.token_id != trade.asset_id {
+                        // Expected for neg-risk markets — on-chain token ID differs from CLOB token ID
+                        debug!(
+                            "Neg-risk token ID mapping: fill token {}... → tracked token {}... (order {}...)",
                             &trade.asset_id[..trade.asset_id.len().min(12)],
-                            &id[..id.len().min(16)],
-                            &tracked.token_id[..tracked.token_id.len().min(12)]
+                            &tracked.token_id[..tracked.token_id.len().min(12)],
+                            &id[..id.len().min(16)]
                         );
-                        false
                     }
+                    true
                 } else {
                     false
                 }
@@ -463,7 +461,21 @@ impl Bot {
 
         // Convert to Fill using the matched order ID (correctly uses matched_amount for makers)
         match trade.to_fill_for_order(&order_id) {
-            Ok(fill) => {
+            Ok(mut fill) => {
+                // For neg-risk markets, the fill's token_id is the on-chain token ID
+                // which differs from the CLOB token ID we track. Remap to CLOB token ID
+                // so strategies can match fills to their tracked positions.
+                if let Some(tracked) = self.order_tracker.get(&order_id) {
+                    if fill.token_id != tracked.token_id {
+                        debug!(
+                            "Remapping fill token_id: {} → {} (neg-risk)",
+                            &fill.token_id[..fill.token_id.len().min(12)],
+                            &tracked.token_id[..tracked.token_id.len().min(12)]
+                        );
+                        fill.token_id = tracked.token_id.clone();
+                    }
+                }
+
                 // ✅ FIX: Log whether this was maker or taker
                 let is_maker = trade.trader_side.to_uppercase() == "MAKER";
                 let execution_type = if is_maker {
@@ -592,7 +604,15 @@ impl Bot {
                     );
                     self.total_executions += 1;
                 }
-                OrderAction::PostTakerFallback { intent } => {
+                OrderAction::PostTakerFallback { cancel_order_id, intent } => {
+                    // Cancel the maker GTC order first to free collateral,
+                    // then wait for CLOB to process the cancellation
+                    if let Some(ref cancel_id) = cancel_order_id {
+                        let _ = executor.cancel_order(cancel_id).await;
+                        order_tracker.remove(cancel_id);
+                        // Brief delay for CLOB to release locked collateral
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
                     let result = executor.execute(&intent).await;
                     Self::handle_execution_result(
                         &intent, &result, &circuit_breaker, &order_tracker,
