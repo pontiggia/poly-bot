@@ -313,7 +313,7 @@ impl MomentumConfig {
         Self {
             trigger_window_secs: 15,
             trigger_fire_secs: 10,
-            min_conviction: dec!(0.75),
+            min_conviction: dec!(0.70),
             overwhelming_conviction: dec!(0.90),
             lookback_windows_ms: vec![60_000, 180_000, 300_000],
             lookback_weights: vec![dec!(0.5), dec!(0.3), dec!(0.2)],
@@ -662,16 +662,16 @@ impl MomentumStrategy {
         // If the market disagrees with us (low bid), require stronger conviction.
         // Rationale: bid=0.37 means market says 37% chance UP. Our spot oracle saying
         // "UP" with conv=0.75 isn't enough to overcome the market's view.
-        // Scale: bid < 0.35 → need conv ≥ 0.95
-        //        bid 0.35-0.45 → need conv ≥ 0.85
-        //        bid ≥ 0.45 → normal threshold applies
+        // Only kicks in when market clearly disagrees (bid < 0.35).
+        // In the 0.35–0.50 "contested" zone, normal threshold is fine — that's where
+        // most 5m crypto markets live and where our edge exists.
         if let Some(bid) = best_bid {
-            let required_conviction = if bid < dec!(0.35) {
+            let required_conviction = if bid < dec!(0.30) {
                 dec!(0.95)
-            } else if bid < dec!(0.45) {
+            } else if bid < dec!(0.35) {
                 dec!(0.85)
             } else {
-                tf_config.min_conviction
+                tf_config.min_conviction // Normal threshold for bid ≥ 0.35
             };
             if conviction < required_conviction {
                 debug!(
