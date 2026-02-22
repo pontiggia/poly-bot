@@ -111,6 +111,12 @@ pub struct MarketState {
     pub entry_instant: Option<Instant>,
     /// Entry timestamp in unix ms (for price history lookup)
     pub entry_timestamp_ms: Option<i64>,
+    /// Price we posted the maker order at (for cancel/replace tracking)
+    pub posted_price: Option<Decimal>,
+    /// Whether we've sent a cancel and are awaiting confirmation
+    pub pending_cancel: bool,
+    /// Market close time (unix timestamp)
+    pub close_time: Option<i64>,
 }
 
 impl MarketState {
@@ -131,6 +137,9 @@ impl MarketState {
             tp_order_id: None,
             entry_instant: None,
             entry_timestamp_ms: None,
+            posted_price: None,
+            pending_cancel: false,
+            close_time: None,
         }
     }
 }
@@ -255,8 +264,8 @@ pub struct MomentumConfig {
     pub lookback_weights: Vec<Decimal>,
 
     // === Maker Entry ===
-    /// Target buy price for maker GTC orders
-    pub maker_buy_price: Decimal,
+    /// Minimum acceptable entry price (skip if book price is below this)
+    pub min_entry_price: Decimal,
     /// Maximum time to wait for maker fill before taker fallback (ms)
     pub maker_fill_timeout_ms: u64,
     /// Cancel/replace loop interval (ms)
@@ -267,12 +276,16 @@ pub struct MomentumConfig {
     pub max_taker_price: Decimal,
 
     // === Inventory Exit ===
-    /// Take-profit price to post maker sell orders
-    pub take_profit_price: Decimal,
-    /// Aggressive take-profit (closer to resolution)
-    pub aggressive_tp_price: Decimal,
-    /// Stop-loss: minimum spot delta reversal to trigger emergency dump
+    /// Take-profit spread above entry price (e.g., 0.04 = 4 cents above entry)
+    pub tp_spread: Decimal,
+    /// Aggressive take-profit spread (wider margin if bid is very high)
+    pub aggressive_tp_spread: Decimal,
+    /// Stop-loss: minimum spot delta reversal to trigger emergency dump (Binance)
     pub stop_loss_reversal_pct: Decimal,
+    /// Book-based stop-loss: dump if best_bid drops this far below entry
+    pub book_stop_loss_spread: Decimal,
+    /// Force exit this many seconds before market resolution
+    pub max_hold_before_close_secs: u64,
 
     // === Sizing ===
     pub max_size_per_trade: Decimal,
@@ -292,13 +305,15 @@ impl MomentumConfig {
             overwhelming_conviction: dec!(0.85),
             lookback_windows_ms: vec![60_000, 180_000, 300_000],
             lookback_weights: vec![dec!(0.5), dec!(0.3), dec!(0.2)],
-            maker_buy_price: dec!(0.93),
+            min_entry_price: dec!(0.10),
             maker_fill_timeout_ms: 2000,
             cancel_replace_interval_ms: 150,
             max_taker_price: dec!(0.96),
-            take_profit_price: dec!(0.98),
-            aggressive_tp_price: dec!(0.99),
+            tp_spread: dec!(0.04),
+            aggressive_tp_spread: dec!(0.06),
             stop_loss_reversal_pct: dec!(-0.003),
+            book_stop_loss_spread: dec!(0.03),
+            max_hold_before_close_secs: 30,
             max_size_per_trade: dec!(15),
             max_total_exposure: dec!(40),
             assets: vec![
@@ -316,9 +331,10 @@ impl MomentumConfig {
     /// - Wider trigger window (30s) and fire point (15s) — more time for price to settle
     /// - Longer lookback windows (3m/10m/15m) — captures the full 15m trend
     /// - Longer maker fill timeout (3s) — 15m markets move slower
-    /// - Lower take-profit (0.97) — more realistic fill probability before resolution
-    /// - Lower aggressive TP (0.98) — same reasoning
+    /// - Tighter TP spread (0.03) — more realistic fill probability before resolution
     /// - Wider stop-loss (-0.5%) — avoids noise-triggered dumps on longer timeframe
+    /// - Wider book SL (0.04) — same reasoning
+    /// - Longer hold before close (45s) — more time to exit
     pub fn preset_15m() -> Self {
         Self {
             trigger_window_secs: 30,
@@ -327,13 +343,15 @@ impl MomentumConfig {
             overwhelming_conviction: dec!(0.85),
             lookback_windows_ms: vec![180_000, 600_000, 900_000],
             lookback_weights: vec![dec!(0.5), dec!(0.3), dec!(0.2)],
-            maker_buy_price: dec!(0.93),
+            min_entry_price: dec!(0.10),
             maker_fill_timeout_ms: 3000,
             cancel_replace_interval_ms: 150,
             max_taker_price: dec!(0.96),
-            take_profit_price: dec!(0.97),
-            aggressive_tp_price: dec!(0.98),
+            tp_spread: dec!(0.03),
+            aggressive_tp_spread: dec!(0.05),
             stop_loss_reversal_pct: dec!(-0.005),
+            book_stop_loss_spread: dec!(0.04),
+            max_hold_before_close_secs: 45,
             max_size_per_trade: dec!(15),
             max_total_exposure: dec!(40),
             assets: vec![
@@ -357,9 +375,9 @@ impl MomentumConfig {
                 config.min_conviction = d;
             }
         }
-        if let Ok(v) = std::env::var("MOMENTUM_MAKER_BUY_PRICE") {
+        if let Ok(v) = std::env::var("MOMENTUM_MIN_ENTRY_PRICE") {
             if let Ok(d) = v.parse::<Decimal>() {
-                config.maker_buy_price = d;
+                config.min_entry_price = d;
             }
         }
         if let Ok(v) = std::env::var("MOMENTUM_MAKER_FILL_TIMEOUT_MS") {
@@ -367,9 +385,14 @@ impl MomentumConfig {
                 config.maker_fill_timeout_ms = d;
             }
         }
-        if let Ok(v) = std::env::var("MOMENTUM_TAKE_PROFIT_PRICE") {
+        if let Ok(v) = std::env::var("MOMENTUM_TP_SPREAD") {
             if let Ok(d) = v.parse::<Decimal>() {
-                config.take_profit_price = d;
+                config.tp_spread = d;
+            }
+        }
+        if let Ok(v) = std::env::var("MOMENTUM_BOOK_SL_SPREAD") {
+            if let Ok(d) = v.parse::<Decimal>() {
+                config.book_stop_loss_spread = d;
             }
         }
         if let Ok(v) = std::env::var("MOMENTUM_STOP_LOSS_PCT") {
@@ -468,9 +491,11 @@ impl MomentumStrategy {
                 c.trigger_fire_secs = preset.trigger_fire_secs;           // 15s
                 c.lookback_windows_ms = preset.lookback_windows_ms;       // [180k, 600k, 900k]
                 c.maker_fill_timeout_ms = preset.maker_fill_timeout_ms;   // 3000ms (slower markets)
-                c.take_profit_price = preset.take_profit_price;           // 0.97 (more realistic fill)
-                c.aggressive_tp_price = preset.aggressive_tp_price;       // 0.98
+                c.tp_spread = preset.tp_spread;                           // 0.03 (tighter for 15m)
+                c.aggressive_tp_spread = preset.aggressive_tp_spread;     // 0.05
                 c.stop_loss_reversal_pct = preset.stop_loss_reversal_pct; // -0.5% (wider to avoid noise)
+                c.book_stop_loss_spread = preset.book_stop_loss_spread;   // 0.04 (wider for 15m)
+                c.max_hold_before_close_secs = preset.max_hold_before_close_secs; // 45s
                 c
             }
         }
@@ -565,10 +590,48 @@ impl MomentumStrategy {
             Direction::Neutral => return Vec::new(),
         };
 
+        // Dynamic pricing from order book
+        let best_bid = ctx.best_bid(&winning_token);
+        let best_ask = ctx.best_ask(&winning_token);
+
+        let maker_price = match (best_bid, best_ask) {
+            (Some(bid), Some(ask)) => {
+                // Post one tick above best bid (top of maker queue)
+                let target = bid + dec!(0.01);
+                if target >= ask {
+                    // Would cross — post one tick below best ask instead
+                    let safe_price = ask - dec!(0.01);
+                    if safe_price < dec!(0.01) {
+                        debug!("MomentumSniper: {} spread too tight, skipping", ms.asset);
+                        return Vec::new();
+                    }
+                    safe_price
+                } else {
+                    target
+                }
+            }
+            (Some(bid), None) => bid + dec!(0.01),
+            (None, Some(ask)) => ask - dec!(0.01),
+            (None, None) => {
+                debug!("MomentumSniper: {} no book data, skipping", ms.asset);
+                return Vec::new();
+            }
+        };
+
+        // Sanity: don't buy below min entry price or above max taker price
+        if maker_price < tf_config.min_entry_price {
+            debug!(
+                "MomentumSniper: {} price {} below min_entry_price {}, skipping",
+                ms.asset, maker_price, tf_config.min_entry_price
+            );
+            return Vec::new();
+        }
+        let maker_price = maker_price.min(tf_config.max_taker_price);
+
         // Sizing
-        let max_affordable = (ctx.available_cash() / tf_config.maker_buy_price).floor();
+        let max_affordable = (ctx.available_cash() / maker_price).floor();
         let remaining_exposure = tf_config.max_total_exposure - ctx.total_exposure();
-        let max_from_exposure = (remaining_exposure / tf_config.maker_buy_price).floor();
+        let max_from_exposure = (remaining_exposure / maker_price).floor();
         let trade_size = tf_config
             .max_size_per_trade
             .min(max_affordable)
@@ -576,7 +639,7 @@ impl MomentumStrategy {
             .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero);
 
         // Need at least $1 order value
-        let min_shares = (dec!(1) / tf_config.maker_buy_price).ceil();
+        let min_shares = (dec!(1) / maker_price).ceil();
         if trade_size < min_shares {
             debug!("MomentumSniper: insufficient cash for trade");
             ms.state = SniperState::Completed;
@@ -590,27 +653,30 @@ impl MomentumStrategy {
         };
 
         info!(
-            "{} Momentum: {} {} (conv={:.3}, {}s to close) → MAKER BUY {} @ {} x {}",
+            "{} Momentum: {} {} (conv={:.3}, {}s to close) → MAKER BUY {} @ {} x {} (bid={:?} ask={:?})",
             ms.timeframe.label(),
             ms.asset,
             dir_label,
             conviction,
             secs_until_close,
             &winning_token[..winning_token.len().min(12)],
-            tf_config.maker_buy_price,
+            maker_price,
             trade_size,
+            best_bid,
+            best_ask,
         );
 
         // Transition to MakerPosted
         ms.target_token_id = winning_token.clone();
         ms.state = SniperState::MakerPosted;
         ms.maker_posted_at = Some(Instant::now());
+        ms.posted_price = Some(maker_price);
 
         let intent = OrderIntent::new(
             ms.condition_id.clone(),
             winning_token,
             Side::Buy,
-            tf_config.maker_buy_price,
+            maker_price,
             trade_size,
             Urgency::Passive, // GTC maker
             format!(
@@ -628,7 +694,7 @@ impl MomentumStrategy {
         vec![intent]
     }
 
-    /// Process InventoryHeld — check for take-profit or stop-loss
+    /// Process InventoryHeld — check for take-profit, stop-loss, and emergency exits
     fn process_inventory_held(
         &self,
         ms: &mut MarketState,
@@ -640,7 +706,80 @@ impl MomentumStrategy {
             None => return Vec::new(),
         };
 
-        // Stop-loss: check Binance delta reversal since entry
+        let entry_price = ms.entry_price.unwrap_or(Decimal::ZERO);
+        let entry_size = ms.entry_size.unwrap_or(Decimal::ZERO);
+        if entry_price <= Decimal::ZERO || entry_size <= Decimal::ZERO {
+            return Vec::new();
+        }
+
+        // === EMERGENCY EXIT: Time-based (force exit before market close) ===
+        if let Some(close_time) = ms.close_time {
+            let secs_until_close = close_time - ctx.utc_now.timestamp();
+            if secs_until_close < tf_config.max_hold_before_close_secs as i64 {
+                let sell_price = ctx
+                    .best_bid(&ms.target_token_id)
+                    .unwrap_or(dec!(0.50));
+
+                warn!(
+                    "EMERGENCY EXIT: {} {} {}s until close → FAK SELL {} @ {}",
+                    ms.asset,
+                    ms.timeframe.label(),
+                    secs_until_close,
+                    entry_size,
+                    sell_price,
+                );
+
+                ms.state = SniperState::StopLoss;
+
+                return vec![OrderIntent::new(
+                    ms.condition_id.clone(),
+                    ms.target_token_id.clone(),
+                    Side::Sell,
+                    sell_price,
+                    entry_size,
+                    Urgency::Normal, // FAK
+                    format!("emergency-exit {} {}", ms.asset, ms.timeframe.label()),
+                    "MomentumSniper",
+                )
+                .with_fee_rate(pair.fee_rate_bps)
+                .with_priority(95)]; // Highest priority
+            }
+        }
+
+        // === STOP-LOSS 1: Book-based (best_bid dropped below entry - spread) ===
+        let book_sl_price = entry_price - tf_config.book_stop_loss_spread;
+        if let Some(best_bid) = ctx.best_bid(&ms.target_token_id) {
+            if best_bid < book_sl_price {
+                let sell_price = best_bid; // Dump at current best bid
+
+                warn!(
+                    "BOOK STOP-LOSS: {} {} best_bid={} < sl_price={} → FAK SELL {} @ {}",
+                    ms.asset,
+                    ms.timeframe.label(),
+                    best_bid,
+                    book_sl_price,
+                    entry_size,
+                    sell_price,
+                );
+
+                ms.state = SniperState::StopLoss;
+
+                return vec![OrderIntent::new(
+                    ms.condition_id.clone(),
+                    ms.target_token_id.clone(),
+                    Side::Sell,
+                    sell_price,
+                    entry_size,
+                    Urgency::Normal, // FAK
+                    format!("book-sl {} {}", ms.asset, ms.timeframe.label()),
+                    "MomentumSniper",
+                )
+                .with_fee_rate(pair.fee_rate_bps)
+                .with_priority(90)];
+            }
+        }
+
+        // === STOP-LOSS 2: Binance delta reversal (crash protection) ===
         if let Some(entry_ts_ms) = ms.entry_timestamp_ms {
             let now_ms = ctx.utc_now.timestamp_millis();
             let ms_since_entry = now_ms - entry_ts_ms;
@@ -653,84 +792,78 @@ impl MomentumStrategy {
                 };
 
                 if reversal < tf_config.stop_loss_reversal_pct {
-                    let entry_size = ms.entry_size.unwrap_or(Decimal::ZERO);
-                    if entry_size > Decimal::ZERO {
-                        // Get best bid for aggressive dump
-                        let sell_price = ctx
-                            .best_bid(&ms.target_token_id)
-                            .map(|b| b - dec!(0.01))
-                            .unwrap_or(dec!(0.50));
+                    let sell_price = ctx
+                        .best_bid(&ms.target_token_id)
+                        .map(|b| b - dec!(0.01))
+                        .unwrap_or(dec!(0.50));
 
-                        warn!(
-                            "STOP-LOSS: {} {} reversal={:.4}% (threshold={:.3}%) → FAK SELL {} @ {}",
-                            ms.asset,
-                            ms.timeframe.label(),
-                            reversal * dec!(100),
-                            tf_config.stop_loss_reversal_pct * dec!(100),
-                            entry_size,
-                            sell_price,
-                        );
+                    warn!(
+                        "BINANCE STOP-LOSS: {} {} reversal={:.4}% (threshold={:.3}%) → FAK SELL {} @ {}",
+                        ms.asset,
+                        ms.timeframe.label(),
+                        reversal * dec!(100),
+                        tf_config.stop_loss_reversal_pct * dec!(100),
+                        entry_size,
+                        sell_price,
+                    );
 
-                        ms.state = SniperState::StopLoss;
+                    ms.state = SniperState::StopLoss;
 
-                        return vec![OrderIntent::new(
-                            ms.condition_id.clone(),
-                            ms.target_token_id.clone(),
-                            Side::Sell,
-                            sell_price,
-                            entry_size,
-                            Urgency::Normal, // FAK
-                            format!("stop-loss {} {}", ms.asset, ms.timeframe.label()),
-                            "MomentumSniper",
-                        )
-                        .with_fee_rate(pair.fee_rate_bps)
-                        .with_priority(90)]; // High priority
-                    }
+                    return vec![OrderIntent::new(
+                        ms.condition_id.clone(),
+                        ms.target_token_id.clone(),
+                        Side::Sell,
+                        sell_price,
+                        entry_size,
+                        Urgency::Normal, // FAK
+                        format!("binance-sl {} {}", ms.asset, ms.timeframe.label()),
+                        "MomentumSniper",
+                    )
+                    .with_fee_rate(pair.fee_rate_bps)
+                    .with_priority(90)];
                 }
             }
         }
 
-        // Take-profit: check best bid
-        if let Some(best_bid) = ctx.best_bid(&ms.target_token_id) {
-            let entry_size = ms.entry_size.unwrap_or(Decimal::ZERO);
-            if entry_size <= Decimal::ZERO {
-                return Vec::new();
-            }
+        // === TAKE-PROFIT: Post GTC SELL at entry + tp_spread immediately ===
+        let tp_price = (entry_price + tf_config.tp_spread).min(dec!(0.99));
 
-            let tp_price = if best_bid >= tf_config.aggressive_tp_price {
-                tf_config.aggressive_tp_price
-            } else if best_bid >= tf_config.take_profit_price {
-                tf_config.take_profit_price
+        // Check if book bid has risen enough for aggressive TP
+        let final_tp_price = if let Some(best_bid) = ctx.best_bid(&ms.target_token_id) {
+            let aggressive_tp = (entry_price + tf_config.aggressive_tp_spread).min(dec!(0.99));
+            if best_bid >= aggressive_tp {
+                aggressive_tp // Bid is very high, take aggressive TP
             } else {
-                return Vec::new(); // Not at TP level yet
-            };
+                tp_price // Standard TP
+            }
+        } else {
+            tp_price
+        };
 
-            info!(
-                "TAKE-PROFIT: {} {} best_bid={} → MAKER SELL {} @ {}",
-                ms.asset,
-                ms.timeframe.label(),
-                best_bid,
-                entry_size,
-                tp_price,
-            );
+        info!(
+            "TAKE-PROFIT: {} {} entry={} → MAKER SELL {} @ {} (tp_spread={})",
+            ms.asset,
+            ms.timeframe.label(),
+            entry_price,
+            entry_size,
+            final_tp_price,
+            tf_config.tp_spread,
+        );
 
-            ms.state = SniperState::TPPosted;
+        ms.state = SniperState::TPPosted;
 
-            return vec![OrderIntent::new(
-                ms.condition_id.clone(),
-                ms.target_token_id.clone(),
-                Side::Sell,
-                tp_price,
-                entry_size,
-                Urgency::Passive, // GTC maker sell
-                format!("take-profit {} {}", ms.asset, ms.timeframe.label()),
-                "MomentumSniper",
-            )
-            .with_fee_rate(pair.fee_rate_bps)
-            .with_priority(70)];
-        }
-
-        Vec::new()
+        vec![OrderIntent::new(
+            ms.condition_id.clone(),
+            ms.target_token_id.clone(),
+            Side::Sell,
+            final_tp_price,
+            entry_size,
+            Urgency::Passive, // GTC maker sell
+            format!("take-profit {} {}", ms.asset, ms.timeframe.label()),
+            "MomentumSniper",
+        )
+        .with_fee_rate(pair.fee_rate_bps)
+        .with_priority(70)]
     }
 }
 
@@ -821,6 +954,11 @@ impl Strategy for MomentumStrategy {
                 .markets
                 .entry(condition_id.clone())
                 .or_insert_with(|| MarketState::new(condition_id.clone(), asset.clone(), timeframe));
+
+            // Store close_time for use in inventory management
+            if ms.close_time.is_none() {
+                ms.close_time = Some(close_time);
+            }
 
             match ms.state {
                 SniperState::Idle => {
@@ -967,7 +1105,7 @@ impl Strategy for MomentumStrategy {
                         continue;
                     }
 
-                    // Cancel/replace loop: check if our order is still competitive
+                    // Cancel/replace loop: re-derive optimal price from book each tick
                     let should_replace = ms
                         .last_cancel_replace
                         .map(|t| t.elapsed().as_millis() as u64 >= self.config.cancel_replace_interval_ms)
@@ -975,40 +1113,52 @@ impl Strategy for MomentumStrategy {
 
                     if should_replace {
                         if let Some(ref order_id) = ms.maker_order_id {
-                            // Check if book has moved (our price no longer competitive)
-                            if let Some(best_ask) = ctx.best_ask(&ms.target_token_id) {
-                                // If best ask dropped below our buy price, we should adjust
-                                if best_ask < self.config.maker_buy_price {
-                                    let new_price = (best_ask - dec!(0.01)).max(dec!(0.90));
-                                    debug!(
-                                        "MomentumSniper: {} cancel/replace {} → {}",
-                                        ms.asset, self.config.maker_buy_price, new_price
-                                    );
+                            let best_bid = ctx.best_bid(&ms.target_token_id);
+                            let best_ask = ctx.best_ask(&ms.target_token_id);
 
-                                    let pair = match self.registry.get_by_condition(&ms.condition_id) {
-                                        Some(p) => p,
-                                        None => continue,
-                                    };
+                            if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
+                                // Compute optimal maker price (same logic as initial entry)
+                                let target = bid + dec!(0.01);
+                                let optimal_price = if target >= ask {
+                                    ask - dec!(0.01)
+                                } else {
+                                    target
+                                };
 
-                                    let trade_size = self.config.max_size_per_trade;
+                                if let Some(posted) = ms.posted_price {
+                                    if optimal_price != posted && optimal_price >= dec!(0.01) {
+                                        debug!(
+                                            "MomentumSniper: {} cancel/replace {} → {} (bid={} ask={})",
+                                            ms.asset, posted, optimal_price, bid, ask
+                                        );
 
-                                    let new_intent = OrderIntent::new(
-                                        ms.condition_id.clone(),
-                                        ms.target_token_id.clone(),
-                                        Side::Buy,
-                                        new_price,
-                                        trade_size,
-                                        Urgency::Passive,
-                                        format!("cancel/replace {} {}", ms.asset, ms.timeframe.label()),
-                                        "MomentumSniper",
-                                    )
-                                    .with_fee_rate(pair.fee_rate_bps)
-                                    .with_priority(60);
+                                        let pair = match self.registry.get_by_condition(&ms.condition_id) {
+                                            Some(p) => p,
+                                            None => continue,
+                                        };
 
-                                    actions.push(OrderAction::Replace {
-                                        old_order_id: order_id.clone(),
-                                        new_intent,
-                                    });
+                                        let trade_size = self.config.max_size_per_trade;
+
+                                        let new_intent = OrderIntent::new(
+                                            ms.condition_id.clone(),
+                                            ms.target_token_id.clone(),
+                                            Side::Buy,
+                                            optimal_price,
+                                            trade_size,
+                                            Urgency::Passive,
+                                            format!("cancel/replace {} {}", ms.asset, ms.timeframe.label()),
+                                            "MomentumSniper",
+                                        )
+                                        .with_fee_rate(pair.fee_rate_bps)
+                                        .with_priority(60);
+
+                                        ms.posted_price = Some(optimal_price);
+
+                                        actions.push(OrderAction::Replace {
+                                            old_order_id: order_id.clone(),
+                                            new_intent,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -1036,6 +1186,23 @@ impl Strategy for MomentumStrategy {
                     if fill.side == Side::Buy {
                         info!(
                             "MomentumSniper: {} {} FILLED {} @ {} → InventoryHeld",
+                            ms.asset,
+                            ms.timeframe.label(),
+                            fill.size,
+                            fill.price,
+                        );
+                        ms.entry_price = Some(fill.price);
+                        ms.entry_size = Some(fill.size);
+                        ms.entry_instant = Some(Instant::now());
+                        ms.entry_timestamp_ms = Some(chrono::Utc::now().timestamp_millis());
+                        ms.state = SniperState::InventoryHeld;
+                    }
+                }
+                SniperState::Completed => {
+                    // Late fill recovery: a fill arrived after state timed out
+                    if fill.side == Side::Buy {
+                        warn!(
+                            "MomentumSniper: {} {} LATE FILL after timeout: {} @ {} → recovering to InventoryHeld",
                             ms.asset,
                             ms.timeframe.label(),
                             fill.size,
@@ -1324,6 +1491,9 @@ mod tests {
                 tp_order_id: None,
                 entry_instant: Some(Instant::now()),
                 entry_timestamp_ms: Some(now_ms - 5000), // Entered 5s ago
+                posted_price: None,
+                pending_cancel: false,
+                close_time: None,
             },
         );
 

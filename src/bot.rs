@@ -33,7 +33,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Main bot struct that orchestrates all components
 pub struct Bot {
@@ -77,6 +77,8 @@ pub struct Bot {
     total_executions: u64,
     /// Total fills received
     total_fills: u64,
+    /// Ignored fills (non-tracked order notifications)
+    ignored_fills: u64,
     /// Seen trade IDs (for deduplication)
     seen_trade_ids: HashSet<String>,
     /// Subscription sender for dynamic WS market subscriptions
@@ -116,10 +118,11 @@ impl Bot {
         // Register MomentumSniper strategy (5m + 15m markets)
         let momentum_config = crate::strategy::MomentumConfig::default_live_test();
         info!(
-            "Registering MomentumSniper: conviction>={}, maker_buy={}, TP={}, max_exposure=${}",
+            "Registering MomentumSniper: conviction>={}, min_entry={}, tp_spread={}, book_sl={}, max_exposure=${}",
             momentum_config.min_conviction,
-            momentum_config.maker_buy_price,
-            momentum_config.take_profit_price,
+            momentum_config.min_entry_price,
+            momentum_config.tp_spread,
+            momentum_config.book_stop_loss_spread,
             momentum_config.max_total_exposure,
         );
         let momentum = Arc::new(crate::strategy::MomentumStrategy::new(
@@ -272,6 +275,7 @@ impl Bot {
             total_intents: 0,
             total_executions: 0,
             total_fills: 0,
+            ignored_fills: 0,
             seen_trade_ids: HashSet::new(),
             ws_subscription_tx,
             spot_prices,
@@ -439,13 +443,13 @@ impl Bot {
         let order_id = match matched_order_id {
             Some(id) => id.to_string(),
             None => {
-                // Not our order - could be a market trade we're just seeing
-                debug!(
-                    "Trade for unknown order(s) {:?}, not ours - skipping (size: {}, price: {})",
-                    our_order_ids.iter().map(|id| &id[..id.len().min(16)]).collect::<Vec<_>>(),
+                // Not our order — suppress unless trace mode
+                trace!(
+                    "Ignoring trade for non-tracked order(s) (token: {}..., size: {})",
+                    &trade.asset_id[..trade.asset_id.len().min(12)],
                     trade.size,
-                    trade.price
                 );
+                self.ignored_fills += 1;
                 return;
             }
         };
@@ -478,6 +482,17 @@ impl Bot {
                     fill.fee,
                     &order_id[..order_id.len().min(16)]
                 );
+
+                // Price slip warning: compare fill price to intended price
+                if let Some(tracked) = self.order_tracker.get(&order_id) {
+                    let price_diff = (fill.price - tracked.price).abs();
+                    if price_diff > rust_decimal_macros::dec!(0.05) {
+                        warn!(
+                            "PRICE SLIP: Fill @ {} vs intended @ {} (diff={})",
+                            fill.price, tracked.price, price_diff
+                        );
+                    }
+                }
 
                 // Record fill in ledger
                 self.ledger.process_fill(fill.clone());
@@ -616,7 +631,7 @@ impl Bot {
         };
 
         info!(
-            "Heartbeat [{}]: {} markets | {} msgs | {:.1} msg/s | {} intents | {} execs | {} fills | {} active | CB: {} | {}",
+            "Heartbeat [{}]: {} markets | {} msgs | {:.1} msg/s | {} intents | {} execs | {} fills | {} ignored | {} active | CB: {} | {}",
             mode_str,
             self.order_book_state.num_markets(),
             self.total_messages,
@@ -624,6 +639,7 @@ impl Bot {
             self.total_intents,
             self.total_executions,
             self.total_fills,
+            self.ignored_fills,
             active_orders,
             circuit_status,
             spot_info
