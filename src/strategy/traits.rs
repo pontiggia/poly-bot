@@ -174,6 +174,9 @@ pub struct StrategyContext<'a> {
 
     /// Whether the CLOB exchange is healthy (accepting orders)
     pub exchange_healthy: bool,
+
+    /// Whether the balance ledger is in sync with exchange (drift < threshold)
+    pub balance_healthy: bool,
 }
 
 impl<'a> StrategyContext<'a> {
@@ -188,6 +191,7 @@ impl<'a> StrategyContext<'a> {
             price_history: None,
             order_tracker: None,
             exchange_healthy: true, // Assume healthy until told otherwise
+            balance_healthy: true,
         }
     }
 
@@ -214,9 +218,20 @@ impl<'a> StrategyContext<'a> {
         self
     }
 
+    /// Set balance health status (drift < threshold)
+    pub fn with_balance_health(mut self, healthy: bool) -> Self {
+        self.balance_healthy = healthy;
+        self
+    }
+
     /// Check if the exchange is healthy
     pub fn is_exchange_healthy(&self) -> bool {
         self.exchange_healthy
+    }
+
+    /// Check if the balance ledger is in sync with exchange
+    pub fn is_balance_healthy(&self) -> bool {
+        self.balance_healthy
     }
 
     /// Get the latest spot price for an asset (e.g., "btc")

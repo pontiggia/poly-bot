@@ -122,6 +122,8 @@ pub struct MarketState {
     pub entry_timestamp_ms: Option<i64>,
     /// Price we posted the maker order at (for cancel/replace tracking)
     pub posted_price: Option<Decimal>,
+    /// The initial entry price (first maker post — for max_chase_cents guard)
+    pub initial_entry_price: Option<Decimal>,
     /// Market close time (unix timestamp)
     pub close_time: Option<i64>,
     /// Whether we've logged the "HOLD TO RESOLUTION" message
@@ -148,6 +150,7 @@ impl MarketState {
             entry_instant: None,
             entry_timestamp_ms: None,
             posted_price: None,
+            initial_entry_price: None,
             close_time: None,
             hold_logged: false,
         }
@@ -291,6 +294,8 @@ pub struct MomentumConfig {
     pub maker_entry_timeout_secs: u64,
     /// Cancel/replace loop interval (ms)
     pub cancel_replace_interval_ms: u64,
+    /// Max cents above initial entry price to chase (prevents crossing spread)
+    pub max_chase_cents: Decimal,
 
     // === Take Profit (Dynamic) ===
     /// Minimum profit per share to target (e.g., 0.15 = 15 cents)
@@ -334,11 +339,12 @@ impl MomentumConfig {
 
             // Maker entry
             maker_entry_timeout_secs: 60,
-            cancel_replace_interval_ms: 200,
+            cancel_replace_interval_ms: 500,
+            max_chase_cents: dec!(0.03),
 
-            // Take profit (dynamic: entry + min_profit, clamped to floor/ceiling)
-            tp_min_profit: dec!(0.15),
-            tp_floor_price: dec!(0.70),
+            // Take profit (dynamic: entry + min_profit, capped at ceiling — NO floor)
+            tp_min_profit: dec!(0.10),
+            tp_floor_price: dec!(0.70),  // kept for config compat, NOT used in formula
             tp_ceiling_price: dec!(0.95),
 
             // Stop loss — ONLY on massive Binance reversal
@@ -378,11 +384,12 @@ impl MomentumConfig {
 
             // Maker entry
             maker_entry_timeout_secs: 30,
-            cancel_replace_interval_ms: 200,
+            cancel_replace_interval_ms: 500,
+            max_chase_cents: dec!(0.03),
 
-            // Take profit (dynamic: entry + min_profit, clamped to floor/ceiling)
-            tp_min_profit: dec!(0.12),
-            tp_floor_price: dec!(0.65),
+            // Take profit (dynamic: entry + min_profit, capped at ceiling — NO floor)
+            tp_min_profit: dec!(0.08),
+            tp_floor_price: dec!(0.65),  // kept for config compat, NOT used in formula
             tp_ceiling_price: dec!(0.93),
 
             // Stop loss
@@ -553,6 +560,8 @@ impl MomentumStrategy {
                 c.lookback_windows_ms = preset.lookback_windows_ms;
                 c.lookback_weights = preset.lookback_weights;
                 c.maker_entry_timeout_secs = preset.maker_entry_timeout_secs;
+                c.cancel_replace_interval_ms = preset.cancel_replace_interval_ms;
+                c.max_chase_cents = preset.max_chase_cents;
                 c.tp_min_profit = preset.tp_min_profit;
                 c.tp_floor_price = preset.tp_floor_price;
                 c.tp_ceiling_price = preset.tp_ceiling_price;
@@ -683,6 +692,15 @@ impl MomentumStrategy {
         if !ctx.is_exchange_healthy() {
             debug!(
                 "ConvictionRider: {} exchange unhealthy, skipping",
+                ms.asset
+            );
+            return Vec::new();
+        }
+
+        // Don't fire if balance drifted (ledger vs exchange mismatch)
+        if !ctx.is_balance_healthy() {
+            warn!(
+                "ConvictionRider: {} balance unhealthy (drift detected), blocking new entries",
                 ms.asset
             );
             return Vec::new();
@@ -830,6 +848,7 @@ impl MomentumStrategy {
         ms.state = SniperState::MakerEntry;
         ms.maker_posted_at = Some(Instant::now());
         ms.posted_price = Some(maker_price);
+        ms.initial_entry_price = Some(maker_price);
 
         let intent = OrderIntent::new(
             ms.condition_id.clone(),
@@ -932,10 +951,10 @@ impl MomentumStrategy {
         }
 
         // === TAKE-PROFIT: Dynamic TP based on entry price ===
-        // tp_price = max(entry + min_profit, floor), capped at ceiling
+        // === FIX: tp_price = entry + min_profit, capped at ceiling (NO floor) ===
+        // The floor was making TPs unreachable for low-entry tokens (e.g., entry $0.33, floor $0.70 = +112%)
         let raw_tp = entry_price + tf_config.tp_min_profit;
         let tp_price = raw_tp
-            .max(tf_config.tp_floor_price)
             .min(tf_config.tp_ceiling_price)
             .min(dec!(0.99));
 
@@ -946,7 +965,7 @@ impl MomentumStrategy {
         );
 
         info!(
-            "TAKE-PROFIT: {} {} entry={} -> MAKER SELL {} @ {} (entry+{}={}, floor={}, ceiling={})",
+            "TAKE-PROFIT: {} {} entry={} -> MAKER SELL {} @ {} (entry+{}={}, ceiling={})",
             ms.asset,
             ms.timeframe.label(),
             entry_price,
@@ -954,7 +973,6 @@ impl MomentumStrategy {
             tp_price,
             tf_config.tp_min_profit,
             raw_tp,
-            tf_config.tp_floor_price,
             tf_config.tp_ceiling_price,
         );
 
@@ -1014,9 +1032,9 @@ impl Strategy for MomentumStrategy {
 
         // Pre-compute active position count BEFORE entering the DashMap loop
         // to avoid deadlock (iter() inside entry() lock = deadlock)
-        let active_count = self.active_position_count();
-        let up_count = self.active_positions_in_direction(Direction::Up);
-        let down_count = self.active_positions_in_direction(Direction::Down);
+        let mut active_count = self.active_position_count();
+        let mut up_count = self.active_positions_in_direction(Direction::Up);
+        let mut down_count = self.active_positions_in_direction(Direction::Down);
 
         let pairs = self.registry.filter(|pair| {
             Self::is_momentum_eligible(&pair.event_slug) && pair.close_time.is_some()
@@ -1086,6 +1104,16 @@ impl Strategy for MomentumStrategy {
                 SniperState::Monitoring => {
                     let new_intents =
                         self.process_monitoring(&mut ms, secs_until_close, elapsed, ctx, &tf_config, active_count, up_count, down_count);
+                    if !new_intents.is_empty() {
+                        // === FIX: Increment counts so subsequent markets in this tick
+                        // see the updated position counts (prevents same-tick race) ===
+                        active_count += 1;
+                        match ms.direction {
+                            Direction::Up => up_count += 1,
+                            Direction::Down => down_count += 1,
+                            Direction::Neutral => {}
+                        }
+                    }
                     intents.extend(new_intents);
                 }
                 SniperState::InventoryHeld => {
@@ -1219,6 +1247,27 @@ impl Strategy for MomentumStrategy {
                         continue;
                     }
 
+                    // === FIX: Stop chasing if we already have enough shares ===
+                    let already_filled = ms.entry_size.unwrap_or(Decimal::ZERO);
+                    let remaining = tf_config.max_size_per_trade - already_filled;
+                    if remaining <= Decimal::ZERO {
+                        // Already fully filled from partial fills during cancel/replace
+                        info!(
+                            "ConvictionRider: {} already filled {} shares (max={}), stopping chase",
+                            ms.asset, already_filled, tf_config.max_size_per_trade
+                        );
+                        // Cancel any outstanding order and transition
+                        actions.push(OrderAction::CancelAllForToken {
+                            token_id: ms.target_token_id.clone(),
+                        });
+                        if already_filled >= dec!(5) {
+                            ms.state = SniperState::InventoryHeld;
+                        } else {
+                            ms.state = SniperState::Completed;
+                        }
+                        continue;
+                    }
+
                     let should_replace = ms
                         .last_cancel_replace
                         .map(|t| {
@@ -1241,6 +1290,39 @@ impl Strategy for MomentumStrategy {
                                     target
                                 };
 
+                                // === FIX: Enforce max_entry_price ceiling ===
+                                if optimal_price > tf_config.max_entry_price {
+                                    debug!(
+                                        "ConvictionRider: {} optimal {} > max_entry {}, clamping",
+                                        ms.asset, optimal_price, tf_config.max_entry_price
+                                    );
+                                    // Don't replace — current order is already at or near ceiling
+                                    ms.last_cancel_replace = Some(Instant::now());
+                                    continue;
+                                }
+
+                                // === FIX: Enforce max_chase_cents above initial price ===
+                                if let Some(initial) = ms.initial_entry_price {
+                                    if optimal_price > initial + tf_config.max_chase_cents {
+                                        debug!(
+                                            "ConvictionRider: {} chase limit reached: {} > {} + {} cents",
+                                            ms.asset, optimal_price, initial, tf_config.max_chase_cents
+                                        );
+                                        ms.last_cancel_replace = Some(Instant::now());
+                                        continue;
+                                    }
+                                }
+
+                                // === FIX: Never cross the ask (strict maker-only) ===
+                                if optimal_price >= ask {
+                                    debug!(
+                                        "ConvictionRider: {} price {} would cross ask {}, skipping",
+                                        ms.asset, optimal_price, ask
+                                    );
+                                    ms.last_cancel_replace = Some(Instant::now());
+                                    continue;
+                                }
+
                                 if let Some(posted) = ms.posted_price {
                                     if optimal_price != posted && optimal_price >= dec!(0.01) {
                                         debug!(
@@ -1254,7 +1336,15 @@ impl Strategy for MomentumStrategy {
                                                 None => continue,
                                             };
 
-                                        let trade_size = tf_config.max_size_per_trade;
+                                        // === FIX: Size = remaining shares, not max ===
+                                        let trade_size = remaining
+                                            .min(tf_config.max_size_per_trade)
+                                            .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero);
+
+                                        if trade_size < Decimal::ONE {
+                                            ms.last_cancel_replace = Some(Instant::now());
+                                            continue;
+                                        }
 
                                         let new_intent = OrderIntent::new(
                                             ms.condition_id.clone(),
@@ -1800,6 +1890,7 @@ mod tests {
                 posted_price: None,
                 close_time: None,
                 hold_logged: false,
+                initial_entry_price: None,
             },
         );
 
@@ -1913,42 +2004,40 @@ mod tests {
 
     #[test]
     fn test_tp_price_calculation() {
-        // Verify dynamic TP config values
+        // Verify dynamic TP config values (updated: lowered tp_min_profit, floor kept for compat but NOT used)
         let config_5m = MomentumConfig::preset_5m_rider();
-        assert_eq!(config_5m.tp_min_profit, dec!(0.12));
-        assert_eq!(config_5m.tp_floor_price, dec!(0.65));
+        assert_eq!(config_5m.tp_min_profit, dec!(0.08));
         assert_eq!(config_5m.tp_ceiling_price, dec!(0.93));
 
         let config_15m = MomentumConfig::preset_15m_rider();
-        assert_eq!(config_15m.tp_min_profit, dec!(0.15));
-        assert_eq!(config_15m.tp_floor_price, dec!(0.70));
+        assert_eq!(config_15m.tp_min_profit, dec!(0.10));
         assert_eq!(config_15m.tp_ceiling_price, dec!(0.95));
 
-        // Verify dynamic TP calculation: entry + min_profit, clamped to floor/ceiling
+        // Verify dynamic TP calculation: entry + min_profit, clamped to ceiling (NO floor)
         let config = MomentumConfig::preset_15m_rider();
 
-        // Entry 0.57 -> raw 0.72, floor 0.70, ceiling 0.95 -> 0.72
+        // Entry 0.57 -> raw 0.67, ceiling 0.95 -> 0.67
         let entry = dec!(0.57);
         let raw = entry + config.tp_min_profit;
-        let tp = raw.max(config.tp_floor_price).min(config.tp_ceiling_price).min(dec!(0.99));
-        assert_eq!(tp, dec!(0.72));
+        let tp = raw.min(config.tp_ceiling_price).min(dec!(0.99));
+        assert_eq!(tp, dec!(0.67));
 
-        // Entry 0.40 -> raw 0.55, floor 0.70 -> 0.70 (floor kicks in)
+        // Entry 0.40 -> raw 0.50, ceiling 0.95 -> 0.50 (no floor, so just entry+min_profit)
         let entry = dec!(0.40);
         let raw = entry + config.tp_min_profit;
-        let tp = raw.max(config.tp_floor_price).min(config.tp_ceiling_price).min(dec!(0.99));
-        assert_eq!(tp, dec!(0.70));
+        let tp = raw.min(config.tp_ceiling_price).min(dec!(0.99));
+        assert_eq!(tp, dec!(0.50));
 
-        // Entry 0.65 -> raw 0.80, floor 0.70, ceiling 0.95 -> 0.80
+        // Entry 0.65 -> raw 0.75, ceiling 0.95 -> 0.75
         let entry = dec!(0.65);
         let raw = entry + config.tp_min_profit;
-        let tp = raw.max(config.tp_floor_price).min(config.tp_ceiling_price).min(dec!(0.99));
-        assert_eq!(tp, dec!(0.80));
+        let tp = raw.min(config.tp_ceiling_price).min(dec!(0.99));
+        assert_eq!(tp, dec!(0.75));
 
-        // Ceiling cap: entry 0.85 -> raw 1.00 -> capped at 0.95
-        let entry = dec!(0.85);
+        // Ceiling cap: entry 0.88 -> raw 0.98 -> capped at 0.95
+        let entry = dec!(0.88);
         let raw = entry + config.tp_min_profit;
-        let tp = raw.max(config.tp_floor_price).min(config.tp_ceiling_price).min(dec!(0.99));
+        let tp = raw.min(config.tp_ceiling_price).min(dec!(0.99));
         assert_eq!(tp, dec!(0.95));
     }
 
@@ -1993,6 +2082,7 @@ mod tests {
                 posted_price: Some(dec!(0.50)),
                 close_time: Some(chrono::Utc::now().timestamp() + 200),
                 hold_logged: false,
+                initial_entry_price: None,
             },
         );
 
@@ -2065,6 +2155,7 @@ mod tests {
                 posted_price: None,
                 close_time: Some(now + 20),
                 hold_logged: false,
+                initial_entry_price: None,
             },
         );
 
