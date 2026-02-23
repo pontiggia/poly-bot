@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
-use crate::api::types::OrderType;
+use crate::api::types::{OrderType, Side};
 use crate::error::ErrorType;
 use crate::exchange::{Exchange, ExchangeError, ExchangeOrderParams, ExchangeOrderType};
 use crate::execution::policy::{ExecutionPolicy, IntentRef};
@@ -141,6 +141,63 @@ impl OrderExecutor {
             "Executing order via SDK"
         );
 
+        // === PRE-SELL BALANCE SYNCHRONIZATION ===
+        // For SELL orders, we must ensure the CLOB's off-chain balance cache
+        // reflects our actual on-chain token holdings. Without this:
+        //   1. The CLOB cache may still show zero (pre-buy state)
+        //   2. The actual token amount may differ from size_matched (fractional slippage)
+        //
+        // Steps:
+        //   1. Force CLOB to refresh cache via on-chain RPC read (AWAIT — not fire-and-forget)
+        //   2. Query the refreshed cache for exact fractional balance
+        //   3. Use min(requested_size, actual_balance) as sell size
+        //
+        // This is safe because the 7-second settlement cooldown in momentum.rs
+        // ensures tokens are on-chain by the time we reach here.
+        let sell_size_override = if intent.side == Side::Sell {
+            match self.sync_balance_for_sell().await {
+                Ok(Some(actual_balance)) => {
+                    if actual_balance < params.size {
+                        warn!(
+                            "SELL size adjusted: requested={} actual_balance={} (fractional slippage)",
+                            params.size, actual_balance
+                        );
+                    }
+                    if actual_balance <= Decimal::ZERO {
+                        error!(
+                            "SELL aborted: CLOB reports zero conditional token balance after cache refresh"
+                        );
+                        return ExecutionResult {
+                            intent_token_id: intent.token_id.clone(),
+                            order_id: None,
+                            filled: false,
+                            filled_size: Decimal::ZERO,
+                            requested_size: intent.size,
+                            status: ExecutionStatus::Rejected,
+                            error: Some("Zero conditional token balance after cache refresh".to_string()),
+                        };
+                    }
+                    // Use the smaller of requested and actual (handles fractional slippage)
+                    Some(actual_balance.min(params.size))
+                }
+                Ok(None) => {
+                    // Exchange doesn't support balance query — proceed with original size
+                    debug!("Balance query not supported, using original sell size");
+                    None
+                }
+                Err(e) => {
+                    // Non-fatal: if balance sync fails, still try the sell with original size
+                    // (the 7s cooldown should have been enough for the cache to update naturally)
+                    warn!("Pre-sell balance sync failed (proceeding anyway): {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let final_size = sell_size_override.unwrap_or(params.size);
+
         // Use cached tick size (warm from startup). No async/network call.
         let tick_size = self.exchange.get_minimum_tick_size_cached(&params.token_id);
 
@@ -149,18 +206,21 @@ impl OrderExecutor {
             token_id: params.token_id.clone(),
             side: params.side,
             price: params.price,
-            size: params.size,
+            size: final_size,
             order_type: self.map_order_type(params.order_type),
             fee_rate_bps: params.fee_rate_bps,
             minimum_tick_size: tick_size,
-            post_only: params.order_type == OrderType::GTC, // GTC orders can be post-only
+            // post_only=false: Polymarket CLOB does not currently enforce post-only.
+            // Exit sells (emergency, stop-loss) use GTC crossed aggressively at best_bid,
+            // which must NOT be post_only or the CLOB would reject them.
+            post_only: false,
         };
 
         // Submit order via Exchange (SDK handles signing and amounts!)
         match self.exchange.place_order(exchange_params).await {
             Ok(order) => {
                 let filled = order.filled_size > Decimal::ZERO;
-                let status = if order.filled_size >= params.size {
+                let status = if order.filled_size >= final_size {
                     ExecutionStatus::FullyFilled
                 } else if filled {
                     ExecutionStatus::PartialFill
@@ -222,6 +282,32 @@ impl OrderExecutor {
             OrderType::FOK => ExchangeOrderType::FOK,
             OrderType::FAK => ExchangeOrderType::FAK,
         }
+    }
+
+    /// Synchronize the CLOB's balance cache before a SELL order.
+    ///
+    /// This is the critical fix for the "not enough balance / allowance" error:
+    ///   1. Forces the CLOB to read our ACTUAL on-chain token balance (RPC call)
+    ///   2. Queries the now-refreshed cache for the exact fractional balance
+    ///   3. Returns the balance so the caller can use it as the sell size
+    ///
+    /// This MUST be called only after settlement is complete (≥7s post-buy fill).
+    /// The method is synchronous (awaited) to guarantee the cache is updated
+    /// before the sell order is submitted.
+    async fn sync_balance_for_sell(&self) -> Result<Option<Decimal>, ExchangeError> {
+        // Step 1: Force CLOB to refresh its cached view from on-chain state.
+        // This triggers an RPC read to Polygon (100-500ms).
+        info!("Pre-sell: refreshing CLOB balance cache (on-chain RPC read)...");
+        self.exchange.refresh_balance_cache().await?;
+
+        // Step 2: Query the now-refreshed cache for exact balance.
+        // This handles fractional slippage (Issue #245): actual tokens may
+        // differ from size_matched due to fee rounding in CTFExchange.sol.
+        let balance = self.exchange.get_conditional_balance().await?;
+        if let Some(bal) = balance {
+            info!("Pre-sell: CLOB reports conditional token balance = {}", bal);
+        }
+        Ok(balance)
     }
 
     /// Execute multiple intents concurrently (for multi-leg orders like arb)
@@ -298,7 +384,7 @@ impl OrderExecutor {
                 order_type: self.map_order_type(params.order_type),
                 fee_rate_bps: params.fee_rate_bps,
                 minimum_tick_size: tick_size,
-                post_only: params.order_type == OrderType::GTC,
+                post_only: false,
             }
         }).collect();
 

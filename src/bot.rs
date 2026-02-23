@@ -15,7 +15,6 @@
 //! - Heartbeat for logging (10s)
 //! - Async kill signal for shutdown
 
-use crate::api::types::Side;
 use crate::config::{Config, OperatingMode};
 use crate::exchange::{Exchange, ExchangeError, SdkExchange};
 use crate::execution::{DualPolicy, ExecutionResult, ExecutionStatus, OrderExecutor, OrderTracker, TrackedOrder};
@@ -542,18 +541,20 @@ impl Bot {
                     if remaining.is_zero() {
                         info!("Order {} fully filled", &fill.order_id[..fill.order_id.len().min(12)]);
 
-                        // After a BUY order is fully filled, refresh the CLOB's cached view
-                        // of our on-chain conditional token balance. Without this, the first
-                        // SELL after a BUY can fail with "not enough balance / allowance"
-                        // because the CLOB backend hasn't noticed the new tokens yet.
-                        if fill.side == Side::Buy {
-                            let exchange = self.exchange.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = exchange.refresh_balance_cache().await {
-                                    debug!("Balance cache refresh failed (non-fatal): {}", e);
-                                }
-                            });
-                        }
+                        // NOTE: We intentionally do NOT call refresh_balance_cache() here.
+                        //
+                        // This WebSocket fill notification has status=MATCHED, meaning the
+                        // off-chain matching engine paired the order but on-chain settlement
+                        // has NOT occurred yet. The tokens do not exist in our wallet.
+                        //
+                        // Calling update_balance_allowance at MATCHED time forces the CLOB
+                        // to do an on-chain RPC read — which returns zero tokens (pre-trade
+                        // balance). The CLOB then LOCKS its cache at zero, making subsequent
+                        // sells impossible even after settlement completes.
+                        //
+                        // Instead, the balance cache is refreshed synchronously (awaited)
+                        // in the executor, right before submitting a SELL order, after the
+                        // 7-second settlement cooldown has elapsed.
                     } else {
                         debug!("Order {} partial fill, {} remaining", &fill.order_id[..fill.order_id.len().min(12)], remaining);
                     }

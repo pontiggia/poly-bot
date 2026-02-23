@@ -732,6 +732,26 @@ impl Exchange for SdkExchange {
         Ok(())
     }
 
+    async fn get_conditional_balance(&self) -> ExchangeResult<Option<Decimal>> {
+        let request = BalanceAllowanceRequest::builder()
+            .asset_type(AssetType::Conditional)
+            .build();
+
+        let response = self
+            .client
+            .balance_allowance(request)
+            .await
+            .map_err(|e| ExchangeError::Network(format!("Failed to get conditional balance: {}", e)))?;
+
+        // The conditional token balance represents share counts (not micro-units like USDC).
+        // A balance of 15 means 15 shares.
+        debug!(
+            raw_balance = %response.balance,
+            "Fetched conditional token balance from CLOB cache"
+        );
+        Ok(Some(response.balance))
+    }
+
     fn maker_address(&self) -> &str {
         &self.maker_address
     }

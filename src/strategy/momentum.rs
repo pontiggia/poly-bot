@@ -581,6 +581,31 @@ impl MomentumStrategy {
             return Vec::new(); // Not yet in fire window
         }
 
+        // BUG-BB FIX: Don't enter if market is at or past its emergency-exit point.
+        // The emergency exit fires at max_hold_before_close_secs (5s for 5m, 8s for 15m).
+        // Entering AFTER that point means we'd immediately emergency-exit, which will fail
+        // because on-chain settlement hasn't happened yet (takes ~7s). The result is a
+        // stuck position on a closed market with "not enough balance / allowance".
+        //
+        // With this guard the effective entry windows become:
+        //   5m:  trigger_fire(10s) → emergency_exit(5s) = 5-second window
+        //   15m: trigger_fire(15s) → emergency_exit(8s) = 7-second window
+        let min_secs_for_entry = tf_config.max_hold_before_close_secs as i64;
+        if secs_until_close <= min_secs_for_entry {
+            if secs_until_close <= 0 {
+                debug!(
+                    "MomentumSniper: {} market already closed ({}s), skipping entry",
+                    ms.asset, secs_until_close
+                );
+            } else {
+                debug!(
+                    "MomentumSniper: {} only {}s to close (emergency exit at {}s), skipping entry",
+                    ms.asset, secs_until_close, min_secs_for_entry
+                );
+            }
+            return Vec::new();
+        }
+
         // Don't fire if exchange is unhealthy (504s, network errors)
         if !ctx.is_exchange_healthy() {
             debug!(
@@ -810,7 +835,7 @@ impl MomentumStrategy {
                     .unwrap_or(dec!(0.50));
 
                 warn!(
-                    "EMERGENCY EXIT: {} {} {}s until close → FAK SELL {} @ {}",
+                    "EMERGENCY EXIT: {} {} {}s until close → GTC SELL {} @ {}",
                     ms.asset,
                     ms.timeframe.label(),
                     secs_until_close,
@@ -820,13 +845,18 @@ impl MomentumStrategy {
 
                 ms.state = SniperState::StopLoss;
 
+                // Use GTC (Passive) instead of FAK (Normal) to avoid
+                // INVALID_ORDER_MIN_SIZE errors on fractional token balances.
+                // Per Polymarket docs, FOK/FAK taker orders have strict 2dp
+                // precision limits. GTC crossed aggressively at best_bid
+                // achieves the same immediate fill without precision issues.
                 return vec![OrderIntent::new(
                     ms.condition_id.clone(),
                     ms.target_token_id.clone(),
                     Side::Sell,
                     sell_price,
                     entry_size,
-                    Urgency::Normal, // FAK
+                    Urgency::Passive, // GTC — crossed aggressively at best_bid
                     format!("emergency-exit {} {}", ms.asset, ms.timeframe.label()),
                     "MomentumSniper",
                 )
@@ -842,7 +872,7 @@ impl MomentumStrategy {
                 let sell_price = best_bid; // Dump at current best bid
 
                 warn!(
-                    "BOOK STOP-LOSS: {} {} best_bid={} < sl_price={} → FAK SELL {} @ {}",
+                    "BOOK STOP-LOSS: {} {} best_bid={} < sl_price={} → GTC SELL {} @ {}",
                     ms.asset,
                     ms.timeframe.label(),
                     best_bid,
@@ -853,13 +883,14 @@ impl MomentumStrategy {
 
                 ms.state = SniperState::StopLoss;
 
+                // Use GTC (Passive) to avoid INVALID_ORDER_MIN_SIZE on fractional balances
                 return vec![OrderIntent::new(
                     ms.condition_id.clone(),
                     ms.target_token_id.clone(),
                     Side::Sell,
                     sell_price,
                     entry_size,
-                    Urgency::Normal, // FAK
+                    Urgency::Passive, // GTC — crossed at best_bid for immediate fill
                     format!("book-sl {} {}", ms.asset, ms.timeframe.label()),
                     "MomentumSniper",
                 )
@@ -887,7 +918,7 @@ impl MomentumStrategy {
                         .unwrap_or(dec!(0.50));
 
                     warn!(
-                        "BINANCE STOP-LOSS: {} {} reversal={:.4}% (threshold={:.3}%) → FAK SELL {} @ {}",
+                        "BINANCE STOP-LOSS: {} {} reversal={:.4}% (threshold={:.3}%) → GTC SELL {} @ {}",
                         ms.asset,
                         ms.timeframe.label(),
                         reversal * dec!(100),
@@ -898,13 +929,14 @@ impl MomentumStrategy {
 
                     ms.state = SniperState::StopLoss;
 
+                    // Use GTC (Passive) to avoid INVALID_ORDER_MIN_SIZE on fractional balances
                     return vec![OrderIntent::new(
                         ms.condition_id.clone(),
                         ms.target_token_id.clone(),
                         Side::Sell,
                         sell_price,
                         entry_size,
-                        Urgency::Normal, // FAK
+                        Urgency::Passive, // GTC — crossed aggressively for immediate fill
                         format!("binance-sl {} {}", ms.asset, ms.timeframe.label()),
                         "MomentumSniper",
                     )
@@ -1776,6 +1808,6 @@ mod tests {
         // Should have triggered stop-loss
         assert_eq!(intents.len(), 1, "Should have one stop-loss sell intent");
         assert_eq!(intents[0].side, Side::Sell);
-        assert_eq!(intents[0].urgency, Urgency::Normal); // FAK
+        assert_eq!(intents[0].urgency, Urgency::Passive); // GTC crossed aggressively
     }
 }
