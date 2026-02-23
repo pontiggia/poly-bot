@@ -533,6 +533,12 @@ impl Bot {
                 // Record fill in ledger
                 self.ledger.process_fill(fill.clone());
 
+                // After any fill, trust the ledger as source of truth.
+                // The exchange REST balance lags behind (on-chain settlement takes seconds),
+                // so a reconcile right now would show a false drift. Reset the flag —
+                // the periodic 60s reconcile will re-verify once settlement catches up.
+                self.balance_healthy = true;
+
                 // Notify strategies of fill (may trigger sell orders)
                 let fill_ctx = StrategyContext::new(&self.order_book_state, &self.ledger)
                     .with_spot(&self.spot_prices, &self.price_history)

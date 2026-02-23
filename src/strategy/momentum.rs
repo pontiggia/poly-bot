@@ -699,7 +699,7 @@ impl MomentumStrategy {
 
         // Don't fire if balance drifted (ledger vs exchange mismatch)
         if !ctx.is_balance_healthy() {
-            warn!(
+            debug!(
                 "ConvictionRider: {} balance unhealthy (drift detected), blocking new entries",
                 ms.asset
             );
