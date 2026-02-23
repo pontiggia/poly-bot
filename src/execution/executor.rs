@@ -155,11 +155,30 @@ impl OrderExecutor {
         // This is safe because the 7-second settlement cooldown in momentum.rs
         // ensures tokens are on-chain by the time we reach here.
         let sell_size_override = if intent.side == Side::Sell {
+            info!(
+                "📊 SELL PIPELINE: token={}... requested_size={} price={}",
+                &params.token_id[..params.token_id.len().min(16)],
+                params.size,
+                params.price,
+            );
             match self.sync_balance_for_sell(&params.token_id).await {
                 Ok(Some(actual_balance)) => {
+                    let capped = actual_balance.min(params.size);
+                    let final_sell = capped.round_dp_with_strategy(
+                        2,
+                        rust_decimal::RoundingStrategy::ToZero,
+                    );
+                    info!(
+                        "📊 SELL PIPELINE: on_chain_balance={} requested={} capped={} final_sell={} (diff={})",
+                        actual_balance,
+                        params.size,
+                        capped,
+                        final_sell,
+                        params.size - actual_balance,
+                    );
                     if actual_balance < params.size {
                         warn!(
-                            "SELL size adjusted: requested={} actual_balance={} (fractional slippage)",
+                            "SELL size adjusted: requested={} actual_balance={} (settlement lag or fractional slippage)",
                             params.size, actual_balance
                         );
                     }
@@ -177,8 +196,8 @@ impl OrderExecutor {
                             error: Some("Zero conditional token balance after cache refresh".to_string()),
                         };
                     }
-                    // Use the smaller of requested and actual (handles fractional slippage)
-                    Some(actual_balance.min(params.size))
+                    // Use the smaller of requested and actual, truncated to 2dp
+                    Some(final_sell)
                 }
                 Ok(None) => {
                     // Exchange doesn't support balance query — proceed with original size
@@ -197,6 +216,15 @@ impl OrderExecutor {
         };
 
         let final_size = sell_size_override.unwrap_or(params.size);
+
+        if intent.side == Side::Sell {
+            info!(
+                "📊 SELL PIPELINE FINAL: submitting size={} (override={:?}, original={})",
+                final_size,
+                sell_size_override,
+                params.size,
+            );
+        }
 
         // Use cached tick size (warm from startup). No async/network call.
         let tick_size = self.exchange.get_minimum_tick_size_cached(&params.token_id);
@@ -217,7 +245,7 @@ impl OrderExecutor {
         };
 
         // Submit order via Exchange (SDK handles signing and amounts!)
-        match self.exchange.place_order(exchange_params).await {
+        match self.exchange.place_order(exchange_params.clone()).await {
             Ok(order) => {
                 let filled = order.filled_size > Decimal::ZERO;
                 let status = if order.filled_size >= final_size {
@@ -252,6 +280,64 @@ impl OrderExecutor {
                 }
             }
             Err(e) => {
+                // === SELL RETRY: If "not enough balance" on a sell, settlement may be lagging ===
+                // Wait 5s for on-chain settlement, re-sync balance, and retry once with actual balance
+                let is_balance_error = e.to_string().contains("not enough balance");
+                if intent.side == Side::Sell && is_balance_error {
+                    warn!(
+                        "📊 SELL REJECTED: size_submitted={} error='not enough balance'. Waiting 5s for settlement retry...",
+                        final_size,
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+                    // Re-sync and get actual balance
+                    if let Ok(Some(actual_balance)) = self.sync_balance_for_sell(&params.token_id).await {
+                        if actual_balance > Decimal::ZERO {
+                            let retry_size = actual_balance.min(params.size)
+                                .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero);
+                            info!(
+                                "📊 SELL RETRY: on_chain_balance={} retry_size={} (original_requested={})",
+                                actual_balance, retry_size, params.size
+                            );
+                            let mut retry_params = exchange_params;
+                            retry_params.size = retry_size;
+
+                            match self.exchange.place_order(retry_params).await {
+                                Ok(order) => {
+                                    let filled = order.filled_size > Decimal::ZERO;
+                                    let status = if order.filled_size >= retry_size {
+                                        ExecutionStatus::FullyFilled
+                                    } else if filled {
+                                        ExecutionStatus::PartialFill
+                                    } else {
+                                        ExecutionStatus::Pending
+                                    };
+                                    info!(
+                                        order_id = %order.order_id,
+                                        status = ?status,
+                                        filled = %order.filled_size,
+                                        requested = %retry_size,
+                                        "SELL RETRY succeeded"
+                                    );
+                                    self.circuit_breaker.record_order_result(None);
+                                    return ExecutionResult {
+                                        intent_token_id: params.token_id.clone(),
+                                        order_id: Some(order.order_id),
+                                        filled,
+                                        filled_size: order.filled_size,
+                                        requested_size: retry_size,
+                                        status,
+                                        error: None,
+                                    };
+                                }
+                                Err(retry_err) => {
+                                    error!(error = %retry_err, "SELL RETRY also failed");
+                                }
+                            }
+                        }
+                    }
+                }
+
                 error!(error = %e, "Order submission failed");
 
                 // Classify error for circuit breaker

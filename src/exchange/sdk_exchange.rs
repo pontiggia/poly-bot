@@ -745,13 +745,17 @@ impl Exchange for SdkExchange {
             .await
             .map_err(|e| ExchangeError::Network(format!("Failed to get conditional balance: {}", e)))?;
 
-        // The conditional token balance represents share counts (not micro-units like USDC).
-        // A balance of 15 means 15 shares.
+        // API returns raw micro-units (e.g. 14878312 = 14.878312 shares), same as USDC.
+        // Conditional tokens use 6 decimals on Polygon, so divide by 10^6.
+        let divisor = Decimal::from(1_000_000);
+        let balance = response.balance / divisor;
+
         debug!(
             raw_balance = %response.balance,
+            balance_shares = %balance,
             "Fetched conditional token balance from CLOB cache"
         );
-        Ok(Some(response.balance))
+        Ok(Some(balance))
     }
 
     fn maker_address(&self) -> &str {

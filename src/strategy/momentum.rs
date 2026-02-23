@@ -965,10 +965,12 @@ impl MomentumStrategy {
         );
 
         info!(
-            "TAKE-PROFIT: {} {} entry={} -> MAKER SELL {} @ {} (entry+{}={}, ceiling={})",
+            "TAKE-PROFIT: {} {} entry={} size_raw={} size_truncated={} -> MAKER SELL {} @ {} (entry+{}={}, ceiling={})",
             ms.asset,
             ms.timeframe.label(),
             entry_price,
+            entry_size,
+            sell_size,
             sell_size,
             tp_price,
             tf_config.tp_min_profit,
@@ -1566,6 +1568,9 @@ impl Strategy for MomentumStrategy {
                         );
                         ms.entry_size = Some(new_size);
                         ms.entry_price = Some(new_price);
+                        // Reset settlement cooldown — this new fill needs time to settle on-chain
+                        ms.entry_instant = Some(Instant::now());
+                        ms.entry_timestamp_ms = Some(chrono::Utc::now().timestamp_millis());
                     }
                 }
                 SniperState::TPPosted => {
