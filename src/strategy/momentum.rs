@@ -121,6 +121,8 @@ pub struct MarketState {
     pub close_time: Option<i64>,
     /// Number of TP sell retry attempts (to prevent infinite loops)
     pub tp_sell_retries: u32,
+    /// Last secs_until_close we logged at (for 1/sec rate-limiting diagnostics)
+    pub last_logged_secs: Option<i64>,
 }
 
 impl MarketState {
@@ -146,6 +148,7 @@ impl MarketState {
             pending_cancel: false,
             close_time: None,
             tp_sell_retries: 0,
+            last_logged_secs: None,
         }
     }
 }
@@ -568,24 +571,28 @@ impl MomentumStrategy {
         ms.conviction = conviction;
         ms.direction = direction;
 
-        // Log at INFO when in fire window so we can see why signals pass/fail
+        // Log at INFO when in fire window (throttled to 1/sec via secs_until_close dedup)
         if secs_until_close <= tf_config.trigger_fire_secs {
-            let dir_label = match direction {
-                Direction::Up => "UP",
-                Direction::Down => "DOWN",
-                Direction::Neutral => "NEUTRAL",
-            };
-            let best_bid = ctx.best_bid(&ms.target_token_id);
-            info!(
-                "⚡ {} {} conv={:.3} {} ({}s to close, need ≥{:.2}) bid={:?}",
-                ms.asset,
-                ms.timeframe.label(),
-                conviction,
-                dir_label,
-                secs_until_close,
-                tf_config.min_conviction,
-                best_bid,
-            );
+            let already_logged = ms.last_logged_secs == Some(secs_until_close);
+            if !already_logged {
+                ms.last_logged_secs = Some(secs_until_close);
+                let dir_label = match direction {
+                    Direction::Up => "UP",
+                    Direction::Down => "DOWN",
+                    Direction::Neutral => "NEUTRAL",
+                };
+                let best_bid = ctx.best_bid(&ms.target_token_id);
+                info!(
+                    "⚡ {} {} conv={:.3} {} ({}s to close, need ≥{:.2}) bid={:?}",
+                    ms.asset,
+                    ms.timeframe.label(),
+                    conviction,
+                    dir_label,
+                    secs_until_close,
+                    tf_config.min_conviction,
+                    best_bid,
+                );
+            }
         } else {
             debug!(
                 "MomentumSniper: {} {} conviction={:.3} dir={:?} ({}s to close)",
@@ -1788,6 +1795,7 @@ mod tests {
                 pending_cancel: false,
                 close_time: None,
                 tp_sell_retries: 0,
+                last_logged_secs: None,
             },
         );
 
