@@ -545,11 +545,12 @@ impl MomentumStrategy {
     ) {
         if secs_until_close <= tf_config.trigger_window_secs && secs_until_close > 0 {
             ms.state = SniperState::Monitoring;
-            debug!(
-                "MomentumSniper: {} {} → Monitoring ({}s to close)",
+            info!(
+                "🔍 {} {} → Monitoring ({}s to close, fire at ≤{}s)",
                 ms.asset,
                 ms.timeframe.label(),
-                secs_until_close
+                secs_until_close,
+                tf_config.trigger_fire_secs
             );
         }
     }
@@ -567,30 +568,53 @@ impl MomentumStrategy {
         ms.conviction = conviction;
         ms.direction = direction;
 
-        debug!(
-            "MomentumSniper: {} {} conviction={:.3} dir={:?} ({}s to close)",
-            ms.asset,
-            ms.timeframe.label(),
-            conviction,
-            direction,
-            secs_until_close
-        );
+        // Log at INFO when in fire window so we can see why signals pass/fail
+        if secs_until_close <= tf_config.trigger_fire_secs {
+            let dir_label = match direction {
+                Direction::Up => "UP",
+                Direction::Down => "DOWN",
+                Direction::Neutral => "NEUTRAL",
+            };
+            let best_bid = ctx.best_bid(&ms.target_token_id);
+            info!(
+                "⚡ {} {} conv={:.3} {} ({}s to close, need ≥{:.2}) bid={:?}",
+                ms.asset,
+                ms.timeframe.label(),
+                conviction,
+                dir_label,
+                secs_until_close,
+                tf_config.min_conviction,
+                best_bid,
+            );
+        } else {
+            debug!(
+                "MomentumSniper: {} {} conviction={:.3} dir={:?} ({}s to close)",
+                ms.asset,
+                ms.timeframe.label(),
+                conviction,
+                direction,
+                secs_until_close
+            );
+        }
 
         // Check if we should fire
         if secs_until_close > tf_config.trigger_fire_secs {
             return Vec::new(); // Not yet in fire window
         }
 
-        // BUG-BB FIX: Don't enter if market is at or past its emergency-exit point.
-        // The emergency exit fires at max_hold_before_close_secs (5s for 5m, 8s for 15m).
-        // Entering AFTER that point means we'd immediately emergency-exit, which will fail
-        // because on-chain settlement hasn't happened yet (takes ~7s). The result is a
-        // stuck position on a closed market with "not enough balance / allowance".
+        // BUG-BB FIX: Don't enter if there isn't enough time for the maker
+        // order to fill before close. Entering too late means we'd immediately
+        // emergency-exit, which can fail because on-chain settlement hasn't
+        // happened yet (takes ~7s), resulting in stuck positions.
         //
-        // With this guard the effective entry windows become:
-        //   5m:  trigger_fire(10s) → emergency_exit(5s) = 5-second window
-        //   15m: trigger_fire(15s) → emergency_exit(8s) = 7-second window
-        let min_secs_for_entry = tf_config.max_hold_before_close_secs as i64;
+        // Minimum time needed = maker_fill_timeout + 1s safety margin.
+        // This gives effective entry windows of:
+        //   5m:  trigger_fire(10s) → cutoff(3s) = 7-second window
+        //   15m: trigger_fire(15s) → cutoff(4s) = 11-second window
+        //
+        // Previously this used max_hold_before_close_secs which halved
+        // the entry windows unnecessarily (5s for 5m, 7s for 15m).
+        let min_secs_for_entry = (tf_config.maker_fill_timeout_ms / 1000 + 1) as i64;
         if secs_until_close <= min_secs_for_entry {
             if secs_until_close <= 0 {
                 debug!(
