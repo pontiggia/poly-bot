@@ -107,6 +107,8 @@ pub struct MarketState {
     pub direction: Direction,
     /// Take-profit order ID (if in TPPosted state)
     pub tp_order_id: Option<String>,
+    /// When we entered TPPosted state (for async execution grace period)
+    pub tp_posted_at: Option<Instant>,
     /// Entry timestamp in Instant (for stop-loss delta calc)
     pub entry_instant: Option<Instant>,
     /// Entry timestamp in unix ms (for price history lookup)
@@ -137,6 +139,7 @@ impl MarketState {
             conviction: Decimal::ZERO,
             direction: Direction::Neutral,
             tp_order_id: None,
+            tp_posted_at: None,
             entry_instant: None,
             entry_timestamp_ms: None,
             posted_price: None,
@@ -939,6 +942,7 @@ impl MomentumStrategy {
         );
 
         ms.state = SniperState::TPPosted;
+        ms.tp_posted_at = Some(Instant::now());
 
         vec![OrderIntent::new(
             ms.condition_id.clone(),
@@ -1069,32 +1073,49 @@ impl Strategy for MomentumStrategy {
                     // Handled in on_order_management
                 }
                 SniperState::TPPosted => {
-                    // If tp_order_id is None, the TP sell was rejected (e.g., settlement delay).
-                    // Retry by transitioning back to InventoryHeld after settlement cooldown.
+                    // The TP sell intent is executed asynchronously (tokio::spawn).
+                    // We must give it a grace period before concluding it was rejected.
+                    // tp_posted_at tracks when we entered TPPosted state.
+                    const TP_GRACE_PERIOD_MS: u128 = 3_000; // 3s for async exec + CLOB response
                     const MAX_TP_RETRIES: u32 = 3;
-                    if ms.tp_order_id.is_none() {
-                        let entry_elapsed = ms.entry_instant
-                            .map(|t| t.elapsed().as_secs())
-                            .unwrap_or(0);
-                        if ms.tp_sell_retries >= MAX_TP_RETRIES {
-                            warn!(
-                                "MomentumSniper: {} {} TP sell failed {} times, giving up (will redeem on resolution)",
-                                ms.asset, ms.timeframe.label(), ms.tp_sell_retries
-                            );
-                            // Don't retry — let PositionRedeemer handle it on market resolution.
-                            // Transition to Completed to stop re-evaluating on every tick.
-                            ms.state = SniperState::Completed;
-                        } else if entry_elapsed >= 5 {
-                            ms.tp_sell_retries += 1;
-                            warn!(
-                                "MomentumSniper: {} {} TP sell was rejected, retry #{} ({}s since entry)",
-                                ms.asset, ms.timeframe.label(), ms.tp_sell_retries, entry_elapsed
-                            );
-                            ms.state = SniperState::InventoryHeld;
-                        }
+
+                    let tp_age_ms = ms.tp_posted_at
+                        .map(|t| t.elapsed().as_millis())
+                        .unwrap_or(0);
+
+                    // If we're still within the grace period, let the async execution finish.
+                    if tp_age_ms < TP_GRACE_PERIOD_MS {
+                        // Still waiting for execution result — do nothing.
+                        continue;
                     }
-                    // Otherwise: TP order is out, wait for fill or expiry.
-                    // If market closed, let PositionRedeemer handle it.
+
+                    // Grace period elapsed and no fill received. The order was either
+                    // rejected (tp_order_id still None) or placed but not filled yet.
+                    // If tp_order_id is set, the order is on the book — wait for fill.
+                    if ms.tp_order_id.is_some() {
+                        // TP order is on the book, wait for fill or market close.
+                        continue;
+                    }
+
+                    // tp_order_id is None after grace period → order was truly rejected.
+                    let entry_elapsed = ms.entry_instant
+                        .map(|t| t.elapsed().as_secs())
+                        .unwrap_or(0);
+                    if ms.tp_sell_retries >= MAX_TP_RETRIES {
+                        warn!(
+                            "MomentumSniper: {} {} TP sell failed {} times, giving up (will redeem on resolution)",
+                            ms.asset, ms.timeframe.label(), ms.tp_sell_retries
+                        );
+                        ms.state = SniperState::Completed;
+                    } else {
+                        ms.tp_sell_retries += 1;
+                        warn!(
+                            "MomentumSniper: {} {} TP sell was rejected after {}ms, retry #{} ({}s since entry)",
+                            ms.asset, ms.timeframe.label(), tp_age_ms, ms.tp_sell_retries, entry_elapsed
+                        );
+                        ms.state = SniperState::InventoryHeld;
+                        ms.tp_posted_at = None;
+                    }
                 }
             }
         }
@@ -1704,6 +1725,7 @@ mod tests {
                 conviction: dec!(0.80),
                 direction: Direction::Up,
                 tp_order_id: None,
+                tp_posted_at: None,
                 entry_instant: Some(Instant::now() - std::time::Duration::from_secs(8)),
                 entry_timestamp_ms: Some(now_ms - 8000), // Entered 8s ago
                 posted_price: None,

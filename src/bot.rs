@@ -15,6 +15,7 @@
 //! - Heartbeat for logging (10s)
 //! - Async kill signal for shutdown
 
+use crate::api::types::Side;
 use crate::config::{Config, OperatingMode};
 use crate::exchange::{Exchange, ExchangeError, SdkExchange};
 use crate::execution::{DualPolicy, ExecutionResult, ExecutionStatus, OrderExecutor, OrderTracker, TrackedOrder};
@@ -540,6 +541,19 @@ impl Bot {
                 if let Some(remaining) = self.order_tracker.on_fill(&fill.order_id, fill.size) {
                     if remaining.is_zero() {
                         info!("Order {} fully filled", &fill.order_id[..fill.order_id.len().min(12)]);
+
+                        // After a BUY order is fully filled, refresh the CLOB's cached view
+                        // of our on-chain conditional token balance. Without this, the first
+                        // SELL after a BUY can fail with "not enough balance / allowance"
+                        // because the CLOB backend hasn't noticed the new tokens yet.
+                        if fill.side == Side::Buy {
+                            let exchange = self.exchange.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = exchange.refresh_balance_cache().await {
+                                    debug!("Balance cache refresh failed (non-fatal): {}", e);
+                                }
+                            });
+                        }
                     } else {
                         debug!("Order {} partial fill, {} remaining", &fill.order_id[..fill.order_id.len().min(12)], remaining);
                     }

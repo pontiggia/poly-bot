@@ -225,6 +225,15 @@ pub trait Exchange: Send + Sync {
     /// Check if the exchange connection is healthy
     fn is_healthy(&self) -> bool;
 
+    /// Force the CLOB backend to refresh its cached view of our on-chain
+    /// token balances and allowances. Call this after receiving buy fills
+    /// so subsequent sell orders don't fail with "not enough balance / allowance"
+    /// due to stale server-side cache.
+    /// Default: no-op (not all implementations support this).
+    async fn refresh_balance_cache(&self) -> ExchangeResult<()> {
+        Ok(())
+    }
+
     /// Get the maker address (proxy wallet)
     fn maker_address(&self) -> &str;
 

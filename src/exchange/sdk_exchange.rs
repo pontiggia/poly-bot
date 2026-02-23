@@ -21,7 +21,7 @@ use tracing::{debug, error, info, warn};
 // SDK imports - matching the official example pattern
 use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer as AlloySigner;
-use polymarket_client_sdk::clob::types::request::{BalanceAllowanceRequest, OrdersRequest};
+use polymarket_client_sdk::clob::types::request::{BalanceAllowanceRequest, OrdersRequest, UpdateBalanceAllowanceRequest};
 use polymarket_client_sdk::clob::types::{AssetType, OrderStatusType, OrderType as SdkOrderType, Side as SdkSide};
 use polymarket_client_sdk::clob::{Client, Config as ClobConfig};
 use polymarket_client_sdk::POLYGON;
@@ -716,6 +716,20 @@ impl Exchange for SdkExchange {
 
     fn is_healthy(&self) -> bool {
         self.healthy.load(Ordering::Relaxed)
+    }
+
+    async fn refresh_balance_cache(&self) -> ExchangeResult<()> {
+        let request = UpdateBalanceAllowanceRequest::builder()
+            .asset_type(AssetType::Conditional)
+            .build();
+
+        self.client
+            .update_balance_allowance(request)
+            .await
+            .map_err(|e| ExchangeError::Network(format!("Failed to refresh balance cache: {}", e)))?;
+
+        debug!("CLOB balance cache refreshed (conditional tokens)");
+        Ok(())
     }
 
     fn maker_address(&self) -> &str {
