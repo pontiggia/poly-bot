@@ -176,10 +176,11 @@ impl DiscoveredMarket {
         let timestamp: i64 = parts[0].parse().ok()?;
         let prefix = parts[1];
 
-        let duration = if prefix.ends_with("5m") {
-            300
-        } else if prefix.ends_with("15m") {
+        // IMPORTANT: check "15m" BEFORE "5m" because "15m" ends with "5m"
+        let duration = if prefix.ends_with("15m") {
             900
+        } else if prefix.ends_with("5m") {
+            300
         } else {
             return None;
         };
@@ -601,5 +602,37 @@ mod tests {
         
         let too_high_vol = MarketFilter::new().with_min_volume(Decimal::from(500000));
         assert!(!discovery.passes_filter(&market, &too_high_vol));
+    }
+
+    #[test]
+    fn test_parse_close_time_5m() {
+        // 5m slug: close = timestamp + 300
+        let close = DiscoveredMarket::parse_close_time("btc-updown-5m-1771867800");
+        assert_eq!(close, Some(1771867800 + 300));
+    }
+
+    #[test]
+    fn test_parse_close_time_15m() {
+        // 15m slug: close = timestamp + 900 (NOT 300!)
+        let close = DiscoveredMarket::parse_close_time("sol-updown-15m-1771868700");
+        assert_eq!(close, Some(1771868700 + 900));
+    }
+
+    #[test]
+    fn test_parse_close_time_15m_not_misdetected_as_5m() {
+        // Regression: "15m" ends with "5m", so must check "15m" first
+        let close_15m = DiscoveredMarket::parse_close_time("sol-updown-15m-1000000000");
+        let close_5m = DiscoveredMarket::parse_close_time("sol-updown-5m-1000000000");
+        // 15m should add 900, not 300
+        assert_eq!(close_15m, Some(1000000000 + 900));
+        assert_eq!(close_5m, Some(1000000000 + 300));
+        // They must be different!
+        assert_ne!(close_15m, close_5m);
+    }
+
+    #[test]
+    fn test_parse_close_time_invalid() {
+        assert_eq!(DiscoveredMarket::parse_close_time("some-random-slug"), None);
+        assert_eq!(DiscoveredMarket::parse_close_time("btc-updown-1h-1234"), None);
     }
 }

@@ -617,6 +617,11 @@ impl MomentumStrategy {
         let candle_open_time = close_time - candle_duration;
         let elapsed = now_unix - candle_open_time;
 
+        // Safety: never enter a candle that hasn't started yet
+        if elapsed < 0 {
+            return;
+        }
+
         if elapsed >= tf_config.entry_window_start_secs {
             let secs_until_close = close_time - now_unix;
             ms.state = SniperState::Monitoring;
