@@ -343,7 +343,7 @@ impl MomentumConfig {
             max_chase_cents: dec!(0.03),
 
             // Take profit (dynamic: entry + min_profit, capped at ceiling — NO floor)
-            tp_min_profit: dec!(0.10),
+            tp_min_profit: dec!(0.03),
             tp_floor_price: dec!(0.70),  // kept for config compat, NOT used in formula
             tp_ceiling_price: dec!(0.95),
 
@@ -388,7 +388,7 @@ impl MomentumConfig {
             max_chase_cents: dec!(0.03),
 
             // Take profit (dynamic: entry + min_profit, capped at ceiling — NO floor)
-            tp_min_profit: dec!(0.08),
+            tp_min_profit: dec!(0.03),
             tp_floor_price: dec!(0.65),  // kept for config compat, NOT used in formula
             tp_ceiling_price: dec!(0.93),
 
@@ -2011,36 +2011,36 @@ mod tests {
     fn test_tp_price_calculation() {
         // Verify dynamic TP config values (updated: lowered tp_min_profit, floor kept for compat but NOT used)
         let config_5m = MomentumConfig::preset_5m_rider();
-        assert_eq!(config_5m.tp_min_profit, dec!(0.08));
+        assert_eq!(config_5m.tp_min_profit, dec!(0.03));
         assert_eq!(config_5m.tp_ceiling_price, dec!(0.93));
 
         let config_15m = MomentumConfig::preset_15m_rider();
-        assert_eq!(config_15m.tp_min_profit, dec!(0.10));
+        assert_eq!(config_15m.tp_min_profit, dec!(0.03));
         assert_eq!(config_15m.tp_ceiling_price, dec!(0.95));
 
         // Verify dynamic TP calculation: entry + min_profit, clamped to ceiling (NO floor)
         let config = MomentumConfig::preset_15m_rider();
 
-        // Entry 0.57 -> raw 0.67, ceiling 0.95 -> 0.67
+        // Entry 0.57 -> raw 0.60, ceiling 0.95 -> 0.60
         let entry = dec!(0.57);
         let raw = entry + config.tp_min_profit;
         let tp = raw.min(config.tp_ceiling_price).min(dec!(0.99));
-        assert_eq!(tp, dec!(0.67));
+        assert_eq!(tp, dec!(0.60));
 
-        // Entry 0.40 -> raw 0.50, ceiling 0.95 -> 0.50 (no floor, so just entry+min_profit)
+        // Entry 0.40 -> raw 0.43, ceiling 0.95 -> 0.43
         let entry = dec!(0.40);
         let raw = entry + config.tp_min_profit;
         let tp = raw.min(config.tp_ceiling_price).min(dec!(0.99));
-        assert_eq!(tp, dec!(0.50));
+        assert_eq!(tp, dec!(0.43));
 
-        // Entry 0.65 -> raw 0.75, ceiling 0.95 -> 0.75
+        // Entry 0.65 -> raw 0.68, ceiling 0.95 -> 0.68
         let entry = dec!(0.65);
         let raw = entry + config.tp_min_profit;
         let tp = raw.min(config.tp_ceiling_price).min(dec!(0.99));
-        assert_eq!(tp, dec!(0.75));
+        assert_eq!(tp, dec!(0.68));
 
-        // Ceiling cap: entry 0.88 -> raw 0.98 -> capped at 0.95
-        let entry = dec!(0.88);
+        // Ceiling cap: entry 0.93 -> raw 0.96 -> capped at 0.95
+        let entry = dec!(0.93);
         let raw = entry + config.tp_min_profit;
         let tp = raw.min(config.tp_ceiling_price).min(dec!(0.99));
         assert_eq!(tp, dec!(0.95));
