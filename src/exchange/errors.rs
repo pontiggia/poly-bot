@@ -72,14 +72,15 @@ impl ExchangeError {
     /// Fatal errors indicate a persistent problem that won't resolve:
     /// - Authentication failures
     /// - Invalid parameters
-    /// - Insufficient balance
     /// - Configuration errors
+    ///
+    /// Note: InsufficientBalance is NOT fatal — it's often transient
+    /// (e.g., neg-risk token settlement delay on sells).
     pub fn is_fatal(&self) -> bool {
         matches!(
             self,
             Self::AuthenticationFailed(_)
                 | Self::InvalidParams(_)
-                | Self::InsufficientBalance(_)
                 | Self::Configuration(_)
         )
     }
@@ -148,7 +149,8 @@ mod tests {
     fn test_fatal_classification() {
         assert!(ExchangeError::AuthenticationFailed("bad key".into()).is_fatal());
         assert!(ExchangeError::InvalidParams("bad price".into()).is_fatal());
-        assert!(ExchangeError::InsufficientBalance("0".into()).is_fatal());
+        // InsufficientBalance is retryable (transient settlement delays), not fatal
+        assert!(!ExchangeError::InsufficientBalance("0".into()).is_fatal());
         assert!(!ExchangeError::Network("timeout".into()).is_fatal());
     }
 

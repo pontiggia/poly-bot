@@ -529,7 +529,8 @@ impl Bot {
 
                 // Notify strategies of fill (may trigger sell orders)
                 let fill_ctx = StrategyContext::new(&self.order_book_state, &self.ledger)
-                    .with_spot(&self.spot_prices, &self.price_history);
+                    .with_spot(&self.spot_prices, &self.price_history)
+                    .with_exchange_health(self.exchange.is_healthy());
                 let fill_intents = self.strategy_router.on_fill(&fill, &fill_ctx);
                 if !fill_intents.is_empty() {
                     self.process_intents(fill_intents);
@@ -584,7 +585,8 @@ impl Bot {
     async fn handle_tick(&mut self) {
         // Create strategy context
         let ctx = StrategyContext::new(&self.order_book_state, &self.ledger)
-            .with_spot(&self.spot_prices, &self.price_history);
+            .with_spot(&self.spot_prices, &self.price_history)
+            .with_exchange_health(self.exchange.is_healthy());
 
         // Run strategy on_tick() callbacks
         let intents = self.strategy_router.on_tick(&ctx);
@@ -599,7 +601,8 @@ impl Bot {
     async fn handle_order_management(&mut self) {
         let ctx = StrategyContext::new(&self.order_book_state, &self.ledger)
             .with_spot(&self.spot_prices, &self.price_history)
-            .with_order_tracker(self.order_tracker.clone());
+            .with_order_tracker(self.order_tracker.clone())
+            .with_exchange_health(self.exchange.is_healthy());
 
         let actions = self.strategy_router.on_order_management(&ctx);
 
@@ -752,7 +755,8 @@ impl Bot {
 
         // Create strategy context
         let ctx = StrategyContext::new(&self.order_book_state, &self.ledger)
-            .with_spot(&self.spot_prices, &self.price_history);
+            .with_spot(&self.spot_prices, &self.price_history)
+            .with_exchange_health(self.exchange.is_healthy());
 
         // Route to strategies
         let intents = self.strategy_router.on_book_update(
@@ -1087,7 +1091,8 @@ impl Bot {
 
         // Get shutdown intents from strategies
         let ctx = StrategyContext::new(&self.order_book_state, &self.ledger)
-            .with_spot(&self.spot_prices, &self.price_history);
+            .with_spot(&self.spot_prices, &self.price_history)
+            .with_exchange_health(self.exchange.is_healthy());
         let shutdown_intents = self.strategy_router.on_shutdown(&ctx);
         if !shutdown_intents.is_empty() {
             info!("Processing {} shutdown intent(s)", shutdown_intents.len());

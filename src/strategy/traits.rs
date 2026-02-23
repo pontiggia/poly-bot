@@ -171,6 +171,9 @@ pub struct StrategyContext<'a> {
 
     /// Order tracker for looking up active orders by token (optional)
     pub order_tracker: Option<Arc<OrderTracker>>,
+
+    /// Whether the CLOB exchange is healthy (accepting orders)
+    pub exchange_healthy: bool,
 }
 
 impl<'a> StrategyContext<'a> {
@@ -184,6 +187,7 @@ impl<'a> StrategyContext<'a> {
             spot_prices: None,
             price_history: None,
             order_tracker: None,
+            exchange_healthy: true, // Assume healthy until told otherwise
         }
     }
 
@@ -202,6 +206,17 @@ impl<'a> StrategyContext<'a> {
     pub fn with_order_tracker(mut self, tracker: Arc<OrderTracker>) -> Self {
         self.order_tracker = Some(tracker);
         self
+    }
+
+    /// Set exchange health status
+    pub fn with_exchange_health(mut self, healthy: bool) -> Self {
+        self.exchange_healthy = healthy;
+        self
+    }
+
+    /// Check if the exchange is healthy
+    pub fn is_exchange_healthy(&self) -> bool {
+        self.exchange_healthy
     }
 
     /// Get the latest spot price for an asset (e.g., "btc")

@@ -117,7 +117,9 @@ impl From<&crate::exchange::ExchangeError> for ErrorType {
         match e {
             ExchangeError::AuthenticationFailed(_) => ErrorType::Critical,
             ExchangeError::InvalidParams(_) => ErrorType::Fatal,
-            ExchangeError::InsufficientBalance(_) => ErrorType::Fatal,
+            // "not enough balance" is often transient (e.g., settlement delay for neg-risk tokens)
+            // rather than a true permanent failure. Retryable prevents circuit breaker tripping.
+            ExchangeError::InsufficientBalance(_) => ErrorType::Retryable,
             ExchangeError::Signing(_) => ErrorType::Critical,
             ExchangeError::Configuration(_) => ErrorType::Critical,
             ExchangeError::RateLimited(_) => ErrorType::Retryable,

@@ -578,6 +578,15 @@ impl MomentumStrategy {
             return Vec::new(); // Not yet in fire window
         }
 
+        // Don't fire if exchange is unhealthy (504s, network errors)
+        if !ctx.is_exchange_healthy() {
+            debug!(
+                "MomentumSniper: {} exchange unhealthy, skipping fire",
+                ms.asset
+            );
+            return Vec::new();
+        }
+
         if conviction < tf_config.min_conviction {
             debug!(
                 "MomentumSniper: {} conviction {:.3} < {:.3} threshold, staying in Monitoring",
@@ -903,11 +912,13 @@ impl MomentumStrategy {
         }
 
         // === TAKE-PROFIT: Post GTC SELL at entry + tp_spread immediately ===
-        let tp_price = (entry_price + tf_config.tp_spread).min(dec!(0.99));
+        // Round entry_price to 2dp (tick_size) to prevent fractional dust from weighted averages
+        let entry_price_clean = entry_price.round_dp(2);
+        let tp_price = (entry_price_clean + tf_config.tp_spread).min(dec!(0.99));
 
         // Check if book bid has risen enough for aggressive TP
         let final_tp_price = if let Some(best_bid) = ctx.best_bid(&ms.target_token_id) {
-            let aggressive_tp = (entry_price + tf_config.aggressive_tp_spread).min(dec!(0.99));
+            let aggressive_tp = (entry_price_clean + tf_config.aggressive_tp_spread).min(dec!(0.99));
             if best_bid >= aggressive_tp {
                 aggressive_tp // Bid is very high, take aggressive TP
             } else {
@@ -1208,6 +1219,11 @@ impl Strategy for MomentumStrategy {
                     }
 
                     // Cancel/replace loop: re-derive optimal price from book each tick
+                    // Skip cancel/replace repricing when exchange is unhealthy
+                    if !ctx.is_exchange_healthy() {
+                        continue;
+                    }
+
                     let should_replace = ms
                         .last_cancel_replace
                         .map(|t| t.elapsed().as_millis() as u64 >= self.config.cancel_replace_interval_ms)
@@ -1288,44 +1304,77 @@ impl Strategy for MomentumStrategy {
             match ms.state {
                 SniperState::MakerPosted | SniperState::TakerFallback => {
                     if fill.side == Side::Buy {
-                        // Minimum fill size guard: tiny fills aren't worth TP effort
-                        const MIN_PROFITABLE_SHARES: Decimal = dec!(5);
-                        if fill.size < MIN_PROFITABLE_SHARES {
-                            info!(
-                                "MomentumSniper: {} {} fill too small ({} < {} shares), skipping TP",
-                                ms.asset, ms.timeframe.label(), fill.size, MIN_PROFITABLE_SHARES
-                            );
-                            ms.state = SniperState::Completed;
+                        // Accumulate partial fills — neg-risk markets produce many small
+                        // fills from a single order. Don't discard any; check minimum
+                        // profitable size later when transitioning to TP.
+                        let old_size = ms.entry_size.unwrap_or(Decimal::ZERO);
+                        let old_price = ms.entry_price.unwrap_or(Decimal::ZERO);
+                        let new_size = old_size + fill.size;
+                        let new_price = if old_size > Decimal::ZERO && new_size > Decimal::ZERO {
+                            ((old_price * old_size + fill.price * fill.size) / new_size).round_dp(2)
                         } else {
+                            fill.price.round_dp(2)
+                        };
+
+                        info!(
+                            "MomentumSniper: {} {} BUY fill {} @ {} → accumulated {} @ {} (state={:?})",
+                            ms.asset,
+                            ms.timeframe.label(),
+                            fill.size,
+                            fill.price,
+                            new_size,
+                            new_price,
+                            ms.state,
+                        );
+                        ms.entry_price = Some(new_price);
+                        ms.entry_size = Some(new_size);
+                        // Set entry_instant on first fill only
+                        if ms.entry_instant.is_none() {
+                            ms.entry_instant = Some(Instant::now());
+                            ms.entry_timestamp_ms = Some(chrono::Utc::now().timestamp_millis());
+                        }
+                        // Transition to InventoryHeld once we have enough
+                        const MIN_PROFITABLE_SHARES: Decimal = dec!(5);
+                        if new_size >= MIN_PROFITABLE_SHARES {
                             info!(
                                 "MomentumSniper: {} {} FILLED {} @ {} → InventoryHeld",
                                 ms.asset,
                                 ms.timeframe.label(),
-                                fill.size,
-                                fill.price,
+                                new_size,
+                                new_price,
                             );
-                            ms.entry_price = Some(fill.price);
-                            ms.entry_size = Some(fill.size);
-                            ms.entry_instant = Some(Instant::now());
-                            ms.entry_timestamp_ms = Some(chrono::Utc::now().timestamp_millis());
                             ms.state = SniperState::InventoryHeld;
                         }
                     }
                 }
                 SniperState::Completed => {
-                    // Late fill recovery: a fill arrived after state timed out
+                    // Late fill recovery: a fill arrived after state timed out.
+                    // Accumulate with any existing partial fills.
                     if fill.side == Side::Buy {
+                        let old_size = ms.entry_size.unwrap_or(Decimal::ZERO);
+                        let old_price = ms.entry_price.unwrap_or(Decimal::ZERO);
+                        let new_size = old_size + fill.size;
+                        let new_price = if old_size > Decimal::ZERO && new_size > Decimal::ZERO {
+                            ((old_price * old_size + fill.price * fill.size) / new_size).round_dp(2)
+                        } else {
+                            fill.price.round_dp(2)
+                        };
+
                         warn!(
-                            "MomentumSniper: {} {} LATE FILL after timeout: {} @ {} → recovering to InventoryHeld",
+                            "MomentumSniper: {} {} LATE FILL: {} @ {} → total {} @ {} → recovering to InventoryHeld",
                             ms.asset,
                             ms.timeframe.label(),
                             fill.size,
                             fill.price,
+                            new_size,
+                            new_price,
                         );
-                        ms.entry_price = Some(fill.price);
-                        ms.entry_size = Some(fill.size);
-                        ms.entry_instant = Some(Instant::now());
-                        ms.entry_timestamp_ms = Some(chrono::Utc::now().timestamp_millis());
+                        ms.entry_price = Some(new_price);
+                        ms.entry_size = Some(new_size);
+                        if ms.entry_instant.is_none() {
+                            ms.entry_instant = Some(Instant::now());
+                            ms.entry_timestamp_ms = Some(chrono::Utc::now().timestamp_millis());
+                        }
                         ms.state = SniperState::InventoryHeld;
                     }
                 }
@@ -1336,11 +1385,11 @@ impl Strategy for MomentumStrategy {
                         let old_size = ms.entry_size.unwrap_or(Decimal::ZERO);
                         let old_price = ms.entry_price.unwrap_or(Decimal::ZERO);
                         let new_size = old_size + fill.size;
-                        // Weighted average entry price
+                        // Weighted average entry price — round to 2dp to prevent fractional dust
                         let new_price = if new_size > Decimal::ZERO {
-                            (old_price * old_size + fill.price * fill.size) / new_size
+                            ((old_price * old_size + fill.price * fill.size) / new_size).round_dp(2)
                         } else {
-                            fill.price
+                            fill.price.round_dp(2)
                         };
                         info!(
                             "MomentumSniper: {} {} additional fill while InventoryHeld: +{} @ {} → total {} @ {:.4}",
@@ -1379,9 +1428,9 @@ impl Strategy for MomentumStrategy {
                         let old_price = ms.entry_price.unwrap_or(Decimal::ZERO);
                         let new_size = old_size + fill.size;
                         let new_price = if new_size > Decimal::ZERO {
-                            (old_price * old_size + fill.price * fill.size) / new_size
+                            ((old_price * old_size + fill.price * fill.size) / new_size).round_dp(2)
                         } else {
-                            fill.price
+                            fill.price.round_dp(2)
                         };
                         warn!(
                             "MomentumSniper: {} {} LATE BUY fill in {:?}: +{} @ {} → total {} @ {:.4} (excess will redeem)",
