@@ -40,7 +40,7 @@ pub use policy::{
 pub use executor::{ExecutionResult, ExecutionStatus, OrderExecutor};
 
 // Re-export order tracker types
-pub use order_tracker::{OrderTracker, TrackedOrder};
+pub use order_tracker::{OrderPurpose, OrderTracker, TrackedOrder};
 
 // Re-export cancellation types
 pub use cancellation::CancellationManager;

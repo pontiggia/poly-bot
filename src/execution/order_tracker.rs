@@ -16,6 +16,44 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info};
 
 // ============================================================================
+// ORDER PURPOSE
+// ============================================================================
+
+/// Purpose of a tracked order — determines stale cleanup behavior
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderPurpose {
+    /// Entry order (buy to open position) — stale after 60s
+    Entry,
+    /// Take-profit sell order — should NOT be cancelled by stale cleanup
+    TakeProfit,
+    /// Stop-loss order — should NOT be cancelled by stale cleanup
+    StopLoss,
+    /// Unknown/other — default stale behavior
+    Other,
+}
+
+impl OrderPurpose {
+    /// Infer purpose from the order reason string
+    pub fn from_reason(reason: &str) -> Self {
+        let r = reason.to_lowercase();
+        if r.contains("take-profit") || r.contains("tp ") || r.starts_with("tp") {
+            Self::TakeProfit
+        } else if r.contains("stop-loss") || r.contains("stop loss") {
+            Self::StopLoss
+        } else if r.contains("conviction") || r.contains("entry") || r.contains("buy") {
+            Self::Entry
+        } else {
+            Self::Other
+        }
+    }
+
+    /// Should this order type be exempt from stale cleanup?
+    pub fn is_exempt_from_stale_cleanup(&self) -> bool {
+        matches!(self, Self::TakeProfit | Self::StopLoss)
+    }
+}
+
+// ============================================================================
 // TRACKED ORDER
 // ============================================================================
 
@@ -56,6 +94,10 @@ pub struct TrackedOrder {
     /// We keep completed orders around so late WS fill notifications
     /// can still match back to the tracked order instead of being silently dropped.
     pub completed_at: Option<Instant>,
+
+    /// Purpose of this order (entry, take-profit, etc.)
+    /// Determines whether stale cleanup should cancel it.
+    pub purpose: OrderPurpose,
 }
 
 impl TrackedOrder {
@@ -323,11 +365,17 @@ impl OrderTracker {
             .unwrap_or_default()
     }
 
-    /// Get all stale active orders (older than max_age, not already completed)
+    /// Get all stale active orders (older than max_age, not already completed).
+    /// TP and stop-loss orders are exempt from stale cleanup — they are intentionally
+    /// resting on the book and should only be cancelled by the strategy or at market close.
     pub fn stale_orders(&self, max_age: Duration) -> Vec<OrderId> {
         self.orders
             .iter()
-            .filter(|entry| entry.completed_at.is_none() && entry.is_stale(max_age))
+            .filter(|entry| {
+                entry.completed_at.is_none()
+                    && entry.is_stale(max_age)
+                    && !entry.purpose.is_exempt_from_stale_cleanup()
+            })
             .map(|entry| entry.order_id.clone())
             .collect()
     }
@@ -385,6 +433,7 @@ mod tests {
             strategy_name: "TestStrategy".to_string(),
             group_id: None,
             completed_at: None,
+            purpose: OrderPurpose::Entry,
         }
     }
 
@@ -478,6 +527,7 @@ mod tests {
             strategy_name: "Test".to_string(),
             group_id: None,
             completed_at: None,
+            purpose: OrderPurpose::Entry,
         };
 
         let order2 = TrackedOrder {
@@ -523,6 +573,28 @@ mod tests {
     }
 
     #[test]
+    fn test_stale_orders_skip_tp() {
+        let tracker = OrderTracker::new();
+
+        // Old entry order — should be stale
+        let mut entry_order = sample_order("entry-1", "token-a", dec!(0.55));
+        entry_order.created_at = Instant::now() - Duration::from_secs(120);
+        entry_order.purpose = OrderPurpose::Entry;
+        tracker.track(entry_order);
+
+        // Old TP order — should NOT be stale (exempt)
+        let mut tp_order = sample_order("tp-1", "token-a", dec!(0.77));
+        tp_order.created_at = Instant::now() - Duration::from_secs(120);
+        tp_order.side = Side::Sell;
+        tp_order.purpose = OrderPurpose::TakeProfit;
+        tracker.track(tp_order);
+
+        let stale = tracker.stale_orders(Duration::from_secs(60));
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0], "entry-1"); // Only entry is stale, TP is exempt
+    }
+
+    #[test]
     fn test_grouped_orders() {
         let tracker = OrderTracker::new();
 
@@ -538,6 +610,7 @@ mod tests {
             strategy_name: "Test".to_string(),
             group_id: Some("arb-001".to_string()),
             completed_at: None,
+            purpose: OrderPurpose::Entry,
         };
 
         let order2 = TrackedOrder {

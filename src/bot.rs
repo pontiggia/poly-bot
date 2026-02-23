@@ -17,7 +17,7 @@
 
 use crate::config::{Config, OperatingMode};
 use crate::exchange::{Exchange, ExchangeError, SdkExchange};
-use crate::execution::{DualPolicy, ExecutionResult, ExecutionStatus, OrderExecutor, OrderTracker, TrackedOrder};
+use crate::execution::{DualPolicy, ExecutionResult, ExecutionStatus, OrderExecutor, OrderPurpose, OrderTracker, TrackedOrder};
 use crate::kill_switch::KillSwitch;
 use crate::ledger::Ledger;
 use crate::risk::CircuitBreaker;
@@ -915,6 +915,7 @@ impl Bot {
                     strategy_name: intent.strategy_name.clone(),
                     group_id: intent.group_id.clone(),
                     completed_at: None,
+                    purpose: OrderPurpose::from_reason(&intent.reason),
                 };
                 order_tracker.track(tracked);
                 debug!(

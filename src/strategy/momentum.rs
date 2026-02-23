@@ -308,6 +308,8 @@ pub struct MomentumConfig {
     pub max_size_per_trade: Decimal,
     pub max_total_exposure: Decimal,
     pub max_concurrent_positions: usize,
+    /// Max positions in the same direction (UP or DOWN) to limit correlation risk
+    pub max_same_direction_positions: usize,
 
     // === Assets ===
     pub assets: Vec<String>,
@@ -346,6 +348,7 @@ impl MomentumConfig {
             max_size_per_trade: dec!(15),
             max_total_exposure: dec!(50),
             max_concurrent_positions: 4,
+            max_same_direction_positions: 2,
 
             // Assets
             assets: vec![
@@ -389,6 +392,7 @@ impl MomentumConfig {
             max_size_per_trade: dec!(15),
             max_total_exposure: dec!(50),
             max_concurrent_positions: 4,
+            max_same_direction_positions: 2,
 
             // Assets
             assets: vec![
@@ -574,6 +578,24 @@ impl MomentumStrategy {
             .count()
     }
 
+    /// Count active positions in a specific direction
+    fn active_positions_in_direction(&self, dir: Direction) -> usize {
+        self.markets
+            .iter()
+            .filter(|entry| {
+                let ms = entry.value();
+                ms.direction == dir
+                    && matches!(
+                        ms.state,
+                        SniperState::MakerEntry
+                            | SniperState::InventoryHeld
+                            | SniperState::TPPosted
+                            | SniperState::HoldToResolution
+                    )
+            })
+            .count()
+    }
+
     /// Clean up completed/stale market states (older than 2 hours)
     fn cleanup_stale(&self) {
         let cutoff = Instant::now() - std::time::Duration::from_secs(7200);
@@ -617,6 +639,8 @@ impl MomentumStrategy {
         ctx: &StrategyContext,
         tf_config: &MomentumConfig,
         active_count: usize,
+        up_count: usize,
+        down_count: usize,
     ) -> Vec<OrderIntent> {
         // Compute conviction
         let (conviction, direction) = ConvictionEngine::compute(ctx, &ms.asset, tf_config);
@@ -672,6 +696,23 @@ impl MomentumStrategy {
             debug!(
                 "ConvictionRider: max {} concurrent positions reached, skipping",
                 tf_config.max_concurrent_positions
+            );
+            return Vec::new();
+        }
+
+        // Same-direction correlation limit: prevent 4x concentrated bets
+        let same_dir_count = match direction {
+            Direction::Up => up_count,
+            Direction::Down => down_count,
+            Direction::Neutral => 0,
+        };
+        if same_dir_count >= tf_config.max_same_direction_positions {
+            debug!(
+                "ConvictionRider: {} already has {} {} positions (max {}), skipping",
+                ms.asset,
+                same_dir_count,
+                match direction { Direction::Up => "UP", Direction::Down => "DOWN", _ => "?" },
+                tf_config.max_same_direction_positions,
             );
             return Vec::new();
         }
@@ -969,6 +1010,8 @@ impl Strategy for MomentumStrategy {
         // Pre-compute active position count BEFORE entering the DashMap loop
         // to avoid deadlock (iter() inside entry() lock = deadlock)
         let active_count = self.active_position_count();
+        let up_count = self.active_positions_in_direction(Direction::Up);
+        let down_count = self.active_positions_in_direction(Direction::Down);
 
         let pairs = self.registry.filter(|pair| {
             Self::is_momentum_eligible(&pair.event_slug) && pair.close_time.is_some()
@@ -1037,7 +1080,7 @@ impl Strategy for MomentumStrategy {
                 }
                 SniperState::Monitoring => {
                     let new_intents =
-                        self.process_monitoring(&mut ms, secs_until_close, elapsed, ctx, &tf_config, active_count);
+                        self.process_monitoring(&mut ms, secs_until_close, elapsed, ctx, &tf_config, active_count, up_count, down_count);
                     intents.extend(new_intents);
                 }
                 SniperState::InventoryHeld => {
@@ -1072,18 +1115,8 @@ impl Strategy for MomentumStrategy {
                                 "ConvictionRider: {} {} {}s to close, cancelling TP -> HoldToResolution",
                                 ms.asset, ms.timeframe.label(), secs_until_close,
                             );
-                            // Cancel will happen via on_order_management or next tick
-                            intents.push(OrderIntent::new(
-                                ms.condition_id.clone(),
-                                ms.target_token_id.clone(),
-                                Side::Buy, // Dummy — CancelAllForToken used in on_order_management
-                                dec!(0.01),
-                                dec!(0),
-                                Urgency::Passive,
-                                "cancel-tp-for-hold",
-                                "ConvictionRider",
-                            ));
-                            // Actually just transition; the cancel happens below
+                            // State transition only — actual cancel happens in on_order_management
+                            // which emits CancelAllForToken for the TP order
                             ms.state = SniperState::HoldToResolution;
                         }
                         // Otherwise just wait for fill
@@ -1302,6 +1335,15 @@ impl Strategy for MomentumStrategy {
                                 // to Completed and the on_tick will see it.
                             }
                         }
+                    }
+                }
+                SniperState::HoldToResolution => {
+                    // Cancel any remaining orders (e.g. TP sell) when we first enter HoldToResolution
+                    if ms.tp_order_id.is_some() {
+                        actions.push(OrderAction::CancelAllForToken {
+                            token_id: ms.target_token_id.clone(),
+                        });
+                        ms.tp_order_id = None; // Prevent repeated cancels
                     }
                 }
                 _ => {}
