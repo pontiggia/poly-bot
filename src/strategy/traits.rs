@@ -4,9 +4,11 @@
 //! The execution layer (policies + executor) handles the HOW.
 
 use crate::api::types::{ConditionId, Side, TokenId};
+use crate::execution::OrderTracker;
 use crate::ledger::{Fill, Ledger, Position};
 use crate::state::{OrderBookState, PriceHistory, SpotPriceState};
 use rust_decimal::Decimal;
+use std::sync::Arc;
 use std::time::Instant;
 
 // ============================================================================
@@ -166,6 +168,9 @@ pub struct StrategyContext<'a> {
 
     /// Price history for momentum calculation (optional)
     pub price_history: Option<&'a PriceHistory>,
+
+    /// Order tracker for looking up active orders by token (optional)
+    pub order_tracker: Option<Arc<OrderTracker>>,
 }
 
 impl<'a> StrategyContext<'a> {
@@ -178,6 +183,7 @@ impl<'a> StrategyContext<'a> {
             utc_now: chrono::Utc::now(),
             spot_prices: None,
             price_history: None,
+            order_tracker: None,
         }
     }
 
@@ -189,6 +195,12 @@ impl<'a> StrategyContext<'a> {
     ) -> Self {
         self.spot_prices = Some(spot_prices);
         self.price_history = Some(price_history);
+        self
+    }
+
+    /// Add order tracker reference
+    pub fn with_order_tracker(mut self, tracker: Arc<OrderTracker>) -> Self {
+        self.order_tracker = Some(tracker);
         self
     }
 
@@ -250,6 +262,11 @@ impl<'a> StrategyContext<'a> {
     /// Check if we hold any shares of a specific token
     pub fn holds_position(&self, token_id: &TokenId) -> bool {
         !self.ledger.get_position(token_id).is_flat()
+    }
+
+    /// Get the first active order ID for a token (e.g., for cancel/replace)
+    pub fn first_order_for_token(&self, token_id: &TokenId) -> Option<String> {
+        self.order_tracker.as_ref()?.orders_for_token(token_id).into_iter().next()
     }
 }
 
@@ -350,15 +367,19 @@ pub trait Strategy: Send + Sync {
 pub enum OrderAction {
     /// Cancel an outstanding order
     Cancel { order_id: String },
+    /// Cancel ALL outstanding orders for a specific token
+    CancelAllForToken { token_id: String },
     /// Cancel and replace with a new order (atomic cancel+post)
     Replace {
         old_order_id: String,
         new_intent: OrderIntent,
     },
     /// Post a taker fallback order (bypass maker pipeline)
-    /// If cancel_order_id is set, cancel that order first and wait for collateral release.
+    /// If cancel_token_id is set, cancel ALL outstanding orders for that token first
+    /// and wait for collateral release. This is safer than cancelling by order_id because
+    /// the strategy doesn't track individual order IDs from async execution.
     PostTakerFallback {
-        cancel_order_id: Option<String>,
+        cancel_token_id: Option<String>,
         intent: OrderIntent,
     },
 }

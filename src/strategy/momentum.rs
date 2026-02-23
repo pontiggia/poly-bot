@@ -769,7 +769,8 @@ impl MomentumStrategy {
         // === SETTLEMENT COOLDOWN: Wait for neg-risk token settlement before selling ===
         // The CLOB reports fills instantly, but on-chain token settlement on Polygon
         // takes 2-5 seconds. Posting a sell before settlement → "not enough balance".
-        const SETTLEMENT_COOLDOWN_SECS: u64 = 5;
+        // Use 7s to provide safety margin (was 5s, but borderline in practice).
+        const SETTLEMENT_COOLDOWN_SECS: u64 = 7;
         let entry_elapsed_secs = ms.entry_instant
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
@@ -1069,7 +1070,9 @@ impl Strategy for MomentumStrategy {
                                 "MomentumSniper: {} {} TP sell failed {} times, giving up (will redeem on resolution)",
                                 ms.asset, ms.timeframe.label(), ms.tp_sell_retries
                             );
-                            // Don't retry — let PositionRedeemer handle it on market resolution
+                            // Don't retry — let PositionRedeemer handle it on market resolution.
+                            // Transition to Completed to stop re-evaluating on every tick.
+                            ms.state = SniperState::Completed;
                         } else if entry_elapsed >= 5 {
                             ms.tp_sell_retries += 1;
                             warn!(
@@ -1109,9 +1112,6 @@ impl Strategy for MomentumStrategy {
 
                     // Timeout check
                     if elapsed_ms > self.config.maker_fill_timeout_ms {
-                        // Capture maker order ID for cancellation
-                        let maker_oid = ms.maker_order_id.clone();
-
                         if ms.conviction >= self.config.overwhelming_conviction {
                             // Taker fallback — cancel is embedded in PostTakerFallback
                             // to ensure collateral is freed before new order posts
@@ -1190,16 +1190,14 @@ impl Strategy for MomentumStrategy {
                             .with_priority(65);
 
                             actions.push(OrderAction::PostTakerFallback {
-                                cancel_order_id: maker_oid.clone(),
+                                cancel_token_id: Some(ms.target_token_id.clone()),
                                 intent,
                             });
                         } else {
-                            // Conviction too low for taker — just cancel the maker and abandon
-                            if let Some(ref oid) = maker_oid {
-                                actions.push(OrderAction::Cancel {
-                                    order_id: oid.clone(),
-                                });
-                            }
+                            // Conviction too low for taker — cancel all orders for this token and abandon
+                            actions.push(OrderAction::CancelAllForToken {
+                                token_id: ms.target_token_id.clone(),
+                            });
                             info!(
                                 "MomentumSniper: {} maker timeout ({}ms), conviction {:.3} too low for taker fallback, abandoning",
                                 ms.asset, elapsed_ms, ms.conviction
@@ -1216,7 +1214,9 @@ impl Strategy for MomentumStrategy {
                         .unwrap_or(true);
 
                     if should_replace {
-                        if let Some(ref order_id) = ms.maker_order_id {
+                        // Look up active order for this token from the order tracker
+                        let active_order_id = ctx.first_order_for_token(&ms.target_token_id);
+                        if let Some(order_id) = active_order_id {
                             let best_bid = ctx.best_bid(&ms.target_token_id);
                             let best_ask = ctx.best_ask(&ms.target_token_id);
 
@@ -1369,6 +1369,32 @@ impl Strategy for MomentumStrategy {
                             pnl,
                         );
                         ms.state = SniperState::Completed;
+                    } else if fill.side == Side::Buy {
+                        // Late maker fill arrived after we already moved to TP/SL.
+                        // This can happen if the maker order wasn't cancelled in time.
+                        // Accumulate into position — the TP/SL sell will be for the
+                        // original size, so this extra inventory will be left for
+                        // PositionRedeemer to handle on resolution.
+                        let old_size = ms.entry_size.unwrap_or(Decimal::ZERO);
+                        let old_price = ms.entry_price.unwrap_or(Decimal::ZERO);
+                        let new_size = old_size + fill.size;
+                        let new_price = if new_size > Decimal::ZERO {
+                            (old_price * old_size + fill.price * fill.size) / new_size
+                        } else {
+                            fill.price
+                        };
+                        warn!(
+                            "MomentumSniper: {} {} LATE BUY fill in {:?}: +{} @ {} → total {} @ {:.4} (excess will redeem)",
+                            ms.asset,
+                            ms.timeframe.label(),
+                            ms.state,
+                            fill.size,
+                            fill.price,
+                            new_size,
+                            new_price,
+                        );
+                        ms.entry_size = Some(new_size);
+                        ms.entry_price = Some(new_price);
                     }
                 }
                 _ => {}
@@ -1629,8 +1655,8 @@ mod tests {
                 conviction: dec!(0.80),
                 direction: Direction::Up,
                 tp_order_id: None,
-                entry_instant: Some(Instant::now() - std::time::Duration::from_secs(6)),
-                entry_timestamp_ms: Some(now_ms - 5000), // Entered 5s ago
+                entry_instant: Some(Instant::now() - std::time::Duration::from_secs(8)),
+                entry_timestamp_ms: Some(now_ms - 8000), // Entered 8s ago
                 posted_price: None,
                 pending_cancel: false,
                 close_time: None,
@@ -1643,9 +1669,9 @@ mod tests {
         let history = PriceHistory::new(1800);
 
         // BTC was at 50000 when we entered, now dropped to 49800 (-0.4% reversal)
-        history.record("btc", now_ms - 5000, dec!(50000));
-        history.record("btc", now_ms - 4000, dec!(49950));
-        history.record("btc", now_ms - 3000, dec!(49900));
+        history.record("btc", now_ms - 8000, dec!(50000));
+        history.record("btc", now_ms - 6000, dec!(49950));
+        history.record("btc", now_ms - 4000, dec!(49900));
         history.record("btc", now_ms - 2000, dec!(49850));
         history.record("btc", now_ms - 1000, dec!(49800));
         history.record("btc", now_ms, dec!(49800));

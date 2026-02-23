@@ -552,6 +552,12 @@ impl Bot {
 
     /// Handle an order update (ack, cancel, etc.)
     async fn handle_order_update(&mut self, update: crate::websocket::OrderUpdate) {
+        // Skip updates with empty order_id (malformed WS messages)
+        if update.order_id.is_empty() {
+            debug!("Ignoring order update with empty order_id (status: {})", update.status);
+            return;
+        }
+
         debug!(
             "Order update: {} -> {}",
             &update.order_id[..update.order_id.len().min(12)],
@@ -592,7 +598,8 @@ impl Bot {
     /// Handle order management tick (100ms) — cancel/replace loop for maker orders
     async fn handle_order_management(&mut self) {
         let ctx = StrategyContext::new(&self.order_book_state, &self.ledger)
-            .with_spot(&self.spot_prices, &self.price_history);
+            .with_spot(&self.spot_prices, &self.price_history)
+            .with_order_tracker(self.order_tracker.clone());
 
         let actions = self.strategy_router.on_order_management(&ctx);
 
@@ -611,6 +618,17 @@ impl Bot {
                     let _ = executor.cancel_order(&order_id).await;
                     order_tracker.remove(&order_id);
                 }
+                OrderAction::CancelAllForToken { token_id } => {
+                    // Cancel all outstanding orders for a specific token
+                    let order_ids = order_tracker.orders_for_token(&token_id);
+                    for oid in &order_ids {
+                        let _ = executor.cancel_order(oid).await;
+                        order_tracker.remove(oid);
+                    }
+                    if !order_ids.is_empty() {
+                        info!("Cancelled {} order(s) for token {}...", order_ids.len(), &token_id[..token_id.len().min(12)]);
+                    }
+                }
                 OrderAction::Replace { old_order_id, new_intent } => {
                     // Cancel old
                     let _ = executor.cancel_order(&old_order_id).await;
@@ -622,14 +640,19 @@ impl Bot {
                     );
                     self.total_executions += 1;
                 }
-                OrderAction::PostTakerFallback { cancel_order_id, intent } => {
-                    // Cancel the maker GTC order first to free collateral,
+                OrderAction::PostTakerFallback { cancel_token_id, intent } => {
+                    // Cancel ALL outstanding orders for this token to free collateral,
                     // then wait for CLOB to process the cancellation
-                    if let Some(ref cancel_id) = cancel_order_id {
-                        let _ = executor.cancel_order(cancel_id).await;
-                        order_tracker.remove(cancel_id);
-                        // Brief delay for CLOB to release locked collateral
-                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    if let Some(ref token_id) = cancel_token_id {
+                        let order_ids = order_tracker.orders_for_token(token_id);
+                        for oid in &order_ids {
+                            let _ = executor.cancel_order(oid).await;
+                            order_tracker.remove(oid);
+                        }
+                        if !order_ids.is_empty() {
+                            // Brief delay for CLOB to release locked collateral
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
                     }
                     let result = executor.execute(&intent).await;
                     Self::handle_execution_result(
