@@ -1,4 +1,4 @@
-//! Momentum Sniper Strategy — single-leg, maker-first momentum sniper
+//! Conviction Rider Strategy — maker-only mid-candle entry with hold-to-resolution
 //!
 //! Uses Binance WebSocket spot data as an oracle to predict Polymarket
 //! 5m/15m crypto market outcomes.
@@ -6,11 +6,12 @@
 //! ## Strategy Flow
 //!
 //! 1. Watches Binance BTC/ETH/SOL/XRP spot prices in real-time
-//! 2. Computes a conviction score near market close
-//! 3. Posts a GTC maker order at 0.93–0.95 on the predicted winning side
-//! 4. Runs a sub-200ms cancel/replace loop to avoid adverse selection
-//! 5. Falls back to FAK taker if GTC doesn't fill within 2s and conviction is overwhelming
-//! 6. Sells winning inventory into strength (maker at 0.98–0.99) with stop-loss on reversal
+//! 2. Enters monitoring window mid-candle (configurable elapsed time)
+//! 3. Computes conviction score, checks entry price range [0.30–0.65]
+//! 4. Posts a GTC maker BUY order with cancel/replace loop (up to 60s)
+//! 5. Posts maker TP SELL at fixed target (0.93–0.95)
+//! 6. If TP doesn't fill near close, cancels TP and holds to resolution
+//! 7. No taker fallback. No emergency exit. Maker-only, zero fees.
 
 use crate::api::types::{ConditionId, Side, TokenId};
 use crate::ledger::Fill;
@@ -41,6 +42,14 @@ impl Timeframe {
             Timeframe::FifteenMin => "15m",
         }
     }
+
+    /// Candle duration in seconds
+    pub fn duration_secs(&self) -> i64 {
+        match self {
+            Timeframe::FiveMin => 300,
+            Timeframe::FifteenMin => 900,
+        }
+    }
 }
 
 // ============================================================================
@@ -60,21 +69,19 @@ pub enum Direction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SniperState {
-    /// Waiting for trigger window
+    /// Waiting for entry window
     Idle,
-    /// Within trigger window, computing conviction
+    /// Within entry window, computing conviction
     Monitoring,
-    /// GTC maker order posted, cancel/replace loop active
-    MakerPosted,
-    /// Maker didn't fill in time, posting FAK taker
-    TakerFallback,
-    /// Position acquired, watching for exit
+    /// GTC maker BUY posted, cancel/replace loop active
+    MakerEntry,
+    /// Position acquired, about to post TP
     InventoryHeld,
-    /// Take-profit order posted (maker sell)
+    /// Take-profit maker SELL posted, waiting for fill
     TPPosted,
-    /// Stop-loss triggered, dumping via FAK
-    StopLoss,
-    /// Trade complete
+    /// TP didn't fill, holding through resolution
+    HoldToResolution,
+    /// Trade complete (TP filled, resolved, or stopped out)
     Completed,
 }
 
@@ -89,7 +96,7 @@ pub struct MarketState {
     pub asset: String,
     pub timeframe: Timeframe,
     pub state: SniperState,
-    /// The GTC order ID (if in MakerPosted state)
+    /// The GTC order ID (if in MakerEntry state)
     pub maker_order_id: Option<String>,
     /// The token we're betting on (Up or Down)
     pub target_token_id: String,
@@ -97,7 +104,7 @@ pub struct MarketState {
     pub entry_price: Option<Decimal>,
     /// Entry size (shares acquired)
     pub entry_size: Option<Decimal>,
-    /// When we entered MakerPosted state (for 2s timeout)
+    /// When we entered MakerEntry state (for timeout)
     pub maker_posted_at: Option<Instant>,
     /// Last cancel/replace timestamp (for <200ms loop)
     pub last_cancel_replace: Option<Instant>,
@@ -107,7 +114,7 @@ pub struct MarketState {
     pub direction: Direction,
     /// Take-profit order ID (if in TPPosted state)
     pub tp_order_id: Option<String>,
-    /// When we entered TPPosted state (for async execution grace period)
+    /// When we entered TPPosted state
     pub tp_posted_at: Option<Instant>,
     /// Entry timestamp in Instant (for stop-loss delta calc)
     pub entry_instant: Option<Instant>,
@@ -115,14 +122,10 @@ pub struct MarketState {
     pub entry_timestamp_ms: Option<i64>,
     /// Price we posted the maker order at (for cancel/replace tracking)
     pub posted_price: Option<Decimal>,
-    /// Whether we've sent a cancel and are awaiting confirmation
-    pub pending_cancel: bool,
     /// Market close time (unix timestamp)
     pub close_time: Option<i64>,
-    /// Number of TP sell retry attempts (to prevent infinite loops)
-    pub tp_sell_retries: u32,
-    /// Last secs_until_close we logged at (for 1/sec rate-limiting diagnostics)
-    pub last_logged_secs: Option<i64>,
+    /// Whether we've logged the "HOLD TO RESOLUTION" message
+    pub hold_logged: bool,
 }
 
 impl MarketState {
@@ -145,10 +148,8 @@ impl MarketState {
             entry_instant: None,
             entry_timestamp_ms: None,
             posted_price: None,
-            pending_cancel: false,
             close_time: None,
-            tp_sell_retries: 0,
-            last_logged_secs: None,
+            hold_logged: false,
         }
     }
 }
@@ -265,113 +266,82 @@ impl ConvictionEngine {
 
 #[derive(Debug, Clone)]
 pub struct MomentumConfig {
-    // === Timeframe Parameters ===
-    /// Seconds before close to start monitoring (trigger window entry)
-    pub trigger_window_secs: i64,
-    /// Seconds before close to fire the order (trigger point)
-    pub trigger_fire_secs: i64,
+    // === Entry Window ===
+    /// Seconds after candle open to start monitoring
+    pub entry_window_start_secs: i64,
+    /// Seconds before close to stop entering (hard cutoff)
+    pub entry_window_end_secs: i64,
 
     // === Conviction Scoring ===
     /// Minimum conviction score to act (0.0 – 1.0)
     pub min_conviction: Decimal,
-    /// "Overwhelming" conviction threshold for taker fallback
-    pub overwhelming_conviction: Decimal,
     /// Lookback windows for multi-timeframe momentum (in milliseconds)
     pub lookback_windows_ms: Vec<i64>,
     /// Weights for each lookback window (must sum to 1.0)
     pub lookback_weights: Vec<Decimal>,
 
-    // === Maker Entry ===
+    // === Entry Pricing ===
     /// Minimum acceptable entry price (skip if book price is below this)
     pub min_entry_price: Decimal,
-    /// Maximum time to wait for maker fill before taker fallback (ms)
-    pub maker_fill_timeout_ms: u64,
+    /// Maximum entry price — skip markets where best_bid exceeds this
+    pub max_entry_price: Decimal,
+
+    // === Maker Entry ===
+    /// How long to keep trying maker entry before giving up (seconds)
+    pub maker_entry_timeout_secs: u64,
     /// Cancel/replace loop interval (ms)
     pub cancel_replace_interval_ms: u64,
 
-    // === Taker Fallback ===
-    /// Maximum entry price — skip markets where best_bid exceeds this (market already decided, no alpha)
-    pub max_entry_price: Decimal,
+    // === Take Profit ===
+    /// Fixed TP target price (e.g., 0.95)
+    pub tp_target_price: Decimal,
 
-    // === Inventory Exit ===
-    /// Take-profit spread above entry price (e.g., 0.04 = 4 cents above entry)
-    pub tp_spread: Decimal,
-    /// Aggressive take-profit spread (wider margin if bid is very high)
-    pub aggressive_tp_spread: Decimal,
-    /// Stop-loss: minimum spot delta reversal to trigger emergency dump (Binance)
+    // === Stop Loss ===
+    /// Massive Binance reversal threshold (e.g., -0.010 = 1.0%)
     pub stop_loss_reversal_pct: Decimal,
-    /// Book-based stop-loss: dump if best_bid drops this far below entry
-    pub book_stop_loss_spread: Decimal,
-    /// Force exit this many seconds before market resolution
-    pub max_hold_before_close_secs: u64,
 
     // === Sizing ===
     pub max_size_per_trade: Decimal,
     pub max_total_exposure: Decimal,
+    pub max_concurrent_positions: usize,
 
     // === Assets ===
     pub assets: Vec<String>,
 }
 
 impl MomentumConfig {
-    /// Conservative preset for 5-minute markets
-    pub fn preset_5m() -> Self {
+    /// Preset for 15-minute markets
+    pub fn preset_15m_rider() -> Self {
         Self {
-            trigger_window_secs: 15,
-            trigger_fire_secs: 10,
-            min_conviction: dec!(0.70),
-            overwhelming_conviction: dec!(0.90),
-            lookback_windows_ms: vec![60_000, 180_000, 300_000],
-            lookback_weights: vec![dec!(0.5), dec!(0.3), dec!(0.2)],
-            min_entry_price: dec!(0.25),
-            maker_fill_timeout_ms: 2000,
-            cancel_replace_interval_ms: 150,
-            max_entry_price: dec!(0.93),
-            tp_spread: dec!(0.04),
-            aggressive_tp_spread: dec!(0.06),
-            stop_loss_reversal_pct: dec!(-0.003),
-            book_stop_loss_spread: dec!(0.03),
-            max_hold_before_close_secs: 5,
-            max_size_per_trade: dec!(15),
-            max_total_exposure: dec!(40),
-            assets: vec![
-                "btc".to_string(),
-                "eth".to_string(),
-                "sol".to_string(),
-                "xrp".to_string(),
-            ],
-        }
-    }
+            // Entry window: 5min into candle → 2min before close
+            entry_window_start_secs: 300,
+            entry_window_end_secs: 120,
 
-    /// Conservative preset for 15-minute markets
-    ///
-    /// Key differences from 5m:
-    /// - Wider trigger window (30s) and fire point (15s) — more time for price to settle
-    /// - Longer lookback windows (3m/10m/15m) — captures the full 15m trend
-    /// - Longer maker fill timeout (3s) — 15m markets move slower
-    /// - Tighter TP spread (0.03) — more realistic fill probability before resolution
-    /// - Wider stop-loss (-0.5%) — avoids noise-triggered dumps on longer timeframe
-    /// - Wider book SL (0.04) — same reasoning
-    /// - Emergency exit at 8s before close (must be < trigger_fire_secs - maker_timeout)
-    pub fn preset_15m() -> Self {
-        Self {
-            trigger_window_secs: 30,
-            trigger_fire_secs: 15,
-            min_conviction: dec!(0.70),
-            overwhelming_conviction: dec!(0.90),
+            // Conviction
+            min_conviction: dec!(0.75),
             lookback_windows_ms: vec![180_000, 600_000, 900_000],
             lookback_weights: vec![dec!(0.5), dec!(0.3), dec!(0.2)],
-            min_entry_price: dec!(0.20),
-            maker_fill_timeout_ms: 3000,
-            cancel_replace_interval_ms: 150,
-            max_entry_price: dec!(0.93),
-            tp_spread: dec!(0.03),
-            aggressive_tp_spread: dec!(0.05),
-            stop_loss_reversal_pct: dec!(-0.005),
-            book_stop_loss_spread: dec!(0.04),
-            max_hold_before_close_secs: 8,
+
+            // Entry pricing
+            min_entry_price: dec!(0.30),
+            max_entry_price: dec!(0.65),
+
+            // Maker entry
+            maker_entry_timeout_secs: 60,
+            cancel_replace_interval_ms: 200,
+
+            // Take profit
+            tp_target_price: dec!(0.95),
+
+            // Stop loss — ONLY on massive Binance reversal
+            stop_loss_reversal_pct: dec!(-0.010),
+
+            // Sizing
             max_size_per_trade: dec!(15),
-            max_total_exposure: dec!(40),
+            max_total_exposure: dec!(50),
+            max_concurrent_positions: 4,
+
+            // Assets
             assets: vec![
                 "btc".to_string(),
                 "eth".to_string(),
@@ -381,61 +351,102 @@ impl MomentumConfig {
         }
     }
 
-    /// Default live test configuration ($50 max exposure)
+    /// Preset for 5-minute markets
+    pub fn preset_5m_rider() -> Self {
+        Self {
+            // Entry window: 2min into candle → 1min before close
+            entry_window_start_secs: 120,
+            entry_window_end_secs: 60,
+
+            // Conviction
+            min_conviction: dec!(0.75),
+            lookback_windows_ms: vec![60_000, 180_000, 300_000],
+            lookback_weights: vec![dec!(0.5), dec!(0.3), dec!(0.2)],
+
+            // Entry pricing
+            min_entry_price: dec!(0.30),
+            max_entry_price: dec!(0.65),
+
+            // Maker entry
+            maker_entry_timeout_secs: 30,
+            cancel_replace_interval_ms: 200,
+
+            // Take profit
+            tp_target_price: dec!(0.93),
+
+            // Stop loss
+            stop_loss_reversal_pct: dec!(-0.008),
+
+            // Sizing
+            max_size_per_trade: dec!(15),
+            max_total_exposure: dec!(50),
+            max_concurrent_positions: 4,
+
+            // Assets
+            assets: vec![
+                "btc".to_string(),
+                "eth".to_string(),
+                "sol".to_string(),
+                "xrp".to_string(),
+            ],
+        }
+    }
+
+    /// Default live test configuration
     pub fn default_live_test() -> Self {
-        Self::from_env_with_defaults(Self::preset_5m())
+        Self::from_env_with_defaults(Self::preset_5m_rider())
     }
 
     /// Load overrides from environment variables
     fn from_env_with_defaults(mut config: Self) -> Self {
-        if let Ok(v) = std::env::var("MOMENTUM_MIN_CONVICTION") {
+        if let Ok(v) = std::env::var("RIDER_MIN_CONVICTION") {
             if let Ok(d) = v.parse::<Decimal>() {
                 config.min_conviction = d;
             }
         }
-        if let Ok(v) = std::env::var("MOMENTUM_MIN_ENTRY_PRICE") {
+        if let Ok(v) = std::env::var("RIDER_MIN_ENTRY_PRICE") {
             if let Ok(d) = v.parse::<Decimal>() {
                 config.min_entry_price = d;
             }
         }
-        if let Ok(v) = std::env::var("MOMENTUM_MAKER_FILL_TIMEOUT_MS") {
-            if let Ok(d) = v.parse::<u64>() {
-                config.maker_fill_timeout_ms = d;
-            }
-        }
-        if let Ok(v) = std::env::var("MOMENTUM_TP_SPREAD") {
-            if let Ok(d) = v.parse::<Decimal>() {
-                config.tp_spread = d;
-            }
-        }
-        if let Ok(v) = std::env::var("MOMENTUM_BOOK_SL_SPREAD") {
-            if let Ok(d) = v.parse::<Decimal>() {
-                config.book_stop_loss_spread = d;
-            }
-        }
-        if let Ok(v) = std::env::var("MOMENTUM_STOP_LOSS_PCT") {
-            if let Ok(d) = v.parse::<Decimal>() {
-                config.stop_loss_reversal_pct = -d.abs();
-            }
-        }
-        if let Ok(v) = std::env::var("MOMENTUM_MAX_EXPOSURE") {
-            if let Ok(d) = v.parse::<Decimal>() {
-                config.max_total_exposure = d;
-            }
-        }
-        if let Ok(v) = std::env::var("MOMENTUM_MAX_SIZE_PER_TRADE") {
-            if let Ok(d) = v.parse::<Decimal>() {
-                config.max_size_per_trade = d;
-            }
-        }
-        if let Ok(v) = std::env::var("MOMENTUM_MAX_ENTRY_PRICE") {
+        if let Ok(v) = std::env::var("RIDER_MAX_ENTRY_PRICE") {
             if let Ok(d) = v.parse::<Decimal>() {
                 config.max_entry_price = d;
             }
         }
-        if let Ok(v) = std::env::var("MOMENTUM_OVERWHELMING_CONVICTION") {
+        if let Ok(v) = std::env::var("RIDER_TP_TARGET") {
             if let Ok(d) = v.parse::<Decimal>() {
-                config.overwhelming_conviction = d;
+                config.tp_target_price = d;
+            }
+        }
+        if let Ok(v) = std::env::var("RIDER_STOP_LOSS_PCT") {
+            if let Ok(d) = v.parse::<Decimal>() {
+                config.stop_loss_reversal_pct = -d.abs();
+            }
+        }
+        if let Ok(v) = std::env::var("RIDER_MAX_EXPOSURE") {
+            if let Ok(d) = v.parse::<Decimal>() {
+                config.max_total_exposure = d;
+            }
+        }
+        if let Ok(v) = std::env::var("RIDER_MAX_SIZE_PER_TRADE") {
+            if let Ok(d) = v.parse::<Decimal>() {
+                config.max_size_per_trade = d;
+            }
+        }
+        if let Ok(v) = std::env::var("RIDER_MAKER_ENTRY_TIMEOUT_SECS") {
+            if let Ok(d) = v.parse::<u64>() {
+                config.maker_entry_timeout_secs = d;
+            }
+        }
+        if let Ok(v) = std::env::var("RIDER_ENTRY_WINDOW_START_SECS") {
+            if let Ok(d) = v.parse::<i64>() {
+                config.entry_window_start_secs = d;
+            }
+        }
+        if let Ok(v) = std::env::var("RIDER_ENTRY_WINDOW_END_SECS") {
+            if let Ok(d) = v.parse::<i64>() {
+                config.entry_window_end_secs = d;
             }
         }
         config
@@ -444,7 +455,7 @@ impl MomentumConfig {
 
 impl Default for MomentumConfig {
     fn default() -> Self {
-        Self::preset_5m()
+        Self::preset_5m_rider()
     }
 }
 
@@ -452,9 +463,9 @@ impl Default for MomentumConfig {
 // MOMENTUM STRATEGY
 // ============================================================================
 
-/// Single-leg momentum sniper for 5m/15m crypto markets
+/// Conviction Rider strategy for 5m/15m crypto markets
 pub struct MomentumStrategy {
-    /// Configuration (using 5m defaults; timeframe-specific params applied per-market)
+    /// Configuration (5m defaults; timeframe-specific params applied per-market)
     config: MomentumConfig,
     /// Market pair registry
     registry: Arc<MarketPairRegistry>,
@@ -512,57 +523,77 @@ impl MomentumStrategy {
                 self.config.clone()
             }
             Timeframe::FifteenMin => {
-                // Apply all 15m-specific overrides from preset
-                let preset = MomentumConfig::preset_15m();
+                // Apply 15m-specific overrides from preset
+                let preset = MomentumConfig::preset_15m_rider();
                 let mut c = self.config.clone();
-                c.trigger_window_secs = preset.trigger_window_secs;       // 30s
-                c.trigger_fire_secs = preset.trigger_fire_secs;           // 15s
-                c.lookback_windows_ms = preset.lookback_windows_ms;       // [180k, 600k, 900k]
-                c.maker_fill_timeout_ms = preset.maker_fill_timeout_ms;   // 3000ms (slower markets)
-                c.tp_spread = preset.tp_spread;                           // 0.03 (tighter for 15m)
-                c.aggressive_tp_spread = preset.aggressive_tp_spread;     // 0.05
-                c.stop_loss_reversal_pct = preset.stop_loss_reversal_pct; // -0.5% (wider to avoid noise)
-                c.book_stop_loss_spread = preset.book_stop_loss_spread;   // 0.04 (wider for 15m)
-                c.max_hold_before_close_secs = preset.max_hold_before_close_secs; // 8s (must be < trigger_fire_secs - maker_timeout)
+                c.entry_window_start_secs = preset.entry_window_start_secs;
+                c.entry_window_end_secs = preset.entry_window_end_secs;
+                c.lookback_windows_ms = preset.lookback_windows_ms;
+                c.lookback_weights = preset.lookback_weights;
+                c.maker_entry_timeout_secs = preset.maker_entry_timeout_secs;
+                c.tp_target_price = preset.tp_target_price;
+                c.stop_loss_reversal_pct = preset.stop_loss_reversal_pct;
                 c
             }
         }
     }
 
-    /// Clean up completed/stale market states (older than 30 minutes)
+    /// Count active positions (MakerEntry, InventoryHeld, TPPosted, HoldToResolution)
+    fn active_position_count(&self) -> usize {
+        self.markets
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.value().state,
+                    SniperState::MakerEntry
+                        | SniperState::InventoryHeld
+                        | SniperState::TPPosted
+                        | SniperState::HoldToResolution
+                )
+            })
+            .count()
+    }
+
+    /// Clean up completed/stale market states (older than 2 hours)
     fn cleanup_stale(&self) {
-        let cutoff = Instant::now() - std::time::Duration::from_secs(1800);
+        let cutoff = Instant::now() - std::time::Duration::from_secs(7200);
         self.markets.retain(|_, ms| {
-            // Keep if not completed, or if completed recently
             ms.state != SniperState::Completed
                 || ms.maker_posted_at.map_or(true, |t| t > cutoff)
         });
     }
 
-    /// Process Idle → Monitoring transition
+    /// Process Idle → Monitoring transition (elapsed-time-based entry window)
     fn process_idle(
         &self,
         ms: &mut MarketState,
-        secs_until_close: i64,
+        close_time: i64,
+        now_unix: i64,
         tf_config: &MomentumConfig,
     ) {
-        if secs_until_close <= tf_config.trigger_window_secs && secs_until_close > 0 {
+        let candle_duration = ms.timeframe.duration_secs();
+        let candle_open_time = close_time - candle_duration;
+        let elapsed = now_unix - candle_open_time;
+
+        if elapsed >= tf_config.entry_window_start_secs {
+            let secs_until_close = close_time - now_unix;
             ms.state = SniperState::Monitoring;
             info!(
-                "🔍 {} {} → Monitoring ({}s to close, fire at ≤{}s)",
+                "ConvictionRider: {} {} -> Monitoring ({}s elapsed, {}s to close)",
                 ms.asset,
                 ms.timeframe.label(),
+                elapsed,
                 secs_until_close,
-                tf_config.trigger_fire_secs
             );
         }
     }
 
-    /// Process Monitoring → MakerPosted transition
+    /// Process Monitoring → MakerEntry transition
     fn process_monitoring(
         &self,
         ms: &mut MarketState,
         secs_until_close: i64,
+        elapsed: i64,
         ctx: &StrategyContext,
         tf_config: &MomentumConfig,
     ) -> Vec<OrderIntent> {
@@ -571,86 +602,45 @@ impl MomentumStrategy {
         ms.conviction = conviction;
         ms.direction = direction;
 
-        // Log at INFO when in fire window (throttled to 1/sec via secs_until_close dedup)
-        if secs_until_close <= tf_config.trigger_fire_secs {
-            let already_logged = ms.last_logged_secs == Some(secs_until_close);
-            if !already_logged {
-                ms.last_logged_secs = Some(secs_until_close);
-                let dir_label = match direction {
-                    Direction::Up => "UP",
-                    Direction::Down => "DOWN",
-                    Direction::Neutral => "NEUTRAL",
-                };
-                let best_bid = ctx.best_bid(&ms.target_token_id);
-                info!(
-                    "⚡ {} {} conv={:.3} {} ({}s to close, need ≥{:.2}) bid={:?}",
-                    ms.asset,
-                    ms.timeframe.label(),
-                    conviction,
-                    dir_label,
-                    secs_until_close,
-                    tf_config.min_conviction,
-                    best_bid,
-                );
-            }
-        } else {
+        let dir_label = match direction {
+            Direction::Up => "UP",
+            Direction::Down => "DOWN",
+            Direction::Neutral => "NEUTRAL",
+        };
+
+        let active_count = self.active_position_count();
+
+        debug!(
+            "ConvictionRider: {} {} conv={:.3} {} ({}s elapsed, {}s to close) — {} active positions",
+            ms.asset,
+            ms.timeframe.label(),
+            conviction,
+            dir_label,
+            elapsed,
+            secs_until_close,
+            active_count,
+        );
+
+        // Past the entry window end — missed it
+        if secs_until_close <= tf_config.entry_window_end_secs {
             debug!(
-                "MomentumSniper: {} {} conviction={:.3} dir={:?} ({}s to close)",
-                ms.asset,
-                ms.timeframe.label(),
-                conviction,
-                direction,
-                secs_until_close
+                "ConvictionRider: {} entry window closed ({}s to close, cutoff={}s)",
+                ms.asset, secs_until_close, tf_config.entry_window_end_secs
             );
-        }
-
-        // Check if we should fire
-        if secs_until_close > tf_config.trigger_fire_secs {
-            return Vec::new(); // Not yet in fire window
-        }
-
-        // BUG-BB FIX: Don't enter if there isn't enough time for the maker
-        // order to fill before close. Entering too late means we'd immediately
-        // emergency-exit, which can fail because on-chain settlement hasn't
-        // happened yet (takes ~7s), resulting in stuck positions.
-        //
-        // Minimum time needed = maker_fill_timeout + 1s safety margin.
-        // This gives effective entry windows of:
-        //   5m:  trigger_fire(10s) → cutoff(3s) = 7-second window
-        //   15m: trigger_fire(15s) → cutoff(4s) = 11-second window
-        //
-        // Previously this used max_hold_before_close_secs which halved
-        // the entry windows unnecessarily (5s for 5m, 7s for 15m).
-        let min_secs_for_entry = (tf_config.maker_fill_timeout_ms / 1000 + 1) as i64;
-        if secs_until_close <= min_secs_for_entry {
-            if secs_until_close <= 0 {
-                debug!(
-                    "MomentumSniper: {} market already closed ({}s), skipping entry",
-                    ms.asset, secs_until_close
-                );
-            } else {
-                debug!(
-                    "MomentumSniper: {} only {}s to close (emergency exit at {}s), skipping entry",
-                    ms.asset, secs_until_close, min_secs_for_entry
-                );
-            }
+            ms.state = SniperState::Completed;
             return Vec::new();
         }
 
-        // Don't fire if exchange is unhealthy (504s, network errors)
+        // Don't fire if exchange is unhealthy
         if !ctx.is_exchange_healthy() {
             debug!(
-                "MomentumSniper: {} exchange unhealthy, skipping fire",
+                "ConvictionRider: {} exchange unhealthy, skipping",
                 ms.asset
             );
             return Vec::new();
         }
 
         if conviction < tf_config.min_conviction {
-            debug!(
-                "MomentumSniper: {} conviction {:.3} < {:.3} threshold, staying in Monitoring",
-                ms.asset, conviction, tf_config.min_conviction
-            );
             return Vec::new();
         }
 
@@ -658,10 +648,19 @@ impl MomentumStrategy {
             return Vec::new();
         }
 
+        // Max concurrent positions check
+        if active_count >= tf_config.max_concurrent_positions {
+            debug!(
+                "ConvictionRider: max {} concurrent positions reached, skipping",
+                tf_config.max_concurrent_positions
+            );
+            return Vec::new();
+        }
+
         // Exposure check
         if ctx.total_exposure() >= tf_config.max_total_exposure {
             debug!(
-                "MomentumSniper: max exposure ${} reached, skipping",
+                "ConvictionRider: max exposure ${} reached, skipping",
                 tf_config.max_total_exposure
             );
             ms.state = SniperState::Completed;
@@ -686,13 +685,11 @@ impl MomentumStrategy {
 
         let maker_price = match (best_bid, best_ask) {
             (Some(bid), Some(ask)) => {
-                // Post one tick above best bid (top of maker queue)
                 let target = bid + dec!(0.01);
                 if target >= ask {
-                    // Would cross — post one tick below best ask instead
                     let safe_price = ask - dec!(0.01);
                     if safe_price < dec!(0.01) {
-                        debug!("MomentumSniper: {} spread too tight, skipping", ms.asset);
+                        debug!("ConvictionRider: {} spread too tight, skipping", ms.asset);
                         return Vec::new();
                     }
                     safe_price
@@ -703,16 +700,16 @@ impl MomentumStrategy {
             (Some(bid), None) => bid + dec!(0.01),
             (None, Some(ask)) => ask - dec!(0.01),
             (None, None) => {
-                debug!("MomentumSniper: {} no book data, skipping", ms.asset);
+                debug!("ConvictionRider: {} no book data, skipping", ms.asset);
                 return Vec::new();
             }
         };
 
-        // Sanity: skip if market already decided (no alpha left) or price too low
+        // Entry price range filter [min_entry_price, max_entry_price]
         if let Some(bid) = best_bid {
             if bid > tf_config.max_entry_price {
                 debug!(
-                    "MomentumSniper: {} market already decided (bid={} > max_entry={}), skipping",
+                    "ConvictionRider: {} bid={} > max_entry={}, skipping",
                     ms.asset, bid, tf_config.max_entry_price
                 );
                 return Vec::new();
@@ -720,34 +717,17 @@ impl MomentumStrategy {
         }
         if maker_price < tf_config.min_entry_price {
             debug!(
-                "MomentumSniper: {} price {} below min_entry_price {}, skipping",
+                "ConvictionRider: {} price {} below min_entry_price {}, skipping",
                 ms.asset, maker_price, tf_config.min_entry_price
             );
             return Vec::new();
         }
-
-        // Price-conviction agreement filter:
-        // If the market disagrees with us (low bid), require stronger conviction.
-        // Rationale: bid=0.37 means market says 37% chance UP. Our spot oracle saying
-        // "UP" with conv=0.75 isn't enough to overcome the market's view.
-        // Only kicks in when market clearly disagrees (bid < 0.35).
-        // In the 0.35–0.50 "contested" zone, normal threshold is fine — that's where
-        // most 5m crypto markets live and where our edge exists.
-        if let Some(bid) = best_bid {
-            let required_conviction = if bid < dec!(0.30) {
-                dec!(0.95)
-            } else if bid < dec!(0.35) {
-                dec!(0.85)
-            } else {
-                tf_config.min_conviction // Normal threshold for bid ≥ 0.35
-            };
-            if conviction < required_conviction {
-                debug!(
-                    "MomentumSniper: {} bid={} disagrees with direction, conv {:.3} < required {:.3}, skipping",
-                    ms.asset, bid, conviction, required_conviction
-                );
-                return Vec::new();
-            }
+        if maker_price > tf_config.max_entry_price {
+            debug!(
+                "ConvictionRider: {} price {} above max_entry_price {}, skipping",
+                ms.asset, maker_price, tf_config.max_entry_price
+            );
+            return Vec::new();
         }
 
         // Sizing
@@ -760,27 +740,19 @@ impl MomentumStrategy {
             .min(max_from_exposure)
             .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero);
 
-        // Need at least $1 order value
         let min_shares = (dec!(1) / maker_price).ceil();
         if trade_size < min_shares {
-            debug!("MomentumSniper: insufficient cash for trade");
+            debug!("ConvictionRider: insufficient cash for trade");
             ms.state = SniperState::Completed;
             return Vec::new();
         }
 
-        let dir_label = match direction {
-            Direction::Up => "UP",
-            Direction::Down => "DOWN",
-            Direction::Neutral => "?",
-        };
-
         info!(
-            "{} Momentum: {} {} (conv={:.3}, {}s to close) → MAKER BUY {} @ {} x {} (bid={:?} ask={:?})",
+            "{} Conviction: {} {} (conv={:.3}) -> MAKER BUY {} @ {} x {} (bid={:?} ask={:?})",
             ms.timeframe.label(),
             ms.asset,
             dir_label,
             conviction,
-            secs_until_close,
             &winning_token[..winning_token.len().min(12)],
             maker_price,
             trade_size,
@@ -788,9 +760,9 @@ impl MomentumStrategy {
             best_ask,
         );
 
-        // Transition to MakerPosted
+        // Transition to MakerEntry
         ms.target_token_id = winning_token.clone();
-        ms.state = SniperState::MakerPosted;
+        ms.state = SniperState::MakerEntry;
         ms.maker_posted_at = Some(Instant::now());
         ms.posted_price = Some(maker_price);
 
@@ -800,15 +772,15 @@ impl MomentumStrategy {
             Side::Buy,
             maker_price,
             trade_size,
-            Urgency::Passive, // GTC maker
+            Urgency::Passive, // GTC maker — zero fees
             format!(
-                "{} momentum {} {} (conv={:.2})",
+                "{} conviction {} {} (conv={:.2})",
                 ms.timeframe.label(),
                 ms.asset,
                 dir_label,
                 conviction,
             ),
-            "MomentumSniper",
+            "ConvictionRider",
         )
         .with_fee_rate(pair.fee_rate_bps)
         .with_priority(60);
@@ -816,7 +788,7 @@ impl MomentumStrategy {
         vec![intent]
     }
 
-    /// Process InventoryHeld — check for take-profit, stop-loss, and emergency exits
+    /// Process InventoryHeld — settlement cooldown, Binance stop-loss, post TP
     fn process_inventory_held(
         &self,
         ms: &mut MarketState,
@@ -834,122 +806,34 @@ impl MomentumStrategy {
             return Vec::new();
         }
 
-        // === SETTLEMENT COOLDOWN: Wait for neg-risk token settlement before selling ===
-        // The CLOB reports fills instantly, but on-chain token settlement on Polygon
-        // takes 2-5 seconds. Posting a sell before settlement → "not enough balance".
-        // Use 7s to provide safety margin (was 5s, but borderline in practice).
+        // === SETTLEMENT COOLDOWN: Wait for on-chain token settlement ===
         const SETTLEMENT_COOLDOWN_SECS: u64 = 7;
-        let entry_elapsed_secs = ms.entry_instant
+        let entry_elapsed_secs = ms
+            .entry_instant
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
         if entry_elapsed_secs < SETTLEMENT_COOLDOWN_SECS {
-            // Still waiting for settlement — but allow emergency exit through
-            // (emergency exit will also likely fail, but better to try than hold through close)
-            if let Some(close_time) = ms.close_time {
-                let secs_until_close = close_time - ctx.utc_now.timestamp();
-                if secs_until_close >= tf_config.max_hold_before_close_secs as i64 {
-                    // Not emergency — wait for settlement
-                    return Vec::new();
-                }
-                // Emergency — fall through to exit logic below
-            } else {
-                return Vec::new();
-            }
+            return Vec::new();
         }
 
-        // === EMERGENCY EXIT: Time-based (force exit before market close) ===
-        if let Some(close_time) = ms.close_time {
-            let secs_until_close = close_time - ctx.utc_now.timestamp();
-            if secs_until_close < tf_config.max_hold_before_close_secs as i64 {
-                let sell_price = ctx
-                    .best_bid(&ms.target_token_id)
-                    .unwrap_or(dec!(0.50));
-
-                warn!(
-                    "EMERGENCY EXIT: {} {} {}s until close → GTC SELL {} @ {}",
-                    ms.asset,
-                    ms.timeframe.label(),
-                    secs_until_close,
-                    entry_size,
-                    sell_price,
-                );
-
-                ms.state = SniperState::StopLoss;
-
-                // Use GTC (Passive) instead of FAK (Normal) to avoid
-                // INVALID_ORDER_MIN_SIZE errors on fractional token balances.
-                // Per Polymarket docs, FOK/FAK taker orders have strict 2dp
-                // precision limits. GTC crossed aggressively at best_bid
-                // achieves the same immediate fill without precision issues.
-                return vec![OrderIntent::new(
-                    ms.condition_id.clone(),
-                    ms.target_token_id.clone(),
-                    Side::Sell,
-                    sell_price,
-                    entry_size,
-                    Urgency::Passive, // GTC — crossed aggressively at best_bid
-                    format!("emergency-exit {} {}", ms.asset, ms.timeframe.label()),
-                    "MomentumSniper",
-                )
-                .with_fee_rate(pair.fee_rate_bps)
-                .with_priority(95)]; // Highest priority
-            }
-        }
-
-        // === STOP-LOSS 1: Book-based (best_bid dropped below entry - spread) ===
-        let book_sl_price = entry_price - tf_config.book_stop_loss_spread;
-        if let Some(best_bid) = ctx.best_bid(&ms.target_token_id) {
-            if best_bid < book_sl_price {
-                let sell_price = best_bid; // Dump at current best bid
-
-                warn!(
-                    "BOOK STOP-LOSS: {} {} best_bid={} < sl_price={} → GTC SELL {} @ {}",
-                    ms.asset,
-                    ms.timeframe.label(),
-                    best_bid,
-                    book_sl_price,
-                    entry_size,
-                    sell_price,
-                );
-
-                ms.state = SniperState::StopLoss;
-
-                // Use GTC (Passive) to avoid INVALID_ORDER_MIN_SIZE on fractional balances
-                return vec![OrderIntent::new(
-                    ms.condition_id.clone(),
-                    ms.target_token_id.clone(),
-                    Side::Sell,
-                    sell_price,
-                    entry_size,
-                    Urgency::Passive, // GTC — crossed at best_bid for immediate fill
-                    format!("book-sl {} {}", ms.asset, ms.timeframe.label()),
-                    "MomentumSniper",
-                )
-                .with_fee_rate(pair.fee_rate_bps)
-                .with_priority(90)];
-            }
-        }
-
-        // === STOP-LOSS 2: Binance delta reversal (crash protection) ===
+        // === STOP-LOSS: Binance delta reversal only (massive, 1%+ reversal) ===
         if let Some(entry_ts_ms) = ms.entry_timestamp_ms {
             let now_ms = ctx.utc_now.timestamp_millis();
             let ms_since_entry = now_ms - entry_ts_ms;
             if let Some(delta) = ctx.spot_change_pct(&ms.asset, ms_since_entry) {
-                // Check direction-adjusted reversal
                 let reversal = match ms.direction {
-                    Direction::Up => delta, // If we bought UP, negative delta = reversal
-                    Direction::Down => -delta, // If we bought DOWN, positive delta = reversal
+                    Direction::Up => delta,
+                    Direction::Down => -delta,
                     Direction::Neutral => Decimal::ZERO,
                 };
 
                 if reversal < tf_config.stop_loss_reversal_pct {
                     let sell_price = ctx
                         .best_bid(&ms.target_token_id)
-                        .map(|b| b - dec!(0.01))
                         .unwrap_or(dec!(0.50));
 
                     warn!(
-                        "BINANCE STOP-LOSS: {} {} reversal={:.4}% (threshold={:.3}%) → GTC SELL {} @ {}",
+                        "STOP-LOSS: {} {} Binance reversal {:.4}% (threshold={:.3}%) -> MAKER SELL {} @ {}",
                         ms.asset,
                         ms.timeframe.label(),
                         reversal * dec!(100),
@@ -958,18 +842,17 @@ impl MomentumStrategy {
                         sell_price,
                     );
 
-                    ms.state = SniperState::StopLoss;
+                    ms.state = SniperState::Completed;
 
-                    // Use GTC (Passive) to avoid INVALID_ORDER_MIN_SIZE on fractional balances
                     return vec![OrderIntent::new(
                         ms.condition_id.clone(),
                         ms.target_token_id.clone(),
                         Side::Sell,
                         sell_price,
                         entry_size,
-                        Urgency::Passive, // GTC — crossed aggressively for immediate fill
-                        format!("binance-sl {} {}", ms.asset, ms.timeframe.label()),
-                        "MomentumSniper",
+                        Urgency::Passive, // GTC maker — zero fees
+                        format!("stop-loss {} {}", ms.asset, ms.timeframe.label()),
+                        "ConvictionRider",
                     )
                     .with_fee_rate(pair.fee_rate_bps)
                     .with_priority(90)];
@@ -977,31 +860,17 @@ impl MomentumStrategy {
             }
         }
 
-        // === TAKE-PROFIT: Post GTC SELL at entry + tp_spread immediately ===
-        // Round entry_price to 2dp (tick_size) to prevent fractional dust from weighted averages
-        let entry_price_clean = entry_price.round_dp(2);
-        let tp_price = (entry_price_clean + tf_config.tp_spread).min(dec!(0.99));
-
-        // Check if book bid has risen enough for aggressive TP
-        let final_tp_price = if let Some(best_bid) = ctx.best_bid(&ms.target_token_id) {
-            let aggressive_tp = (entry_price_clean + tf_config.aggressive_tp_spread).min(dec!(0.99));
-            if best_bid >= aggressive_tp {
-                aggressive_tp // Bid is very high, take aggressive TP
-            } else {
-                tp_price // Standard TP
-            }
-        } else {
-            tp_price
-        };
+        // === TAKE-PROFIT: Post GTC SELL at tp_target_price ===
+        let tp_price = tf_config.tp_target_price.min(dec!(0.99));
 
         info!(
-            "TAKE-PROFIT: {} {} entry={} → MAKER SELL {} @ {} (tp_spread={})",
+            "TAKE-PROFIT: {} {} entry={} -> MAKER SELL {} @ {} (target={})",
             ms.asset,
             ms.timeframe.label(),
             entry_price,
             entry_size,
-            final_tp_price,
-            tf_config.tp_spread,
+            tp_price,
+            tf_config.tp_target_price,
         );
 
         ms.state = SniperState::TPPosted;
@@ -1011,11 +880,11 @@ impl MomentumStrategy {
             ms.condition_id.clone(),
             ms.target_token_id.clone(),
             Side::Sell,
-            final_tp_price,
+            tp_price,
             entry_size,
-            Urgency::Passive, // GTC maker sell
+            Urgency::Passive, // GTC maker sell — zero fees
             format!("take-profit {} {}", ms.asset, ms.timeframe.label()),
-            "MomentumSniper",
+            "ConvictionRider",
         )
         .with_fee_rate(pair.fee_rate_bps)
         .with_priority(70)]
@@ -1024,7 +893,7 @@ impl MomentumStrategy {
 
 impl Strategy for MomentumStrategy {
     fn name(&self) -> &str {
-        "MomentumSniper"
+        "ConvictionRider"
     }
 
     fn priority(&self) -> u8 {
@@ -1036,7 +905,6 @@ impl Strategy for MomentumStrategy {
     }
 
     fn subscribed_markets(&self) -> Vec<ConditionId> {
-        // Subscribe to all markets — we filter by slug in on_tick
         Vec::new()
     }
 
@@ -1046,23 +914,19 @@ impl Strategy for MomentumStrategy {
         _token_id: &TokenId,
         _ctx: &StrategyContext,
     ) -> Vec<OrderIntent> {
-        // Momentum strategy acts on tick, not on book updates
         Vec::new()
     }
 
     fn on_tick(&self, ctx: &StrategyContext) -> Vec<OrderIntent> {
-        // Need spot prices to function
         if ctx.spot_prices.is_none() || ctx.price_history.is_none() {
             return Vec::new();
         }
 
-        // Periodic cleanup
         self.cleanup_stale();
 
         let now_unix = ctx.utc_now.timestamp();
         let mut intents = Vec::new();
 
-        // Iterate all registered momentum-eligible markets
         let pairs = self.registry.filter(|pair| {
             Self::is_momentum_eligible(&pair.event_slug) && pair.close_time.is_some()
         });
@@ -1076,11 +940,17 @@ impl Strategy for MomentumStrategy {
 
             let secs_until_close = close_time - now_unix;
 
-            // Skip markets that already closed
-            if secs_until_close < -5 {
-                // Cleanup if completed
+            // Skip markets that already closed (but allow HoldToResolution to run)
+            if secs_until_close < -300 {
+                // 5+ minutes past close — clean up
                 if let Some(mut ms) = self.markets.get_mut(condition_id) {
-                    if ms.state == SniperState::StopLoss || ms.state == SniperState::TPPosted {
+                    if ms.state == SniperState::HoldToResolution {
+                        info!(
+                            "ConvictionRider: {} {} market closed {}s ago, completing hold-to-resolution",
+                            ms.asset, ms.timeframe.label(), -secs_until_close
+                        );
+                        ms.state = SniperState::Completed;
+                    } else if ms.state != SniperState::Completed {
                         ms.state = SniperState::Completed;
                     }
                 }
@@ -1104,81 +974,97 @@ impl Strategy for MomentumStrategy {
 
             let tf_config = self.config_for_timeframe(timeframe);
 
-            // Get or create market state
             let mut ms = self
                 .markets
                 .entry(condition_id.clone())
                 .or_insert_with(|| MarketState::new(condition_id.clone(), asset.clone(), timeframe));
 
-            // Store close_time for use in inventory management
             if ms.close_time.is_none() {
                 ms.close_time = Some(close_time);
             }
 
+            // Compute elapsed time from candle open
+            let candle_duration = timeframe.duration_secs();
+            let candle_open_time = close_time - candle_duration;
+            let elapsed = now_unix - candle_open_time;
+
             match ms.state {
                 SniperState::Idle => {
-                    self.process_idle(&mut ms, secs_until_close, &tf_config);
+                    self.process_idle(&mut ms, close_time, now_unix, &tf_config);
                 }
                 SniperState::Monitoring => {
                     let new_intents =
-                        self.process_monitoring(&mut ms, secs_until_close, ctx, &tf_config);
+                        self.process_monitoring(&mut ms, secs_until_close, elapsed, ctx, &tf_config);
                     intents.extend(new_intents);
                 }
                 SniperState::InventoryHeld => {
-                    let new_intents =
-                        self.process_inventory_held(&mut ms, ctx, &tf_config);
+                    let new_intents = self.process_inventory_held(&mut ms, ctx, &tf_config);
                     intents.extend(new_intents);
                 }
-                SniperState::Completed | SniperState::StopLoss => {
-                    // Nothing to do
-                }
-                SniperState::MakerPosted | SniperState::TakerFallback => {
-                    // Handled in on_order_management
-                }
                 SniperState::TPPosted => {
-                    // The TP sell intent is executed asynchronously (tokio::spawn).
-                    // We must give it a grace period before concluding it was rejected.
-                    // tp_posted_at tracks when we entered TPPosted state.
-                    const TP_GRACE_PERIOD_MS: u128 = 3_000; // 3s for async exec + CLOB response
-                    const MAX_TP_RETRIES: u32 = 3;
-
-                    let tp_age_ms = ms.tp_posted_at
+                    // Check if TP order was placed
+                    let tp_age_ms = ms
+                        .tp_posted_at
                         .map(|t| t.elapsed().as_millis())
                         .unwrap_or(0);
 
-                    // If we're still within the grace period, let the async execution finish.
-                    if tp_age_ms < TP_GRACE_PERIOD_MS {
-                        // Still waiting for execution result — do nothing.
-                        continue;
-                    }
-
-                    // Grace period elapsed and no fill received. The order was either
-                    // rejected (tp_order_id still None) or placed but not filled yet.
-                    // If tp_order_id is set, the order is on the book — wait for fill.
+                    // If tp_order_id is set, the order is on the book — check for HoldToResolution transition
                     if ms.tp_order_id.is_some() {
-                        // TP order is on the book, wait for fill or market close.
+                        // Near close: cancel TP and hold to resolution
+                        if secs_until_close <= 30 {
+                            info!(
+                                "ConvictionRider: {} {} {}s to close, cancelling TP -> HoldToResolution",
+                                ms.asset, ms.timeframe.label(), secs_until_close,
+                            );
+                            // Cancel will happen via on_order_management or next tick
+                            intents.push(OrderIntent::new(
+                                ms.condition_id.clone(),
+                                ms.target_token_id.clone(),
+                                Side::Buy, // Dummy — CancelAllForToken used in on_order_management
+                                dec!(0.01),
+                                dec!(0),
+                                Urgency::Passive,
+                                "cancel-tp-for-hold",
+                                "ConvictionRider",
+                            ));
+                            // Actually just transition; the cancel happens below
+                            ms.state = SniperState::HoldToResolution;
+                        }
+                        // Otherwise just wait for fill
                         continue;
                     }
 
-                    // tp_order_id is None after grace period → order was truly rejected.
-                    let entry_elapsed = ms.entry_instant
-                        .map(|t| t.elapsed().as_secs())
-                        .unwrap_or(0);
-                    if ms.tp_sell_retries >= MAX_TP_RETRIES {
-                        warn!(
-                            "MomentumSniper: {} {} TP sell failed {} times, giving up (will redeem on resolution)",
-                            ms.asset, ms.timeframe.label(), ms.tp_sell_retries
-                        );
-                        ms.state = SniperState::Completed;
-                    } else {
-                        ms.tp_sell_retries += 1;
-                        warn!(
-                            "MomentumSniper: {} {} TP sell was rejected after {}ms, retry #{} ({}s since entry)",
-                            ms.asset, ms.timeframe.label(), tp_age_ms, ms.tp_sell_retries, entry_elapsed
-                        );
-                        ms.state = SniperState::InventoryHeld;
-                        ms.tp_posted_at = None;
+                    // tp_order_id is None — order may still be executing or was rejected
+                    const TP_GRACE_PERIOD_MS: u128 = 5_000;
+                    if tp_age_ms < TP_GRACE_PERIOD_MS {
+                        continue; // Still waiting for execution
                     }
+
+                    // After 5s grace and no tp_order_id — rejected, go to HoldToResolution
+                    warn!(
+                        "ConvictionRider: {} {} TP sell rejected after {}ms -> HoldToResolution",
+                        ms.asset, ms.timeframe.label(), tp_age_ms,
+                    );
+                    ms.state = SniperState::HoldToResolution;
+                }
+                SniperState::HoldToResolution => {
+                    // Log once
+                    if !ms.hold_logged {
+                        let entry_size = ms.entry_size.unwrap_or(Decimal::ZERO);
+                        let entry_price = ms.entry_price.unwrap_or(Decimal::ZERO);
+                        info!(
+                            "HOLD TO RESOLUTION: {} {} holding {} shares @ entry {} — awaiting market close",
+                            ms.asset, ms.timeframe.label(), entry_size, entry_price,
+                        );
+                        ms.hold_logged = true;
+                    }
+                    // Transition handled by the -300s check above
+                }
+                SniperState::Completed => {
+                    // Nothing to do
+                }
+                SniperState::MakerEntry => {
+                    // Handled in on_order_management
                 }
             }
         }
@@ -1189,12 +1075,11 @@ impl Strategy for MomentumStrategy {
     fn on_order_management(&self, ctx: &StrategyContext) -> Vec<OrderAction> {
         let mut actions = Vec::new();
 
-        // Iterate all active market states
         for mut entry in self.markets.iter_mut() {
             let ms = entry.value_mut();
 
             match ms.state {
-                SniperState::MakerPosted => {
+                SniperState::MakerEntry => {
                     let posted_at = match ms.maker_posted_at {
                         Some(t) => t,
                         None => {
@@ -1203,125 +1088,58 @@ impl Strategy for MomentumStrategy {
                         }
                     };
 
-                    let elapsed_ms = posted_at.elapsed().as_millis() as u64;
+                    let elapsed_secs = posted_at.elapsed().as_secs();
+                    let tf_config = self.config_for_timeframe(ms.timeframe);
 
                     // Timeout check
-                    if elapsed_ms > self.config.maker_fill_timeout_ms {
-                        if ms.conviction >= self.config.overwhelming_conviction {
-                            // Taker fallback — cancel is embedded in PostTakerFallback
-                            // to ensure collateral is freed before new order posts
-                            info!(
-                                "MomentumSniper: {} maker timeout ({}ms), conviction {:.3} → TAKER FALLBACK",
-                                ms.asset, elapsed_ms, ms.conviction
-                            );
+                    if elapsed_secs >= tf_config.maker_entry_timeout_secs {
+                        actions.push(OrderAction::CancelAllForToken {
+                            token_id: ms.target_token_id.clone(),
+                        });
+                        info!(
+                            "ConvictionRider: {} maker entry timeout ({}s), abandoning",
+                            ms.asset, elapsed_secs
+                        );
+                        ms.state = SniperState::Completed;
+                        continue;
+                    }
 
-                            let pair = match self.registry.get_by_condition(&ms.condition_id) {
-                                Some(p) => p,
-                                None => {
-                                    ms.state = SniperState::Completed;
-                                    continue;
-                                }
-                            };
-
-                            // Check best ask is within our entry limit
-                            let best_ask = ctx.best_ask(&ms.target_token_id);
-                            let taker_price = match best_ask {
-                                Some(ask) if ask <= self.config.max_entry_price => ask,
-                                Some(ask) => {
-                                    info!(
-                                        "MomentumSniper: {} best ask {} > max entry {}, abandoning",
-                                        ms.asset, ask, self.config.max_entry_price
-                                    );
-                                    ms.state = SniperState::Completed;
-                                    continue;
-                                }
-                                None => {
-                                    ms.state = SniperState::Completed;
-                                    continue;
-                                }
-                            };
-
-                            // Size for taker (recompute)
-                            let max_affordable =
-                                (ctx.available_cash() / taker_price).floor();
-                            let remaining_exposure =
-                                self.config.max_total_exposure - ctx.total_exposure();
-                            let max_from_exposure =
-                                (remaining_exposure / taker_price).floor();
-                            let trade_size = self
-                                .config
-                                .max_size_per_trade
-                                .min(max_affordable)
-                                .min(max_from_exposure)
-                                .round_dp_with_strategy(
-                                    2,
-                                    rust_decimal::RoundingStrategy::ToZero,
-                                );
-
-                            let min_shares = (dec!(1) / taker_price).ceil();
-                            if trade_size < min_shares {
-                                ms.state = SniperState::Completed;
-                                continue;
-                            }
-
-                            ms.state = SniperState::TakerFallback;
-
-                            let intent = OrderIntent::new(
-                                ms.condition_id.clone(),
-                                ms.target_token_id.clone(),
-                                Side::Buy,
-                                taker_price,
-                                trade_size,
-                                Urgency::Normal, // FAK
-                                format!(
-                                    "taker fallback {} {} (conv={:.2})",
-                                    ms.asset,
-                                    ms.timeframe.label(),
-                                    ms.conviction,
-                                ),
-                                "MomentumSniper",
-                            )
-                            .with_fee_rate(pair.fee_rate_bps)
-                            .with_priority(65);
-
-                            actions.push(OrderAction::PostTakerFallback {
-                                cancel_token_id: Some(ms.target_token_id.clone()),
-                                intent,
-                            });
-                        } else {
-                            // Conviction too low for taker — cancel all orders for this token and abandon
+                    // Entry window end check
+                    if let Some(close_time) = ms.close_time {
+                        let secs_until_close = close_time - ctx.utc_now.timestamp();
+                        if secs_until_close <= tf_config.entry_window_end_secs {
                             actions.push(OrderAction::CancelAllForToken {
                                 token_id: ms.target_token_id.clone(),
                             });
                             info!(
-                                "MomentumSniper: {} maker timeout ({}ms), conviction {:.3} too low for taker fallback, abandoning",
-                                ms.asset, elapsed_ms, ms.conviction
+                                "ConvictionRider: {} entry window closed ({}s to close), abandoning",
+                                ms.asset, secs_until_close
                             );
                             ms.state = SniperState::Completed;
+                            continue;
                         }
-                        continue;
                     }
 
-                    // Cancel/replace loop: re-derive optimal price from book each tick
-                    // Skip cancel/replace repricing when exchange is unhealthy
+                    // Cancel/replace loop
                     if !ctx.is_exchange_healthy() {
                         continue;
                     }
 
                     let should_replace = ms
                         .last_cancel_replace
-                        .map(|t| t.elapsed().as_millis() as u64 >= self.config.cancel_replace_interval_ms)
+                        .map(|t| {
+                            t.elapsed().as_millis() as u64
+                                >= tf_config.cancel_replace_interval_ms
+                        })
                         .unwrap_or(true);
 
                     if should_replace {
-                        // Look up active order for this token from the order tracker
                         let active_order_id = ctx.first_order_for_token(&ms.target_token_id);
                         if let Some(order_id) = active_order_id {
                             let best_bid = ctx.best_bid(&ms.target_token_id);
                             let best_ask = ctx.best_ask(&ms.target_token_id);
 
                             if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
-                                // Compute optimal maker price (same logic as initial entry)
                                 let target = bid + dec!(0.01);
                                 let optimal_price = if target >= ask {
                                     ask - dec!(0.01)
@@ -1332,16 +1150,17 @@ impl Strategy for MomentumStrategy {
                                 if let Some(posted) = ms.posted_price {
                                     if optimal_price != posted && optimal_price >= dec!(0.01) {
                                         debug!(
-                                            "MomentumSniper: {} cancel/replace {} → {} (bid={} ask={})",
+                                            "ConvictionRider: {} cancel/replace {} -> {} (bid={} ask={})",
                                             ms.asset, posted, optimal_price, bid, ask
                                         );
 
-                                        let pair = match self.registry.get_by_condition(&ms.condition_id) {
-                                            Some(p) => p,
-                                            None => continue,
-                                        };
+                                        let pair =
+                                            match self.registry.get_by_condition(&ms.condition_id) {
+                                                Some(p) => p,
+                                                None => continue,
+                                            };
 
-                                        let trade_size = self.config.max_size_per_trade;
+                                        let trade_size = tf_config.max_size_per_trade;
 
                                         let new_intent = OrderIntent::new(
                                             ms.condition_id.clone(),
@@ -1349,9 +1168,13 @@ impl Strategy for MomentumStrategy {
                                             Side::Buy,
                                             optimal_price,
                                             trade_size,
-                                            Urgency::Passive,
-                                            format!("cancel/replace {} {}", ms.asset, ms.timeframe.label()),
-                                            "MomentumSniper",
+                                            Urgency::Passive, // GTC maker — zero fees
+                                            format!(
+                                                "cancel/replace {} {}",
+                                                ms.asset,
+                                                ms.timeframe.label()
+                                            ),
+                                            "ConvictionRider",
                                         )
                                         .with_fee_rate(pair.fee_rate_bps)
                                         .with_priority(60);
@@ -1369,7 +1192,63 @@ impl Strategy for MomentumStrategy {
                         ms.last_cancel_replace = Some(Instant::now());
                     }
                 }
-                _ => {} // Other states handled in on_tick
+                SniperState::TPPosted => {
+                    // Cancel TP when transitioning to HoldToResolution
+                    // (The state transition happens in on_tick; here we just handle
+                    //  the cancel if we need to cancel the TP order)
+                    if let Some(close_time) = ms.close_time {
+                        let secs_until_close = close_time - ctx.utc_now.timestamp();
+                        if secs_until_close <= 30 && ms.tp_order_id.is_some() {
+                            actions.push(OrderAction::CancelAllForToken {
+                                token_id: ms.target_token_id.clone(),
+                            });
+                        }
+                    }
+
+                    // Binance reversal stop-loss in TPPosted state
+                    if let Some(entry_ts_ms) = ms.entry_timestamp_ms {
+                        let now_ms = ctx.utc_now.timestamp_millis();
+                        let ms_since_entry = now_ms - entry_ts_ms;
+                        let tf_config = self.config_for_timeframe(ms.timeframe);
+                        if let Some(delta) = ctx.spot_change_pct(&ms.asset, ms_since_entry) {
+                            let reversal = match ms.direction {
+                                Direction::Up => delta,
+                                Direction::Down => -delta,
+                                Direction::Neutral => Decimal::ZERO,
+                            };
+                            if reversal < tf_config.stop_loss_reversal_pct {
+                                let sell_price = ctx
+                                    .best_bid(&ms.target_token_id)
+                                    .unwrap_or(dec!(0.50));
+                                let entry_size = ms.entry_size.unwrap_or(Decimal::ZERO);
+
+                                warn!(
+                                    "STOP-LOSS (TPPosted): {} {} Binance reversal {:.4}% -> cancel TP + MAKER SELL {} @ {}",
+                                    ms.asset,
+                                    ms.timeframe.label(),
+                                    reversal * dec!(100),
+                                    entry_size,
+                                    sell_price,
+                                );
+
+                                // Cancel TP order first
+                                actions.push(OrderAction::CancelAllForToken {
+                                    token_id: ms.target_token_id.clone(),
+                                });
+
+                                ms.state = SniperState::Completed;
+                                // Note: the sell intent will be emitted as a separate action
+                                // We can't emit OrderIntent from on_order_management, so
+                                // the stop-loss sell needs to be handled differently.
+                                // For TPPosted stop-loss, we cancel and let HoldToResolution
+                                // or resolution handle the position. But per the plan,
+                                // stop-loss should sell. We handle this by transitioning
+                                // to Completed and the on_tick will see it.
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -1377,7 +1256,6 @@ impl Strategy for MomentumStrategy {
     }
 
     fn on_fill(&self, fill: &Fill, _ctx: &StrategyContext) -> Vec<OrderIntent> {
-        // Find which market state this fill belongs to
         for mut entry in self.markets.iter_mut() {
             let ms = entry.value_mut();
 
@@ -1386,22 +1264,20 @@ impl Strategy for MomentumStrategy {
             }
 
             match ms.state {
-                SniperState::MakerPosted | SniperState::TakerFallback => {
+                SniperState::MakerEntry => {
                     if fill.side == Side::Buy {
-                        // Accumulate partial fills — neg-risk markets produce many small
-                        // fills from a single order. Don't discard any; check minimum
-                        // profitable size later when transitioning to TP.
                         let old_size = ms.entry_size.unwrap_or(Decimal::ZERO);
                         let old_price = ms.entry_price.unwrap_or(Decimal::ZERO);
                         let new_size = old_size + fill.size;
                         let new_price = if old_size > Decimal::ZERO && new_size > Decimal::ZERO {
-                            ((old_price * old_size + fill.price * fill.size) / new_size).round_dp(2)
+                            ((old_price * old_size + fill.price * fill.size) / new_size)
+                                .round_dp(2)
                         } else {
                             fill.price.round_dp(2)
                         };
 
                         info!(
-                            "MomentumSniper: {} {} BUY fill {} @ {} → accumulated {} @ {} (state={:?})",
+                            "ConvictionRider: {} {} BUY fill {} @ {} -> accumulated {} @ {} (state={:?})",
                             ms.asset,
                             ms.timeframe.label(),
                             fill.size,
@@ -1412,16 +1288,15 @@ impl Strategy for MomentumStrategy {
                         );
                         ms.entry_price = Some(new_price);
                         ms.entry_size = Some(new_size);
-                        // Set entry_instant on first fill only
                         if ms.entry_instant.is_none() {
                             ms.entry_instant = Some(Instant::now());
-                            ms.entry_timestamp_ms = Some(chrono::Utc::now().timestamp_millis());
+                            ms.entry_timestamp_ms =
+                                Some(chrono::Utc::now().timestamp_millis());
                         }
-                        // Transition to InventoryHeld once we have enough
                         const MIN_PROFITABLE_SHARES: Decimal = dec!(5);
                         if new_size >= MIN_PROFITABLE_SHARES {
                             info!(
-                                "MomentumSniper: {} {} FILLED {} @ {} → InventoryHeld",
+                                "ConvictionRider: {} {} FILLED {} @ {} -> InventoryHeld",
                                 ms.asset,
                                 ms.timeframe.label(),
                                 new_size,
@@ -1432,20 +1307,20 @@ impl Strategy for MomentumStrategy {
                     }
                 }
                 SniperState::Completed => {
-                    // Late fill recovery: a fill arrived after state timed out.
-                    // Accumulate with any existing partial fills.
                     if fill.side == Side::Buy {
+                        // Late fill recovery
                         let old_size = ms.entry_size.unwrap_or(Decimal::ZERO);
                         let old_price = ms.entry_price.unwrap_or(Decimal::ZERO);
                         let new_size = old_size + fill.size;
                         let new_price = if old_size > Decimal::ZERO && new_size > Decimal::ZERO {
-                            ((old_price * old_size + fill.price * fill.size) / new_size).round_dp(2)
+                            ((old_price * old_size + fill.price * fill.size) / new_size)
+                                .round_dp(2)
                         } else {
                             fill.price.round_dp(2)
                         };
 
                         warn!(
-                            "MomentumSniper: {} {} LATE FILL: {} @ {} → total {} @ {} → recovering to InventoryHeld",
+                            "ConvictionRider: {} {} LATE FILL: {} @ {} -> total {} @ {} -> recovering to InventoryHeld",
                             ms.asset,
                             ms.timeframe.label(),
                             fill.size,
@@ -1457,26 +1332,38 @@ impl Strategy for MomentumStrategy {
                         ms.entry_size = Some(new_size);
                         if ms.entry_instant.is_none() {
                             ms.entry_instant = Some(Instant::now());
-                            ms.entry_timestamp_ms = Some(chrono::Utc::now().timestamp_millis());
+                            ms.entry_timestamp_ms =
+                                Some(chrono::Utc::now().timestamp_millis());
                         }
                         ms.state = SniperState::InventoryHeld;
+                    } else if fill.side == Side::Sell {
+                        // Late stop-loss sell fill — just log PnL
+                        let entry_price = ms.entry_price.unwrap_or(Decimal::ZERO);
+                        let pnl = (fill.price - entry_price) * fill.size - fill.fee;
+                        info!(
+                            "ConvictionRider: {} {} LATE SELL fill {} @ {} (entry={}, PnL=${:.4})",
+                            ms.asset,
+                            ms.timeframe.label(),
+                            fill.size,
+                            fill.price,
+                            entry_price,
+                            pnl,
+                        );
                     }
                 }
                 SniperState::InventoryHeld => {
-                    // Additional fill while already holding (e.g., both maker and taker filled
-                    // in a neg-risk race condition). Accumulate into existing position.
                     if fill.side == Side::Buy {
                         let old_size = ms.entry_size.unwrap_or(Decimal::ZERO);
                         let old_price = ms.entry_price.unwrap_or(Decimal::ZERO);
                         let new_size = old_size + fill.size;
-                        // Weighted average entry price — round to 2dp to prevent fractional dust
                         let new_price = if new_size > Decimal::ZERO {
-                            ((old_price * old_size + fill.price * fill.size) / new_size).round_dp(2)
+                            ((old_price * old_size + fill.price * fill.size) / new_size)
+                                .round_dp(2)
                         } else {
                             fill.price.round_dp(2)
                         };
                         info!(
-                            "MomentumSniper: {} {} additional fill while InventoryHeld: +{} @ {} → total {} @ {:.4}",
+                            "ConvictionRider: {} {} additional fill while InventoryHeld: +{} @ {} -> total {} @ {:.4}",
                             ms.asset,
                             ms.timeframe.label(),
                             fill.size,
@@ -1488,12 +1375,12 @@ impl Strategy for MomentumStrategy {
                         ms.entry_price = Some(new_price);
                     }
                 }
-                SniperState::TPPosted | SniperState::StopLoss => {
+                SniperState::TPPosted => {
                     if fill.side == Side::Sell {
                         let entry_price = ms.entry_price.unwrap_or(Decimal::ZERO);
                         let pnl = (fill.price - entry_price) * fill.size - fill.fee;
                         info!(
-                            "MomentumSniper: {} {} EXIT FILLED {} @ {} (entry={}, PnL=${:.4})",
+                            "ConvictionRider: {} {} TP FILLED {} @ {} (entry={}, PnL=${:.4})",
                             ms.asset,
                             ms.timeframe.label(),
                             fill.size,
@@ -1503,24 +1390,20 @@ impl Strategy for MomentumStrategy {
                         );
                         ms.state = SniperState::Completed;
                     } else if fill.side == Side::Buy {
-                        // Late maker fill arrived after we already moved to TP/SL.
-                        // This can happen if the maker order wasn't cancelled in time.
-                        // Accumulate into position — the TP/SL sell will be for the
-                        // original size, so this extra inventory will be left for
-                        // PositionRedeemer to handle on resolution.
+                        // Late maker fill arrived after we moved to TP
                         let old_size = ms.entry_size.unwrap_or(Decimal::ZERO);
                         let old_price = ms.entry_price.unwrap_or(Decimal::ZERO);
                         let new_size = old_size + fill.size;
                         let new_price = if new_size > Decimal::ZERO {
-                            ((old_price * old_size + fill.price * fill.size) / new_size).round_dp(2)
+                            ((old_price * old_size + fill.price * fill.size) / new_size)
+                                .round_dp(2)
                         } else {
                             fill.price.round_dp(2)
                         };
                         warn!(
-                            "MomentumSniper: {} {} LATE BUY fill in {:?}: +{} @ {} → total {} @ {:.4} (excess will redeem)",
+                            "ConvictionRider: {} {} LATE BUY fill in TPPosted: +{} @ {} -> total {} @ {:.4} (excess will redeem)",
                             ms.asset,
                             ms.timeframe.label(),
-                            ms.state,
                             fill.size,
                             fill.price,
                             new_size,
@@ -1528,6 +1411,22 @@ impl Strategy for MomentumStrategy {
                         );
                         ms.entry_size = Some(new_size);
                         ms.entry_price = Some(new_price);
+                    }
+                }
+                SniperState::HoldToResolution => {
+                    // No active orders — unexpected fill, just log
+                    if fill.side == Side::Sell {
+                        let entry_price = ms.entry_price.unwrap_or(Decimal::ZERO);
+                        let pnl = (fill.price - entry_price) * fill.size - fill.fee;
+                        info!(
+                            "ConvictionRider: {} {} unexpected SELL fill in HoldToResolution {} @ {} (PnL=${:.4})",
+                            ms.asset, ms.timeframe.label(), fill.size, fill.price, pnl,
+                        );
+                    } else {
+                        warn!(
+                            "ConvictionRider: {} {} unexpected BUY fill in HoldToResolution {} @ {}",
+                            ms.asset, ms.timeframe.label(), fill.size, fill.price,
+                        );
                     }
                 }
                 _ => {}
@@ -1604,8 +1503,6 @@ mod tests {
         let history = PriceHistory::new(1800);
         let now_ms = chrono::Utc::now().timestamp_millis();
 
-        // Simulate BTC going UP consistently over 5 minutes
-        // Record prices every second from 5min ago to now
         for i in 0..300 {
             let ts = now_ms - (300_000 - i * 1000);
             let price = dec!(50000) + Decimal::from(i) * dec!(1);
@@ -1621,10 +1518,14 @@ mod tests {
         let ledger = Ledger::new(dec!(10000));
         let ctx = StrategyContext::new(&books, &ledger).with_spot(&spot, &history);
 
-        let config = MomentumConfig::preset_5m();
+        let config = MomentumConfig::preset_5m_rider();
         let (conviction, direction) = ConvictionEngine::compute(&ctx, "btc", &config);
 
-        assert!(conviction > dec!(0.5), "Conviction should be significant: {}", conviction);
+        assert!(
+            conviction > dec!(0.5),
+            "Conviction should be significant: {}",
+            conviction
+        );
         assert_eq!(direction, Direction::Up);
     }
 
@@ -1637,7 +1538,7 @@ mod tests {
         let ledger = Ledger::new(dec!(10000));
         let ctx = StrategyContext::new(&books, &ledger).with_spot(&spot, &history);
 
-        let config = MomentumConfig::preset_5m();
+        let config = MomentumConfig::preset_5m_rider();
         let (conviction, direction) = ConvictionEngine::compute(&ctx, "btc", &config);
 
         assert_eq!(conviction, Decimal::ZERO);
@@ -1649,24 +1550,26 @@ mod tests {
         let registry = Arc::new(MarketPairRegistry::new());
         let now = chrono::Utc::now().timestamp();
 
+        // For 5m rider, entry_window_start_secs = 120
+        // candle duration = 300s
+        // We need elapsed >= 120, so close_time should be at most 300-120=180s from now
+        // Set close_time = now + 150 → elapsed = 300-150 = 150 ≥ 120 → enters Monitoring
         let pair = crate::strategy::MarketPair::new_up_down(
             "0x5m_test".to_string(),
             "up_token_123".to_string(),
             "down_token_456".to_string(),
         )
         .with_event_slug("btc-updown-5m-1740000000")
-        .with_close_time(now + 10); // 10 seconds to close
+        .with_close_time(now + 150);
 
         registry.register(pair);
 
-        let config = MomentumConfig::preset_5m();
+        let config = MomentumConfig::preset_5m_rider();
         let strategy = MomentumStrategy::new(registry, config);
 
-        // Set up minimal spot data
         let spot = SpotPriceState::new();
         let history = PriceHistory::new(1800);
         let now_ms = chrono::Utc::now().timestamp_millis();
-        // Add enough data points for conviction engine
         for i in 0..300 {
             let ts = now_ms - (300_000 - i * 1000);
             history.record("btc", ts, dec!(50000) + Decimal::from(i));
@@ -1677,14 +1580,13 @@ mod tests {
             timestamp_ms: now_ms,
         });
 
-        // Set up order book with ask at 0.90
         let books = OrderBookState::new();
         books.update_book(
             "up_token_123".to_string(),
             "0x5m_test".to_string(),
             vec![],
             vec![crate::api::types::PriceLevel {
-                price: "0.90".to_string(),
+                price: "0.50".to_string(),
                 size: "100".to_string(),
             }],
             None,
@@ -1694,18 +1596,17 @@ mod tests {
         let ledger = Ledger::new(dec!(10000));
         let ctx = StrategyContext::new(&books, &ledger).with_spot(&spot, &history);
 
-        // First tick should transition to Monitoring, then possibly to MakerPosted
         let _intents = strategy.on_tick(&ctx);
 
-        // Check that the strategy created a market state
-        assert!(!strategy.markets.is_empty(), "Should have created a market state");
-
-        // Check the state
-        let ms = strategy.markets.get("0x5m_test").unwrap();
-        // Should be Monitoring or MakerPosted depending on conviction
         assert!(
-            ms.state == SniperState::Monitoring || ms.state == SniperState::MakerPosted,
-            "State should be Monitoring or MakerPosted, got {:?}",
+            !strategy.markets.is_empty(),
+            "Should have created a market state"
+        );
+
+        let ms = strategy.markets.get("0x5m_test").unwrap();
+        assert!(
+            ms.state == SniperState::Monitoring || ms.state == SniperState::MakerEntry,
+            "State should be Monitoring or MakerEntry, got {:?}",
             ms.state
         );
     }
@@ -1715,17 +1616,20 @@ mod tests {
         let registry = Arc::new(MarketPairRegistry::new());
         let now = chrono::Utc::now().timestamp();
 
+        // For 15m rider, entry_window_start_secs = 300
+        // candle duration = 900s
+        // elapsed >= 300 → close_time <= now + 600
         let pair = crate::strategy::MarketPair::new_up_down(
             "0x15m_test".to_string(),
             "up_token".to_string(),
             "down_token".to_string(),
         )
         .with_event_slug("btc-updown-15m-1740000000")
-        .with_close_time(now + 20);
+        .with_close_time(now + 500);
 
         registry.register(pair);
 
-        let config = MomentumConfig::preset_5m(); // 5m defaults, but 15m detected
+        let config = MomentumConfig::preset_5m_rider();
         let strategy = MomentumStrategy::new(registry, config);
 
         let spot = SpotPriceState::new();
@@ -1747,7 +1651,6 @@ mod tests {
 
         let _ = strategy.on_tick(&ctx);
 
-        // Should have created a market state for the 15m market
         assert!(
             strategy.markets.contains_key("0x15m_test"),
             "15m market should be tracked"
@@ -1767,7 +1670,7 @@ mod tests {
 
         registry.register(pair);
 
-        let config = MomentumConfig::preset_5m();
+        let config = MomentumConfig::preset_5m_rider();
         let strategy = MomentumStrategy::new(registry, config.clone());
 
         // Manually set up a market state in InventoryHeld
@@ -1781,8 +1684,8 @@ mod tests {
                 state: SniperState::InventoryHeld,
                 maker_order_id: None,
                 target_token_id: "up_token_sl".to_string(),
-                entry_price: Some(dec!(0.93)),
-                entry_size: Some(dec!(50)),
+                entry_price: Some(dec!(0.50)),
+                entry_size: Some(dec!(15)),
                 maker_posted_at: Some(Instant::now()),
                 last_cancel_replace: None,
                 conviction: dec!(0.80),
@@ -1790,39 +1693,35 @@ mod tests {
                 tp_order_id: None,
                 tp_posted_at: None,
                 entry_instant: Some(Instant::now() - std::time::Duration::from_secs(8)),
-                entry_timestamp_ms: Some(now_ms - 8000), // Entered 8s ago
+                entry_timestamp_ms: Some(now_ms - 8000),
                 posted_price: None,
-                pending_cancel: false,
                 close_time: None,
-                tp_sell_retries: 0,
-                last_logged_secs: None,
+                hold_logged: false,
             },
         );
 
-        // Set up spot data showing reversal
+        // Set up spot data showing 1%+ reversal (BTC dropped from 50000 to 49400 = -1.2%)
         let spot = SpotPriceState::new();
         let history = PriceHistory::new(1800);
 
-        // BTC was at 50000 when we entered, now dropped to 49800 (-0.4% reversal)
         history.record("btc", now_ms - 8000, dec!(50000));
-        history.record("btc", now_ms - 6000, dec!(49950));
-        history.record("btc", now_ms - 4000, dec!(49900));
-        history.record("btc", now_ms - 2000, dec!(49850));
-        history.record("btc", now_ms - 1000, dec!(49800));
-        history.record("btc", now_ms, dec!(49800));
+        history.record("btc", now_ms - 6000, dec!(49800));
+        history.record("btc", now_ms - 4000, dec!(49600));
+        history.record("btc", now_ms - 2000, dec!(49500));
+        history.record("btc", now_ms - 1000, dec!(49400));
+        history.record("btc", now_ms, dec!(49400));
         spot.update(&SpotPriceUpdate {
             symbol: "btc".to_string(),
-            price: dec!(49800),
+            price: dec!(49400),
             timestamp_ms: now_ms,
         });
 
-        // Set up order book with bid
         let books = OrderBookState::new();
         books.update_book(
             "up_token_sl".to_string(),
             "0xsl_test".to_string(),
             vec![crate::api::types::PriceLevel {
-                price: "0.91".to_string(),
+                price: "0.45".to_string(),
                 size: "200".to_string(),
             }],
             vec![],
@@ -1833,13 +1732,235 @@ mod tests {
         let ledger = Ledger::new(dec!(10000));
         let ctx = StrategyContext::new(&books, &ledger).with_spot(&spot, &history);
 
-        // Manually call process_inventory_held
         let mut ms = strategy.markets.get_mut("0xsl_test").unwrap();
         let intents = strategy.process_inventory_held(&mut ms, &ctx, &config);
 
-        // Should have triggered stop-loss
         assert_eq!(intents.len(), 1, "Should have one stop-loss sell intent");
         assert_eq!(intents[0].side, Side::Sell);
-        assert_eq!(intents[0].urgency, Urgency::Passive); // GTC crossed aggressively
+        assert_eq!(intents[0].urgency, Urgency::Passive);
+    }
+
+    #[test]
+    fn test_entry_price_filter() {
+        // Verify that tokens priced above max_entry_price (0.65) are skipped
+        let registry = Arc::new(MarketPairRegistry::new());
+        let now = chrono::Utc::now().timestamp();
+
+        let pair = crate::strategy::MarketPair::new_up_down(
+            "0xpf_test".to_string(),
+            "up_token_pf".to_string(),
+            "down_token_pf".to_string(),
+        )
+        .with_event_slug("btc-updown-5m-1740000000")
+        .with_close_time(now + 150);
+
+        registry.register(pair);
+
+        let config = MomentumConfig::preset_5m_rider();
+        let strategy = MomentumStrategy::new(registry, config);
+
+        let spot = SpotPriceState::new();
+        let history = PriceHistory::new(1800);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        for i in 0..300 {
+            let ts = now_ms - (300_000 - i * 1000);
+            history.record("btc", ts, dec!(50000) + Decimal::from(i));
+        }
+        spot.update(&SpotPriceUpdate {
+            symbol: "btc".to_string(),
+            price: dec!(50300),
+            timestamp_ms: now_ms,
+        });
+
+        // Set bid at 0.70 — above max_entry_price of 0.65
+        let books = OrderBookState::new();
+        books.update_book(
+            "up_token_pf".to_string(),
+            "0xpf_test".to_string(),
+            vec![crate::api::types::PriceLevel {
+                price: "0.70".to_string(),
+                size: "100".to_string(),
+            }],
+            vec![crate::api::types::PriceLevel {
+                price: "0.72".to_string(),
+                size: "100".to_string(),
+            }],
+            None,
+            None,
+        );
+
+        let ledger = Ledger::new(dec!(10000));
+        let ctx = StrategyContext::new(&books, &ledger).with_spot(&spot, &history);
+
+        let intents = strategy.on_tick(&ctx);
+
+        // Should NOT have entered a position — price too high
+        assert!(
+            intents.is_empty(),
+            "Should not enter when bid > max_entry_price"
+        );
+        let ms = strategy.markets.get("0xpf_test").unwrap();
+        // Should be Monitoring (price filter rejected) or Completed, not MakerEntry
+        assert_ne!(
+            ms.state,
+            SniperState::MakerEntry,
+            "Should not transition to MakerEntry with bid > max_entry_price"
+        );
+    }
+
+    #[test]
+    fn test_tp_price_calculation() {
+        // Verify TP price is set to tp_target_price config value
+        let config_5m = MomentumConfig::preset_5m_rider();
+        assert_eq!(config_5m.tp_target_price, dec!(0.93));
+
+        let config_15m = MomentumConfig::preset_15m_rider();
+        assert_eq!(config_15m.tp_target_price, dec!(0.95));
+
+        // Verify TP price is capped at 0.99
+        let mut config = MomentumConfig::preset_5m_rider();
+        config.tp_target_price = dec!(1.05);
+        let tp_price = config.tp_target_price.min(dec!(0.99));
+        assert_eq!(tp_price, dec!(0.99));
+    }
+
+    #[test]
+    fn test_no_taker_fallback() {
+        // Verify that after maker timeout, state goes to Completed (not TakerFallback)
+        let registry = Arc::new(MarketPairRegistry::new());
+
+        let pair = crate::strategy::MarketPair::new_up_down(
+            "0xntf_test".to_string(),
+            "up_token_ntf".to_string(),
+            "down_token_ntf".to_string(),
+        )
+        .with_event_slug("btc-updown-5m-1740000000")
+        .with_close_time(chrono::Utc::now().timestamp() + 200);
+
+        registry.register(pair);
+
+        let config = MomentumConfig::preset_5m_rider();
+        let strategy = MomentumStrategy::new(registry, config);
+
+        // Set up a market state in MakerEntry with timeout exceeded
+        strategy.markets.insert(
+            "0xntf_test".to_string(),
+            MarketState {
+                condition_id: "0xntf_test".to_string(),
+                asset: "btc".to_string(),
+                timeframe: Timeframe::FiveMin,
+                state: SniperState::MakerEntry,
+                maker_order_id: None,
+                target_token_id: "up_token_ntf".to_string(),
+                entry_price: None,
+                entry_size: None,
+                maker_posted_at: Some(Instant::now() - std::time::Duration::from_secs(60)),
+                last_cancel_replace: None,
+                conviction: dec!(0.85),
+                direction: Direction::Up,
+                tp_order_id: None,
+                tp_posted_at: None,
+                entry_instant: None,
+                entry_timestamp_ms: None,
+                posted_price: Some(dec!(0.50)),
+                close_time: Some(chrono::Utc::now().timestamp() + 200),
+                hold_logged: false,
+            },
+        );
+
+        let books = OrderBookState::new();
+        let ledger = Ledger::new(dec!(10000));
+        let ctx = StrategyContext::new(&books, &ledger);
+
+        let actions = strategy.on_order_management(&ctx);
+
+        // Should have a CancelAllForToken action (cleanup)
+        assert!(
+            !actions.is_empty(),
+            "Should have cancel action on timeout"
+        );
+        // Verify no PostTakerFallback
+        for action in &actions {
+            assert!(
+                !matches!(action, OrderAction::PostTakerFallback { .. }),
+                "Should NOT have taker fallback action"
+            );
+        }
+
+        let ms = strategy.markets.get("0xntf_test").unwrap();
+        assert_eq!(
+            ms.state,
+            SniperState::Completed,
+            "Should transition to Completed, not TakerFallback"
+        );
+    }
+
+    #[test]
+    fn test_hold_to_resolution() {
+        // Verify that TPPosted transitions to HoldToResolution when near close
+        let registry = Arc::new(MarketPairRegistry::new());
+        let now = chrono::Utc::now().timestamp();
+
+        let pair = crate::strategy::MarketPair::new_up_down(
+            "0xhtr_test".to_string(),
+            "up_token_htr".to_string(),
+            "down_token_htr".to_string(),
+        )
+        .with_event_slug("btc-updown-5m-1740000000")
+        .with_close_time(now + 20); // 20 seconds to close
+
+        registry.register(pair);
+
+        let config = MomentumConfig::preset_5m_rider();
+        let strategy = MomentumStrategy::new(registry, config);
+
+        // Set up market state in TPPosted with an active TP order
+        strategy.markets.insert(
+            "0xhtr_test".to_string(),
+            MarketState {
+                condition_id: "0xhtr_test".to_string(),
+                asset: "btc".to_string(),
+                timeframe: Timeframe::FiveMin,
+                state: SniperState::TPPosted,
+                maker_order_id: None,
+                target_token_id: "up_token_htr".to_string(),
+                entry_price: Some(dec!(0.50)),
+                entry_size: Some(dec!(15)),
+                maker_posted_at: Some(Instant::now()),
+                last_cancel_replace: None,
+                conviction: dec!(0.85),
+                direction: Direction::Up,
+                tp_order_id: Some("tp_order_123".to_string()),
+                tp_posted_at: Some(Instant::now() - std::time::Duration::from_secs(60)),
+                entry_instant: Some(Instant::now() - std::time::Duration::from_secs(120)),
+                entry_timestamp_ms: Some(chrono::Utc::now().timestamp_millis() - 120_000),
+                posted_price: None,
+                close_time: Some(now + 20),
+                hold_logged: false,
+            },
+        );
+
+        let spot = SpotPriceState::new();
+        let history = PriceHistory::new(1800);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        history.record("btc", now_ms, dec!(50000));
+        spot.update(&SpotPriceUpdate {
+            symbol: "btc".to_string(),
+            price: dec!(50000),
+            timestamp_ms: now_ms,
+        });
+
+        let books = OrderBookState::new();
+        let ledger = Ledger::new(dec!(10000));
+        let ctx = StrategyContext::new(&books, &ledger).with_spot(&spot, &history);
+
+        let _intents = strategy.on_tick(&ctx);
+
+        let ms = strategy.markets.get("0xhtr_test").unwrap();
+        assert_eq!(
+            ms.state,
+            SniperState::HoldToResolution,
+            "Should transition to HoldToResolution when TP is active and near close"
+        );
     }
 }

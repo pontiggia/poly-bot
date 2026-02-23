@@ -115,14 +115,14 @@ impl Bot {
         // Set up strategy router
         let strategy_router = Arc::new(StrategyRouter::new());
 
-        // Register MomentumSniper strategy (5m + 15m markets)
+        // Register ConvictionRider strategy (5m + 15m markets)
         let momentum_config = crate::strategy::MomentumConfig::default_live_test();
         info!(
-            "Registering MomentumSniper: conviction>={}, min_entry={}, tp_spread={}, book_sl={}, max_exposure=${}",
+            "Registering ConvictionRider: conviction>={}, entry_range=[{}, {}], tp_target={}, max_exposure=${}",
             momentum_config.min_conviction,
             momentum_config.min_entry_price,
-            momentum_config.tp_spread,
-            momentum_config.book_stop_loss_spread,
+            momentum_config.max_entry_price,
+            momentum_config.tp_target_price,
             momentum_config.max_total_exposure,
         );
         let momentum = Arc::new(crate::strategy::MomentumStrategy::new(
