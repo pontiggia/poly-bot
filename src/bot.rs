@@ -311,16 +311,15 @@ impl Bot {
 
         loop {
             tokio::select! {
-                // Biased: check kill first, then user fills, then timers, then market data last
+                // Bias toward market data - process first if multiple ready
                 biased;
 
-                // Kill signal - HIGHEST PRIORITY, checked first
-                _ = self.kill_switch.wait_for_kill() => {
-                    warn!("Kill signal received - shutting down");
-                    break;
+                // Market WebSocket messages - highest priority, zero latency
+                Some(msg) = self.market_ws_rx.recv() => {
+                    self.handle_market_message(msg).await;
                 }
 
-                // User WebSocket messages - fill notifications (high priority)
+                // User WebSocket messages - fill notifications
                 Some(msg) = self.user_ws_rx.recv() => {
                     self.handle_user_message(msg).await;
                 }
@@ -335,9 +334,9 @@ impl Bot {
                     self.handle_order_management().await;
                 }
 
-                // Heartbeat - 10s periodic logging
-                _ = heartbeat_interval.tick() => {
-                    self.log_heartbeat();
+                // Stale order cleanup - 30s periodic
+                _ = stale_cleanup_interval.tick() => {
+                    self.cleanup_stale_orders().await;
                 }
 
                 // Balance reconciliation - 60s periodic
@@ -345,25 +344,15 @@ impl Bot {
                     self.reconcile_balance().await;
                 }
 
-                // Stale order cleanup - 30s periodic
-                _ = stale_cleanup_interval.tick() => {
-                    self.cleanup_stale_orders().await;
+                // Heartbeat - 10s periodic logging
+                _ = heartbeat_interval.tick() => {
+                    self.log_heartbeat();
                 }
 
-                // Market WebSocket messages - drain in batches to avoid starving other branches
-                Some(msg) = self.market_ws_rx.recv() => {
-                    self.handle_market_message(msg).await;
-                    // Drain up to 50 more pending messages in this iteration
-                    let mut drained = 0;
-                    while drained < 50 {
-                        match self.market_ws_rx.try_recv() {
-                            Ok(msg) => {
-                                self.handle_market_message(msg).await;
-                                drained += 1;
-                            }
-                            Err(_) => break,
-                        }
-                    }
+                // Kill signal - graceful shutdown
+                _ = self.kill_switch.wait_for_kill() => {
+                    warn!("Kill signal received - shutting down");
+                    break;
                 }
             }
         }

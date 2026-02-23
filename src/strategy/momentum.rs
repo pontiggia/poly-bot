@@ -596,6 +596,7 @@ impl MomentumStrategy {
         elapsed: i64,
         ctx: &StrategyContext,
         tf_config: &MomentumConfig,
+        active_count: usize,
     ) -> Vec<OrderIntent> {
         // Compute conviction
         let (conviction, direction) = ConvictionEngine::compute(ctx, &ms.asset, tf_config);
@@ -607,8 +608,6 @@ impl MomentumStrategy {
             Direction::Down => "DOWN",
             Direction::Neutral => "NEUTRAL",
         };
-
-        let active_count = self.active_position_count();
 
         debug!(
             "ConvictionRider: {} {} conv={:.3} {} ({}s elapsed, {}s to close) — {} active positions",
@@ -927,6 +926,10 @@ impl Strategy for MomentumStrategy {
         let now_unix = ctx.utc_now.timestamp();
         let mut intents = Vec::new();
 
+        // Pre-compute active position count BEFORE entering the DashMap loop
+        // to avoid deadlock (iter() inside entry() lock = deadlock)
+        let active_count = self.active_position_count();
+
         let pairs = self.registry.filter(|pair| {
             Self::is_momentum_eligible(&pair.event_slug) && pair.close_time.is_some()
         });
@@ -994,7 +997,7 @@ impl Strategy for MomentumStrategy {
                 }
                 SniperState::Monitoring => {
                     let new_intents =
-                        self.process_monitoring(&mut ms, secs_until_close, elapsed, ctx, &tf_config);
+                        self.process_monitoring(&mut ms, secs_until_close, elapsed, ctx, &tf_config, active_count);
                     intents.extend(new_intents);
                 }
                 SniperState::InventoryHeld => {
