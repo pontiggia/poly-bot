@@ -896,6 +896,7 @@ impl Bot {
                     created_at: std::time::Instant::now(),
                     strategy_name: intent.strategy_name.clone(),
                     group_id: intent.group_id.clone(),
+                    completed_at: None,
                 };
                 order_tracker.track(tracked);
                 debug!(
@@ -1019,8 +1020,14 @@ impl Bot {
         }
     }
 
-    /// Cancel stale orders that have been pending too long
+    /// Cancel stale orders that have been pending too long + purge completed order ghosts
     async fn cleanup_stale_orders(&self) {
+        // Purge completed orders that have been retained for late-fill matching (60s retention)
+        let purged = self.order_tracker.cleanup_completed(std::time::Duration::from_secs(60));
+        if purged > 0 {
+            debug!("Purged {} completed order(s) from tracker", purged);
+        }
+
         let stale = self.order_tracker.stale_orders(std::time::Duration::from_secs(60));
         if stale.is_empty() {
             return;

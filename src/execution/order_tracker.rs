@@ -51,6 +51,11 @@ pub struct TrackedOrder {
 
     /// Group ID for linked orders (e.g., arb legs)
     pub group_id: Option<String>,
+
+    /// When the order was fully filled (None if still active).
+    /// We keep completed orders around so late WS fill notifications
+    /// can still match back to the tracked order instead of being silently dropped.
+    pub completed_at: Option<Instant>,
 }
 
 impl TrackedOrder {
@@ -115,8 +120,16 @@ impl OrderTracker {
         }
     }
 
-    /// Number of active orders
+    /// Number of active (non-completed) orders
     pub fn active_count(&self) -> usize {
+        self.orders
+            .iter()
+            .filter(|e| e.completed_at.is_none())
+            .count()
+    }
+
+    /// Total orders in tracker (including completed awaiting cleanup)
+    pub fn total_in_tracker(&self) -> usize {
         self.orders.len()
     }
 
@@ -176,7 +189,10 @@ impl OrderTracker {
 
     /// Update an order with a fill
     ///
-    /// Returns the updated remaining size, or None if order not found
+    /// Returns the updated remaining size, or None if order not found.
+    /// When fully filled, marks the order as completed but does NOT remove it
+    /// immediately — we keep it around so late WS fill notifications can still
+    /// match back to this order. Call `cleanup_completed()` periodically to purge.
     pub fn on_fill(&self, order_id: &OrderId, fill_size: Decimal) -> Option<Decimal> {
         let mut order = self.orders.get_mut(order_id)?;
         order.filled_size += fill_size;
@@ -191,13 +207,42 @@ impl OrderTracker {
             "Order fill update"
         );
 
-        // If fully filled, remove from tracking
-        if order.is_filled() {
-            drop(order); // Release lock before removing
-            self.remove(order_id);
+        // If fully filled, mark as completed but keep in map for late-fill matching
+        if order.is_filled() && order.completed_at.is_none() {
+            order.completed_at = Some(Instant::now());
+            debug!(order_id = %order_id, "Order marked completed (kept for late-fill matching)");
         }
 
         Some(remaining)
+    }
+
+    /// Remove completed (fully-filled) orders that have been sitting for longer
+    /// than `retention`. This prevents the tracker from growing unbounded while
+    /// still allowing late WS fill notifications to match for a grace period.
+    ///
+    /// Returns the number of orders purged.
+    pub fn cleanup_completed(&self, retention: Duration) -> usize {
+        let to_purge: Vec<OrderId> = self
+            .orders
+            .iter()
+            .filter_map(|entry| {
+                if let Some(completed_at) = entry.completed_at {
+                    if completed_at.elapsed() > retention {
+                        return Some(entry.order_id.clone());
+                    }
+                }
+                None
+            })
+            .collect();
+
+        let count = to_purge.len();
+        for order_id in &to_purge {
+            self.remove(order_id);
+        }
+        if count > 0 {
+            debug!(purged = count, "Cleaned up completed orders from tracker");
+        }
+        count
     }
 
     /// Remove an order from tracking
@@ -226,12 +271,12 @@ impl OrderTracker {
         }
     }
 
-    /// Check if we have an order at a specific price for a token
+    /// Check if we have an active (non-completed) order at a specific price for a token
     pub fn has_order_at(&self, token_id: &TokenId, side: Side, price: Decimal) -> bool {
         if let Some(order_ids) = self.by_token.get(token_id) {
             for order_id in order_ids.iter() {
                 if let Some(order) = self.orders.get(order_id) {
-                    if order.side == side && order.price == price {
+                    if order.completed_at.is_none() && order.side == side && order.price == price {
                         return true;
                     }
                 }
@@ -240,12 +285,12 @@ impl OrderTracker {
         false
     }
 
-    /// Check if we have any order for a token on a specific side
+    /// Check if we have any active (non-completed) order for a token on a specific side
     pub fn has_order_for(&self, token_id: &TokenId, side: Side) -> bool {
         if let Some(order_ids) = self.by_token.get(token_id) {
             for order_id in order_ids.iter() {
                 if let Some(order) = self.orders.get(order_id) {
-                    if order.side == side {
+                    if order.completed_at.is_none() && order.side == side {
                         return true;
                     }
                 }
@@ -278,11 +323,11 @@ impl OrderTracker {
             .unwrap_or_default()
     }
 
-    /// Get all stale orders (older than max_age)
+    /// Get all stale active orders (older than max_age, not already completed)
     pub fn stale_orders(&self, max_age: Duration) -> Vec<OrderId> {
         self.orders
             .iter()
-            .filter(|entry| entry.is_stale(max_age))
+            .filter(|entry| entry.completed_at.is_none() && entry.is_stale(max_age))
             .map(|entry| entry.order_id.clone())
             .collect()
     }
@@ -299,8 +344,12 @@ impl OrderTracker {
 
     /// Log current state
     pub fn log_status(&self) {
+        let total_in_tracker = self.total_in_tracker();
+        let active = self.active_count();
+        let completed_pending = total_in_tracker - active;
         info!(
-            active = self.active_count(),
+            active = active,
+            completed_pending = completed_pending,
             total_tracked = self.total_tracked(),
             total_completed = self.total_completed(),
             "OrderTracker status"
@@ -335,6 +384,7 @@ mod tests {
             created_at: Instant::now(),
             strategy_name: "TestStrategy".to_string(),
             group_id: None,
+            completed_at: None,
         }
     }
 
@@ -386,7 +436,16 @@ mod tests {
         let remaining = tracker.on_fill(&"order-1".to_string(), dec!(100));
 
         assert_eq!(remaining, Some(Decimal::ZERO));
-        assert_eq!(tracker.active_count(), 0); // Removed when fully filled
+        assert_eq!(tracker.active_count(), 0); // Not active (completed)
+        // But still accessible for late-fill matching
+        assert!(tracker.get(&"order-1".to_string()).is_some());
+        assert!(tracker.get(&"order-1".to_string()).unwrap().completed_at.is_some());
+        assert_eq!(tracker.total_in_tracker(), 1); // Still in tracker
+
+        // Cleanup with 0 retention removes it
+        let purged = tracker.cleanup_completed(Duration::ZERO);
+        assert_eq!(purged, 1);
+        assert!(tracker.get(&"order-1".to_string()).is_none());
         assert_eq!(tracker.total_completed(), 1);
     }
 
@@ -418,6 +477,7 @@ mod tests {
             created_at: Instant::now(),
             strategy_name: "Test".to_string(),
             group_id: None,
+            completed_at: None,
         };
 
         let order2 = TrackedOrder {
@@ -477,6 +537,7 @@ mod tests {
             created_at: Instant::now(),
             strategy_name: "Test".to_string(),
             group_id: Some("arb-001".to_string()),
+            completed_at: None,
         };
 
         let order2 = TrackedOrder {
