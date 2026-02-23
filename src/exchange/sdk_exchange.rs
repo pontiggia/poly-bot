@@ -718,9 +718,10 @@ impl Exchange for SdkExchange {
         self.healthy.load(Ordering::Relaxed)
     }
 
-    async fn refresh_balance_cache(&self) -> ExchangeResult<()> {
+    async fn refresh_balance_cache(&self, token_id: &str) -> ExchangeResult<()> {
         let request = UpdateBalanceAllowanceRequest::builder()
             .asset_type(AssetType::Conditional)
+            .token_id(parse_token_u256(token_id))
             .build();
 
         self.client
@@ -728,13 +729,14 @@ impl Exchange for SdkExchange {
             .await
             .map_err(|e| ExchangeError::Network(format!("Failed to refresh balance cache: {}", e)))?;
 
-        debug!("CLOB balance cache refreshed (conditional tokens)");
+        debug!("CLOB balance cache refreshed (conditional token {}...)", &token_id[..token_id.len().min(12)]);
         Ok(())
     }
 
-    async fn get_conditional_balance(&self) -> ExchangeResult<Option<Decimal>> {
+    async fn get_conditional_balance(&self, token_id: &str) -> ExchangeResult<Option<Decimal>> {
         let request = BalanceAllowanceRequest::builder()
             .asset_type(AssetType::Conditional)
+            .token_id(parse_token_u256(token_id))
             .build();
 
         let response = self

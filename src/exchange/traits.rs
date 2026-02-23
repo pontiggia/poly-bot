@@ -226,7 +226,7 @@ pub trait Exchange: Send + Sync {
     fn is_healthy(&self) -> bool;
 
     /// Force the CLOB backend to refresh its cached view of our on-chain
-    /// token balances and allowances.
+    /// token balances and allowances for a specific conditional token.
     ///
     /// IMPORTANT: This triggers an on-chain RPC read (100-500ms). Must be
     /// called AFTER settlement is confirmed (≥7s post-fill), NOT at MATCHED time.
@@ -234,7 +234,9 @@ pub trait Exchange: Send + Sync {
     ///
     /// Must be AWAITED — fire-and-forget means the cache may not be updated
     /// before the subsequent sell order.
-    async fn refresh_balance_cache(&self) -> ExchangeResult<()> {
+    ///
+    /// `token_id` is the CLOB token ID (long numeric string) for the conditional token.
+    async fn refresh_balance_cache(&self, _token_id: &str) -> ExchangeResult<()> {
         Ok(())
     }
 
@@ -247,7 +249,9 @@ pub trait Exchange: Send + Sync {
     /// This is essential for handling fractional slippage (Issue #245):
     /// the API may report `size_matched=5.0` but actual tokens deposited
     /// may be 4.954 due to fee/rounding. Use this exact balance for SELL size.
-    async fn get_conditional_balance(&self) -> ExchangeResult<Option<Decimal>> {
+    ///
+    /// `token_id` is the CLOB token ID (long numeric string) for the conditional token.
+    async fn get_conditional_balance(&self, _token_id: &str) -> ExchangeResult<Option<Decimal>> {
         Ok(None) // Not all implementations support this
     }
 

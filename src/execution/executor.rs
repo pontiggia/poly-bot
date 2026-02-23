@@ -155,7 +155,7 @@ impl OrderExecutor {
         // This is safe because the 7-second settlement cooldown in momentum.rs
         // ensures tokens are on-chain by the time we reach here.
         let sell_size_override = if intent.side == Side::Sell {
-            match self.sync_balance_for_sell().await {
+            match self.sync_balance_for_sell(&params.token_id).await {
                 Ok(Some(actual_balance)) => {
                     if actual_balance < params.size {
                         warn!(
@@ -294,16 +294,16 @@ impl OrderExecutor {
     /// This MUST be called only after settlement is complete (≥7s post-buy fill).
     /// The method is synchronous (awaited) to guarantee the cache is updated
     /// before the sell order is submitted.
-    async fn sync_balance_for_sell(&self) -> Result<Option<Decimal>, ExchangeError> {
+    async fn sync_balance_for_sell(&self, token_id: &str) -> Result<Option<Decimal>, ExchangeError> {
         // Step 1: Force CLOB to refresh its cached view from on-chain state.
         // This triggers an RPC read to Polygon (100-500ms).
         info!("Pre-sell: refreshing CLOB balance cache (on-chain RPC read)...");
-        self.exchange.refresh_balance_cache().await?;
+        self.exchange.refresh_balance_cache(token_id).await?;
 
         // Step 2: Query the now-refreshed cache for exact balance.
         // This handles fractional slippage (Issue #245): actual tokens may
         // differ from size_matched due to fee rounding in CTFExchange.sol.
-        let balance = self.exchange.get_conditional_balance().await?;
+        let balance = self.exchange.get_conditional_balance(token_id).await?;
         if let Some(bal) = balance {
             info!("Pre-sell: CLOB reports conditional token balance = {}", bal);
         }

@@ -292,9 +292,13 @@ pub struct MomentumConfig {
     /// Cancel/replace loop interval (ms)
     pub cancel_replace_interval_ms: u64,
 
-    // === Take Profit ===
-    /// Fixed TP target price (e.g., 0.95)
-    pub tp_target_price: Decimal,
+    // === Take Profit (Dynamic) ===
+    /// Minimum profit per share to target (e.g., 0.15 = 15 cents)
+    pub tp_min_profit: Decimal,
+    /// Floor: never post TP below this price (e.g., 0.70)
+    pub tp_floor_price: Decimal,
+    /// Ceiling: never post TP above this price (e.g., 0.95)
+    pub tp_ceiling_price: Decimal,
 
     // === Stop Loss ===
     /// Massive Binance reversal threshold (e.g., -0.010 = 1.0%)
@@ -330,8 +334,10 @@ impl MomentumConfig {
             maker_entry_timeout_secs: 60,
             cancel_replace_interval_ms: 200,
 
-            // Take profit
-            tp_target_price: dec!(0.95),
+            // Take profit (dynamic: entry + min_profit, clamped to floor/ceiling)
+            tp_min_profit: dec!(0.15),
+            tp_floor_price: dec!(0.70),
+            tp_ceiling_price: dec!(0.95),
 
             // Stop loss — ONLY on massive Binance reversal
             stop_loss_reversal_pct: dec!(-0.010),
@@ -371,8 +377,10 @@ impl MomentumConfig {
             maker_entry_timeout_secs: 30,
             cancel_replace_interval_ms: 200,
 
-            // Take profit
-            tp_target_price: dec!(0.93),
+            // Take profit (dynamic: entry + min_profit, clamped to floor/ceiling)
+            tp_min_profit: dec!(0.12),
+            tp_floor_price: dec!(0.65),
+            tp_ceiling_price: dec!(0.93),
 
             // Stop loss
             stop_loss_reversal_pct: dec!(-0.008),
@@ -416,7 +424,17 @@ impl MomentumConfig {
         }
         if let Ok(v) = std::env::var("RIDER_TP_TARGET") {
             if let Ok(d) = v.parse::<Decimal>() {
-                config.tp_target_price = d;
+                config.tp_ceiling_price = d;
+            }
+        }
+        if let Ok(v) = std::env::var("RIDER_TP_MIN_PROFIT") {
+            if let Ok(d) = v.parse::<Decimal>() {
+                config.tp_min_profit = d;
+            }
+        }
+        if let Ok(v) = std::env::var("RIDER_TP_FLOOR") {
+            if let Ok(d) = v.parse::<Decimal>() {
+                config.tp_floor_price = d;
             }
         }
         if let Ok(v) = std::env::var("RIDER_STOP_LOSS_PCT") {
@@ -531,7 +549,9 @@ impl MomentumStrategy {
                 c.lookback_windows_ms = preset.lookback_windows_ms;
                 c.lookback_weights = preset.lookback_weights;
                 c.maker_entry_timeout_secs = preset.maker_entry_timeout_secs;
-                c.tp_target_price = preset.tp_target_price;
+                c.tp_min_profit = preset.tp_min_profit;
+                c.tp_floor_price = preset.tp_floor_price;
+                c.tp_ceiling_price = preset.tp_ceiling_price;
                 c.stop_loss_reversal_pct = preset.stop_loss_reversal_pct;
                 c
             }
@@ -831,13 +851,19 @@ impl MomentumStrategy {
                         .best_bid(&ms.target_token_id)
                         .unwrap_or(dec!(0.50));
 
+                    // Truncate to 2dp — Polymarket max lot size is 2 decimal places
+                    let sell_size = entry_size.round_dp_with_strategy(
+                        2,
+                        rust_decimal::RoundingStrategy::ToZero,
+                    );
+
                     warn!(
                         "STOP-LOSS: {} {} Binance reversal {:.4}% (threshold={:.3}%) -> MAKER SELL {} @ {}",
                         ms.asset,
                         ms.timeframe.label(),
                         reversal * dec!(100),
                         tf_config.stop_loss_reversal_pct * dec!(100),
-                        entry_size,
+                        sell_size,
                         sell_price,
                     );
 
@@ -848,7 +874,7 @@ impl MomentumStrategy {
                         ms.target_token_id.clone(),
                         Side::Sell,
                         sell_price,
-                        entry_size,
+                        sell_size,
                         Urgency::Passive, // GTC maker — zero fees
                         format!("stop-loss {} {}", ms.asset, ms.timeframe.label()),
                         "ConvictionRider",
@@ -859,17 +885,31 @@ impl MomentumStrategy {
             }
         }
 
-        // === TAKE-PROFIT: Post GTC SELL at tp_target_price ===
-        let tp_price = tf_config.tp_target_price.min(dec!(0.99));
+        // === TAKE-PROFIT: Dynamic TP based on entry price ===
+        // tp_price = max(entry + min_profit, floor), capped at ceiling
+        let raw_tp = entry_price + tf_config.tp_min_profit;
+        let tp_price = raw_tp
+            .max(tf_config.tp_floor_price)
+            .min(tf_config.tp_ceiling_price)
+            .min(dec!(0.99));
+
+        // Truncate to 2dp — Polymarket max lot size is 2 decimal places
+        let sell_size = entry_size.round_dp_with_strategy(
+            2,
+            rust_decimal::RoundingStrategy::ToZero,
+        );
 
         info!(
-            "TAKE-PROFIT: {} {} entry={} -> MAKER SELL {} @ {} (target={})",
+            "TAKE-PROFIT: {} {} entry={} -> MAKER SELL {} @ {} (entry+{}={}, floor={}, ceiling={})",
             ms.asset,
             ms.timeframe.label(),
             entry_price,
-            entry_size,
+            sell_size,
             tp_price,
-            tf_config.tp_target_price,
+            tf_config.tp_min_profit,
+            raw_tp,
+            tf_config.tp_floor_price,
+            tf_config.tp_ceiling_price,
         );
 
         ms.state = SniperState::TPPosted;
@@ -880,7 +920,7 @@ impl MomentumStrategy {
             ms.target_token_id.clone(),
             Side::Sell,
             tp_price,
-            entry_size,
+            sell_size,
             Urgency::Passive, // GTC maker sell — zero fees
             format!("take-profit {} {}", ms.asset, ms.timeframe.label()),
             "ConvictionRider",
@@ -1010,6 +1050,19 @@ impl Strategy for MomentumStrategy {
                         .tp_posted_at
                         .map(|t| t.elapsed().as_millis())
                         .unwrap_or(0);
+
+                    // Discover tp_order_id from order_tracker if not yet set.
+                    // The executor stores the order_id in the tracker after submission,
+                    // but there's no direct callback to the strategy — so we poll it here.
+                    if ms.tp_order_id.is_none() {
+                        if let Some(order_id) = ctx.first_order_for_token(&ms.target_token_id) {
+                            debug!(
+                                "ConvictionRider: {} {} discovered TP order_id {} from tracker",
+                                ms.asset, ms.timeframe.label(), &order_id[..order_id.len().min(16)],
+                            );
+                            ms.tp_order_id = Some(order_id);
+                        }
+                    }
 
                     // If tp_order_id is set, the order is on the book — check for HoldToResolution transition
                     if ms.tp_order_id.is_some() {
@@ -1813,18 +1866,43 @@ mod tests {
 
     #[test]
     fn test_tp_price_calculation() {
-        // Verify TP price is set to tp_target_price config value
+        // Verify dynamic TP config values
         let config_5m = MomentumConfig::preset_5m_rider();
-        assert_eq!(config_5m.tp_target_price, dec!(0.93));
+        assert_eq!(config_5m.tp_min_profit, dec!(0.12));
+        assert_eq!(config_5m.tp_floor_price, dec!(0.65));
+        assert_eq!(config_5m.tp_ceiling_price, dec!(0.93));
 
         let config_15m = MomentumConfig::preset_15m_rider();
-        assert_eq!(config_15m.tp_target_price, dec!(0.95));
+        assert_eq!(config_15m.tp_min_profit, dec!(0.15));
+        assert_eq!(config_15m.tp_floor_price, dec!(0.70));
+        assert_eq!(config_15m.tp_ceiling_price, dec!(0.95));
 
-        // Verify TP price is capped at 0.99
-        let mut config = MomentumConfig::preset_5m_rider();
-        config.tp_target_price = dec!(1.05);
-        let tp_price = config.tp_target_price.min(dec!(0.99));
-        assert_eq!(tp_price, dec!(0.99));
+        // Verify dynamic TP calculation: entry + min_profit, clamped to floor/ceiling
+        let config = MomentumConfig::preset_15m_rider();
+
+        // Entry 0.57 -> raw 0.72, floor 0.70, ceiling 0.95 -> 0.72
+        let entry = dec!(0.57);
+        let raw = entry + config.tp_min_profit;
+        let tp = raw.max(config.tp_floor_price).min(config.tp_ceiling_price).min(dec!(0.99));
+        assert_eq!(tp, dec!(0.72));
+
+        // Entry 0.40 -> raw 0.55, floor 0.70 -> 0.70 (floor kicks in)
+        let entry = dec!(0.40);
+        let raw = entry + config.tp_min_profit;
+        let tp = raw.max(config.tp_floor_price).min(config.tp_ceiling_price).min(dec!(0.99));
+        assert_eq!(tp, dec!(0.70));
+
+        // Entry 0.65 -> raw 0.80, floor 0.70, ceiling 0.95 -> 0.80
+        let entry = dec!(0.65);
+        let raw = entry + config.tp_min_profit;
+        let tp = raw.max(config.tp_floor_price).min(config.tp_ceiling_price).min(dec!(0.99));
+        assert_eq!(tp, dec!(0.80));
+
+        // Ceiling cap: entry 0.85 -> raw 1.00 -> capped at 0.95
+        let entry = dec!(0.85);
+        let raw = entry + config.tp_min_profit;
+        let tp = raw.max(config.tp_floor_price).min(config.tp_ceiling_price).min(dec!(0.99));
+        assert_eq!(tp, dec!(0.95));
     }
 
     #[test]

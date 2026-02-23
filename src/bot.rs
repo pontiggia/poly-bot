@@ -118,11 +118,13 @@ impl Bot {
         // Register ConvictionRider strategy (5m + 15m markets)
         let momentum_config = crate::strategy::MomentumConfig::default_live_test();
         info!(
-            "Registering ConvictionRider: conviction>={}, entry_range=[{}, {}], tp_target={}, max_exposure=${}",
+            "Registering ConvictionRider: conviction>={}, entry_range=[{}, {}], tp=entry+{} (floor={}, ceiling={}), max_exposure=${}",
             momentum_config.min_conviction,
             momentum_config.min_entry_price,
             momentum_config.max_entry_price,
-            momentum_config.tp_target_price,
+            momentum_config.tp_min_profit,
+            momentum_config.tp_floor_price,
+            momentum_config.tp_ceiling_price,
             momentum_config.max_total_exposure,
         );
         let momentum = Arc::new(crate::strategy::MomentumStrategy::new(
@@ -601,6 +603,7 @@ impl Bot {
         // Create strategy context
         let ctx = StrategyContext::new(&self.order_book_state, &self.ledger)
             .with_spot(&self.spot_prices, &self.price_history)
+            .with_order_tracker(self.order_tracker.clone())
             .with_exchange_health(self.exchange.is_healthy());
 
         // Run strategy on_tick() callbacks
