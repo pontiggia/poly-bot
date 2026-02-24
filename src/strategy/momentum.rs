@@ -308,6 +308,14 @@ pub struct MomentumConfig {
     // === Stop Loss ===
     /// Massive Binance reversal threshold (e.g., -0.010 = 1.0%)
     pub stop_loss_reversal_pct: Decimal,
+    /// Book-based stop-loss: dump if best_bid drops this far below entry
+    pub book_stop_loss_spread: Decimal,
+    /// Force exit this many seconds before market resolution
+    pub max_hold_before_close_secs: u64,
+
+    // === Taker Fallback ===
+    /// "Overwhelming" conviction threshold for taker fallback
+    pub overwhelming_conviction: Decimal,
 
     // === Sizing ===
     pub max_size_per_trade: Decimal,
@@ -322,39 +330,49 @@ pub struct MomentumConfig {
 
 impl MomentumConfig {
     /// Preset for 15-minute markets
+    ///
+    /// KEY INSIGHT: Late-candle sniping (near close) is far more accurate than
+    /// mid-candle entries. At 15-30s before close, the price direction is mostly
+    /// decided, so our Binance spot oracle has very high conviction accuracy.
     pub fn preset_15m_rider() -> Self {
         Self {
-            // Entry window: 5min into candle → 2min before close
-            entry_window_start_secs: 300,
-            entry_window_end_secs: 120,
+            // Late entry: 870s into candle (30s before close) → 0s (hard cutoff)
+            // This is the "sniper" timing that was profitable
+            entry_window_start_secs: 870,  // 900 - 30 = start monitoring 30s before close
+            entry_window_end_secs: 0,      // allow entries right up to close
 
             // Conviction
-            min_conviction: dec!(0.75),
+            min_conviction: dec!(0.70),
             lookback_windows_ms: vec![180_000, 600_000, 900_000],
             lookback_weights: vec![dec!(0.5), dec!(0.3), dec!(0.2)],
 
-            // Entry pricing
-            min_entry_price: dec!(0.30),
-            max_entry_price: dec!(0.65),
+            // Entry pricing — wide range to catch more opportunities
+            min_entry_price: dec!(0.20),
+            max_entry_price: dec!(0.93),
 
-            // Maker entry
-            maker_entry_timeout_secs: 60,
-            cancel_replace_interval_ms: 500,
-            max_chase_cents: dec!(0.03),
+            // Maker entry — short timeout since we're near close
+            maker_entry_timeout_secs: 3,
+            cancel_replace_interval_ms: 150,
+            max_chase_cents: dec!(0.05),
 
-            // Take profit (dynamic: entry + min_profit, capped at ceiling — NO floor)
+            // Take profit
             tp_min_profit: dec!(0.03),
-            tp_floor_price: dec!(0.70),  // kept for config compat, NOT used in formula
+            tp_floor_price: dec!(0.65),
             tp_ceiling_price: dec!(0.95),
 
-            // Stop loss — ONLY on massive Binance reversal
-            stop_loss_reversal_pct: dec!(-0.010),
+            // Stop loss — book-based + Binance reversal
+            stop_loss_reversal_pct: dec!(-0.005),
+            book_stop_loss_spread: dec!(0.04),
+            max_hold_before_close_secs: 8,
+
+            // Taker fallback for overwhelming conviction
+            overwhelming_conviction: dec!(0.90),
 
             // Sizing
             max_size_per_trade: dec!(15),
             max_total_exposure: dec!(50),
             max_concurrent_positions: 4,
-            max_same_direction_positions: 2,
+            max_same_direction_positions: 3,
 
             // Assets
             assets: vec![
@@ -367,39 +385,46 @@ impl MomentumConfig {
     }
 
     /// Preset for 5-minute markets
+    ///
+    /// Same "late sniper" approach: enter near close when direction is decided.
     pub fn preset_5m_rider() -> Self {
         Self {
-            // Entry window: 2min into candle → 1min before close
-            entry_window_start_secs: 120,
-            entry_window_end_secs: 60,
+            // Late entry: 285s into candle (15s before close) → 0s
+            entry_window_start_secs: 285,  // 300 - 15 = start monitoring 15s before close
+            entry_window_end_secs: 0,      // allow entries right up to close
 
             // Conviction
             min_conviction: dec!(0.75),
             lookback_windows_ms: vec![60_000, 180_000, 300_000],
             lookback_weights: vec![dec!(0.5), dec!(0.3), dec!(0.2)],
 
-            // Entry pricing
-            min_entry_price: dec!(0.30),
-            max_entry_price: dec!(0.65),
+            // Entry pricing — wide range
+            min_entry_price: dec!(0.25),
+            max_entry_price: dec!(0.93),
 
-            // Maker entry
-            maker_entry_timeout_secs: 30,
-            cancel_replace_interval_ms: 500,
-            max_chase_cents: dec!(0.03),
+            // Maker entry — very short timeout since we're near close
+            maker_entry_timeout_secs: 2,
+            cancel_replace_interval_ms: 150,
+            max_chase_cents: dec!(0.05),
 
-            // Take profit (dynamic: entry + min_profit, capped at ceiling — NO floor)
+            // Take profit
             tp_min_profit: dec!(0.03),
-            tp_floor_price: dec!(0.65),  // kept for config compat, NOT used in formula
+            tp_floor_price: dec!(0.65),
             tp_ceiling_price: dec!(0.93),
 
             // Stop loss
-            stop_loss_reversal_pct: dec!(-0.008),
+            stop_loss_reversal_pct: dec!(-0.003),
+            book_stop_loss_spread: dec!(0.03),
+            max_hold_before_close_secs: 5,
+
+            // Taker fallback
+            overwhelming_conviction: dec!(0.90),
 
             // Sizing
             max_size_per_trade: dec!(15),
             max_total_exposure: dec!(50),
             max_concurrent_positions: 4,
-            max_same_direction_positions: 2,
+            max_same_direction_positions: 3,
 
             // Assets
             assets: vec![
@@ -476,6 +501,16 @@ impl MomentumConfig {
         if let Ok(v) = std::env::var("RIDER_ENTRY_WINDOW_END_SECS") {
             if let Ok(d) = v.parse::<i64>() {
                 config.entry_window_end_secs = d;
+            }
+        }
+        if let Ok(v) = std::env::var("RIDER_BOOK_SL_SPREAD") {
+            if let Ok(d) = v.parse::<Decimal>() {
+                config.book_stop_loss_spread = d;
+            }
+        }
+        if let Ok(v) = std::env::var("RIDER_OVERWHELMING_CONVICTION") {
+            if let Ok(d) = v.parse::<Decimal>() {
+                config.overwhelming_conviction = d;
             }
         }
         config
@@ -566,6 +601,12 @@ impl MomentumStrategy {
                 c.tp_floor_price = preset.tp_floor_price;
                 c.tp_ceiling_price = preset.tp_ceiling_price;
                 c.stop_loss_reversal_pct = preset.stop_loss_reversal_pct;
+                c.book_stop_loss_spread = preset.book_stop_loss_spread;
+                c.max_hold_before_close_secs = preset.max_hold_before_close_secs;
+                c.overwhelming_conviction = preset.overwhelming_conviction;
+                c.min_entry_price = preset.min_entry_price;
+                c.max_entry_price = preset.max_entry_price;
+                c.min_conviction = preset.min_conviction;
                 c
             }
         }
@@ -813,6 +854,26 @@ impl MomentumStrategy {
             return Vec::new();
         }
 
+        // Price-conviction agreement filter:
+        // If the market disagrees with us (low bid), require stronger conviction.
+        // bid < 0.35 means market says 35% chance in our direction — need very high conviction.
+        if let Some(bid) = best_bid {
+            let required_conviction = if bid < dec!(0.35) {
+                dec!(0.95)
+            } else if bid < dec!(0.45) {
+                dec!(0.85)
+            } else {
+                tf_config.min_conviction
+            };
+            if conviction < required_conviction {
+                debug!(
+                    "ConvictionRider: {} bid={} disagrees, conv {:.3} < required {:.3}, skipping",
+                    ms.asset, bid, conviction, required_conviction
+                );
+                return Vec::new();
+            }
+        }
+
         // Sizing
         let max_affordable = (ctx.available_cash() / maker_price).floor();
         let remaining_exposure = tf_config.max_total_exposure - ctx.total_exposure();
@@ -897,10 +958,92 @@ impl MomentumStrategy {
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
         if entry_elapsed_secs < SETTLEMENT_COOLDOWN_SECS {
-            return Vec::new();
+            // Allow emergency exit to fall through even during cooldown
+            if let Some(close_time) = ms.close_time {
+                let secs_until_close = close_time - ctx.utc_now.timestamp();
+                if secs_until_close >= tf_config.max_hold_before_close_secs as i64 {
+                    return Vec::new(); // Not emergency — wait for settlement
+                }
+                // Emergency — fall through to exit logic below
+            } else {
+                return Vec::new();
+            }
         }
 
-        // === STOP-LOSS: Binance delta reversal only (massive, 1%+ reversal) ===
+        // Truncate to 2dp for all sell sizes
+        let sell_size = entry_size.round_dp_with_strategy(
+            2,
+            rust_decimal::RoundingStrategy::ToZero,
+        );
+
+        // === EMERGENCY EXIT: Time-based (force exit before market close) ===
+        if let Some(close_time) = ms.close_time {
+            let secs_until_close = close_time - ctx.utc_now.timestamp();
+            if secs_until_close < tf_config.max_hold_before_close_secs as i64 {
+                let sell_price = ctx
+                    .best_bid(&ms.target_token_id)
+                    .unwrap_or(dec!(0.50));
+
+                warn!(
+                    "EMERGENCY EXIT: {} {} {}s until close -> SELL {} @ {}",
+                    ms.asset,
+                    ms.timeframe.label(),
+                    secs_until_close,
+                    sell_size,
+                    sell_price,
+                );
+
+                ms.state = SniperState::Completed;
+
+                return vec![OrderIntent::new(
+                    ms.condition_id.clone(),
+                    ms.target_token_id.clone(),
+                    Side::Sell,
+                    sell_price,
+                    sell_size,
+                    Urgency::Passive,
+                    format!("emergency-exit {} {}", ms.asset, ms.timeframe.label()),
+                    "ConvictionRider",
+                )
+                .with_fee_rate(pair.fee_rate_bps)
+                .with_priority(95)];
+            }
+        }
+
+        // === STOP-LOSS 1: Book-based (best_bid dropped below entry - spread) ===
+        let book_sl_price = entry_price - tf_config.book_stop_loss_spread;
+        if let Some(best_bid) = ctx.best_bid(&ms.target_token_id) {
+            if best_bid < book_sl_price {
+                let sell_price = best_bid;
+
+                warn!(
+                    "BOOK STOP-LOSS: {} {} best_bid={} < sl_price={} -> SELL {} @ {}",
+                    ms.asset,
+                    ms.timeframe.label(),
+                    best_bid,
+                    book_sl_price,
+                    sell_size,
+                    sell_price,
+                );
+
+                ms.state = SniperState::Completed;
+
+                return vec![OrderIntent::new(
+                    ms.condition_id.clone(),
+                    ms.target_token_id.clone(),
+                    Side::Sell,
+                    sell_price,
+                    sell_size,
+                    Urgency::Passive,
+                    format!("book-sl {} {}", ms.asset, ms.timeframe.label()),
+                    "ConvictionRider",
+                )
+                .with_fee_rate(pair.fee_rate_bps)
+                .with_priority(90)];
+            }
+        }
+
+        // === STOP-LOSS 2: Binance delta reversal (crash protection) ===
         if let Some(entry_ts_ms) = ms.entry_timestamp_ms {
             let now_ms = ctx.utc_now.timestamp_millis();
             let ms_since_entry = now_ms - entry_ts_ms;
@@ -915,12 +1058,6 @@ impl MomentumStrategy {
                     let sell_price = ctx
                         .best_bid(&ms.target_token_id)
                         .unwrap_or(dec!(0.50));
-
-                    // Truncate to 2dp — Polymarket max lot size is 2 decimal places
-                    let sell_size = entry_size.round_dp_with_strategy(
-                        2,
-                        rust_decimal::RoundingStrategy::ToZero,
-                    );
 
                     warn!(
                         "STOP-LOSS: {} {} Binance reversal {:.4}% (threshold={:.3}%) -> MAKER SELL {} @ {}",
@@ -951,18 +1088,11 @@ impl MomentumStrategy {
         }
 
         // === TAKE-PROFIT: Dynamic TP based on entry price ===
-        // === FIX: tp_price = entry + min_profit, capped at ceiling (NO floor) ===
-        // The floor was making TPs unreachable for low-entry tokens (e.g., entry $0.33, floor $0.70 = +112%)
+        // tp_price = entry + min_profit, capped at ceiling (NO floor)
         let raw_tp = entry_price + tf_config.tp_min_profit;
         let tp_price = raw_tp
             .min(tf_config.tp_ceiling_price)
             .min(dec!(0.99));
-
-        // Truncate to 2dp — Polymarket max lot size is 2 decimal places
-        let sell_size = entry_size.round_dp_with_strategy(
-            2,
-            rust_decimal::RoundingStrategy::ToZero,
-        );
 
         info!(
             "TAKE-PROFIT: {} {} entry={} size_raw={} size_truncated={} -> MAKER SELL {} @ {} (entry+{}={}, ceiling={})",
@@ -1215,16 +1345,101 @@ impl Strategy for MomentumStrategy {
                     let elapsed_secs = posted_at.elapsed().as_secs();
                     let tf_config = self.config_for_timeframe(ms.timeframe);
 
-                    // Timeout check
+                    // Timeout check — if maker didn't fill, try taker fallback if conviction is high
                     if elapsed_secs >= tf_config.maker_entry_timeout_secs {
-                        actions.push(OrderAction::CancelAllForToken {
-                            token_id: ms.target_token_id.clone(),
-                        });
-                        info!(
-                            "ConvictionRider: {} maker entry timeout ({}s), abandoning",
-                            ms.asset, elapsed_secs
-                        );
-                        ms.state = SniperState::Completed;
+                        if ms.conviction >= tf_config.overwhelming_conviction {
+                            // Taker fallback — cancel maker and post FAK
+                            info!(
+                                "ConvictionRider: {} maker timeout ({}s), conviction {:.3} → TAKER FALLBACK",
+                                ms.asset, elapsed_secs, ms.conviction
+                            );
+
+                            let pair = match self.registry.get_by_condition(&ms.condition_id) {
+                                Some(p) => p,
+                                None => {
+                                    ms.state = SniperState::Completed;
+                                    continue;
+                                }
+                            };
+
+                            // Check best ask is within our entry limit
+                            let best_ask = ctx.best_ask(&ms.target_token_id);
+                            let taker_price = match best_ask {
+                                Some(ask) if ask <= tf_config.max_entry_price => ask,
+                                Some(ask) => {
+                                    info!(
+                                        "ConvictionRider: {} best ask {} > max entry {}, abandoning",
+                                        ms.asset, ask, tf_config.max_entry_price
+                                    );
+                                    actions.push(OrderAction::CancelAllForToken {
+                                        token_id: ms.target_token_id.clone(),
+                                    });
+                                    ms.state = SniperState::Completed;
+                                    continue;
+                                }
+                                None => {
+                                    actions.push(OrderAction::CancelAllForToken {
+                                        token_id: ms.target_token_id.clone(),
+                                    });
+                                    ms.state = SniperState::Completed;
+                                    continue;
+                                }
+                            };
+
+                            // Recompute size for taker
+                            let max_affordable = (ctx.available_cash() / taker_price).floor();
+                            let remaining_exposure = tf_config.max_total_exposure - ctx.total_exposure();
+                            let max_from_exposure = (remaining_exposure / taker_price).floor();
+                            let trade_size = tf_config
+                                .max_size_per_trade
+                                .min(max_affordable)
+                                .min(max_from_exposure)
+                                .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero);
+
+                            let min_shares = (dec!(1) / taker_price).ceil();
+                            if trade_size < min_shares {
+                                actions.push(OrderAction::CancelAllForToken {
+                                    token_id: ms.target_token_id.clone(),
+                                });
+                                ms.state = SniperState::Completed;
+                                continue;
+                            }
+
+                            ms.state = SniperState::Completed; // Will recover on fill via late fill
+
+                            let intent = OrderIntent::new(
+                                ms.condition_id.clone(),
+                                ms.target_token_id.clone(),
+                                Side::Buy,
+                                taker_price,
+                                trade_size,
+                                Urgency::Normal, // FAK taker
+                                format!(
+                                    "taker fallback {} {} (conv={:.2})",
+                                    ms.asset,
+                                    ms.timeframe.label(),
+                                    ms.conviction,
+                                ),
+                                "ConvictionRider",
+                            )
+                            .with_fee_rate(pair.fee_rate_bps)
+                            .with_priority(65);
+
+                            actions.push(OrderAction::PostTakerFallback {
+                                cancel_token_id: Some(ms.target_token_id.clone()),
+                                intent,
+                            });
+                        } else {
+                            // Conviction too low for taker — just cancel and abandon
+                            actions.push(OrderAction::CancelAllForToken {
+                                token_id: ms.target_token_id.clone(),
+                            });
+                            info!(
+                                "ConvictionRider: {} maker timeout ({}s), conviction {:.3} too low for taker, abandoning",
+                                ms.asset, elapsed_secs, ms.conviction
+                            );
+                            ms.state = SniperState::Completed;
+                        }
                         continue;
                     }
 
@@ -1750,15 +1965,15 @@ mod tests {
 
         // For 5m rider, entry_window_start_secs = 120
         // candle duration = 300s
-        // We need elapsed >= 120, so close_time should be at most 300-120=180s from now
-        // Set close_time = now + 150 → elapsed = 300-150 = 150 ≥ 120 → enters Monitoring
+        // We need elapsed >= 285 (entry_window_start_secs), so close_time should be at most 300-285=15s from now
+        // Set close_time = now + 10 → elapsed = 300-10 = 290 ≥ 285 → enters Monitoring
         let pair = crate::strategy::MarketPair::new_up_down(
             "0x5m_test".to_string(),
             "up_token_123".to_string(),
             "down_token_456".to_string(),
         )
         .with_event_slug("btc-updown-5m-1740000000")
-        .with_close_time(now + 150);
+        .with_close_time(now + 10);
 
         registry.register(pair);
 
@@ -1814,16 +2029,16 @@ mod tests {
         let registry = Arc::new(MarketPairRegistry::new());
         let now = chrono::Utc::now().timestamp();
 
-        // For 15m rider, entry_window_start_secs = 300
+        // For 15m rider, entry_window_start_secs = 870
         // candle duration = 900s
-        // elapsed >= 300 → close_time <= now + 600
+        // elapsed >= 870 → close_time <= now + 30
         let pair = crate::strategy::MarketPair::new_up_down(
             "0x15m_test".to_string(),
             "up_token".to_string(),
             "down_token".to_string(),
         )
         .with_event_slug("btc-updown-15m-1740000000")
-        .with_close_time(now + 500);
+        .with_close_time(now + 20);
 
         registry.register(pair);
 
@@ -1941,7 +2156,7 @@ mod tests {
 
     #[test]
     fn test_entry_price_filter() {
-        // Verify that tokens priced above max_entry_price (0.65) are skipped
+        // Verify that tokens priced above max_entry_price (0.93) are skipped
         let registry = Arc::new(MarketPairRegistry::new());
         let now = chrono::Utc::now().timestamp();
 
@@ -1951,7 +2166,7 @@ mod tests {
             "down_token_pf".to_string(),
         )
         .with_event_slug("btc-updown-5m-1740000000")
-        .with_close_time(now + 150);
+        .with_close_time(now + 10); // 10s to close = 290s elapsed, past entry_window_start (285s)
 
         registry.register(pair);
 
@@ -1971,17 +2186,17 @@ mod tests {
             timestamp_ms: now_ms,
         });
 
-        // Set bid at 0.70 — above max_entry_price of 0.65
+        // Set bid at 0.95 — above max_entry_price of 0.93
         let books = OrderBookState::new();
         books.update_book(
             "up_token_pf".to_string(),
             "0xpf_test".to_string(),
             vec![crate::api::types::PriceLevel {
-                price: "0.70".to_string(),
+                price: "0.95".to_string(),
                 size: "100".to_string(),
             }],
             vec![crate::api::types::PriceLevel {
-                price: "0.72".to_string(),
+                price: "0.97".to_string(),
                 size: "100".to_string(),
             }],
             None,

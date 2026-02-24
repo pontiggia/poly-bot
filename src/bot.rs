@@ -121,13 +121,14 @@ impl Bot {
         // Register ConvictionRider strategy (5m + 15m markets)
         let momentum_config = crate::strategy::MomentumConfig::default_live_test();
         info!(
-            "Registering ConvictionRider: conviction>={}, entry_range=[{}, {}], tp=entry+{} (floor={}, ceiling={}), max_exposure=${}",
+            "Registering ConvictionRider: conviction>={}, entry=[{}, {}], tp=entry+{} (ceiling={}), book_sl={}, taker_threshold={}, max_exposure=${}",
             momentum_config.min_conviction,
             momentum_config.min_entry_price,
             momentum_config.max_entry_price,
             momentum_config.tp_min_profit,
-            momentum_config.tp_floor_price,
             momentum_config.tp_ceiling_price,
+            momentum_config.book_stop_loss_spread,
+            momentum_config.overwhelming_conviction,
             momentum_config.max_total_exposure,
         );
         let momentum = Arc::new(crate::strategy::MomentumStrategy::new(
